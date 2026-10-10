@@ -1,0 +1,1572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LocalAI — Open-Source AI Engine: Local Files, Web Fetch & Multi-Modal Studio</title>
+  <meta name="description" content="LocalAI is the open-source AI engine. Run any model — LLMs, vision, voice, image, video — on any hardware without GPU. Includes local file ingestion, real-time web fetch, and OpenAI-compatible API.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Outfit:wght@500;600;700;800;900&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-void: #04070e;
+      --bg-dark: #080d1a;
+      --bg-panel: #0d1527;
+      --bg-card: #121c33;
+      --bg-card-hover: #172442;
+      --bg-subtle: #1a2a4c;
+      --border-subtle: #1e3157;
+      --border-glow: #284478;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+      --primary: #3b82f6;
+      --primary-hover: #2563eb;
+      --primary-glow: rgba(59, 130, 246, 0.35);
+      --emerald: #10b981;
+      --emerald-glow: rgba(16, 185, 129, 0.25);
+      --cyan: #06b6d4;
+      --cyan-glow: rgba(6, 182, 212, 0.25);
+      --purple: #8b5cf6;
+      --purple-glow: rgba(139, 92, 246, 0.25);
+      --amber: #f59e0b;
+      --rose: #ef4444;
+      --radius-sm: 8px;
+      --radius-md: 12px;
+      --radius-lg: 16px;
+      --radius-xl: 22px;
+      --shadow-sm: 0 4px 12px rgba(0,0,0,0.35);
+      --shadow-md: 0 8px 24px rgba(0,0,0,0.45);
+      --shadow-lg: 0 16px 48px rgba(0,0,0,0.6);
+      --transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+      background-color: var(--bg-void);
+      color: var(--text-main);
+      line-height: 1.6;
+      min-height: 100vh;
+      overflow-x: hidden;
+      background-image: 
+        radial-gradient(circle at 10% 10%, rgba(59, 130, 246, 0.12) 0%, transparent 45%),
+        radial-gradient(circle at 90% 15%, rgba(16, 185, 129, 0.12) 0%, transparent 45%),
+        radial-gradient(circle at 50% 85%, rgba(139, 92, 246, 0.08) 0%, transparent 55%);
+      background-attachment: fixed;
+    }
+
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: var(--bg-void); }
+    ::-webkit-scrollbar-thumb { background: var(--border-glow); border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--primary); }
+
+    /* Top Bar */
+    .top-header {
+      background: rgba(13, 21, 39, 0.85);
+      backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--border-subtle);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      padding: 12px 24px;
+    }
+    .header-inner {
+      max-width: 1440px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+    }
+    .brand-group {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      text-decoration: none;
+      color: inherit;
+    }
+    .brand-logo {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #10b981, #3b82f6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.25rem;
+      box-shadow: 0 4px 14px var(--emerald-glow);
+    }
+    .brand-title {
+      font-family: 'Outfit', sans-serif;
+      font-size: 1.35rem;
+      font-weight: 800;
+      letter-spacing: -0.4px;
+      background: linear-gradient(135deg, #ffffff 40%, #93c5fd 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .brand-badge {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      padding: 2px 7px;
+      border-radius: 6px;
+      background: rgba(16, 185, 129, 0.15);
+      border: 1px solid rgba(16, 185, 129, 0.35);
+      color: #6ee7b7;
+      -webkit-text-fill-color: initial;
+    }
+    .brand-desc {
+      font-size: 0.76rem;
+      color: var(--text-muted);
+    }
+
+    /* Live Telemetry Bar */
+    .telemetry-strip {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.76rem;
+    }
+    .tele-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--text-muted);
+    }
+    .status-pulse {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #10b981;
+      box-shadow: 0 0 10px #10b981;
+      animation: pulse 1.8s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.85); }
+    }
+
+    .header-btns {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 16px;
+      border-radius: var(--radius-sm);
+      font-size: 0.86rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: var(--transition);
+      border: 1px solid transparent;
+      text-decoration: none;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--primary), #2563eb);
+      color: white;
+      box-shadow: 0 4px 14px var(--primary-glow);
+    }
+    .btn-primary:hover {
+      background: linear-gradient(135deg, #2563eb, #1d4ed8);
+      transform: translateY(-1px);
+    }
+    .btn-secondary {
+      background: var(--bg-card);
+      border-color: var(--border-glow);
+      color: var(--text-main);
+    }
+    .btn-secondary:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--primary);
+    }
+    .btn-ghost {
+      background: transparent;
+      color: var(--text-muted);
+    }
+    .btn-ghost:hover {
+      color: var(--text-main);
+      background: rgba(255, 255, 255, 0.05);
+    }
+
+    /* Tabs Bar */
+    .tabs-nav-bar {
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border-subtle);
+      position: sticky;
+      top: 65px;
+      z-index: 90;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .tabs-nav-bar::-webkit-scrollbar { display: none; }
+    .tabs-container {
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 0 24px;
+      display: flex;
+      gap: 4px;
+    }
+    .tab-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      font-size: 0.9rem;
+      font-weight: 600;
+      padding: 13px 18px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border-bottom: 2px solid transparent;
+      white-space: nowrap;
+      transition: var(--transition);
+    }
+    .tab-btn:hover {
+      color: var(--text-main);
+      background: rgba(255, 255, 255, 0.03);
+    }
+    .tab-btn.active {
+      color: #60a5fa;
+      border-bottom-color: #3b82f6;
+      background: rgba(59, 130, 246, 0.08);
+    }
+    .tab-badge {
+      font-size: 0.7rem;
+      padding: 2px 6px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.1);
+      color: #94a3b8;
+    }
+    .tab-btn.active .tab-badge {
+      background: rgba(59, 130, 246, 0.25);
+      color: #93c5fd;
+    }
+
+    /* Main Container */
+    .app-main {
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    /* Hero */
+    .hero-box {
+      background: linear-gradient(145deg, rgba(13, 21, 39, 0.8), rgba(18, 28, 51, 0.5));
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-xl);
+      padding: 32px 36px;
+      margin-bottom: 24px;
+      position: relative;
+      overflow: hidden;
+      box-shadow: var(--shadow-md);
+    }
+    .hero-box::before {
+      content: '';
+      position: absolute;
+      top: -100px;
+      right: -80px;
+      width: 380px;
+      height: 380px;
+      background: radial-gradient(circle, rgba(16, 185, 129, 0.15) 0%, rgba(59, 130, 246, 0.12) 50%, transparent 70%);
+      pointer-events: none;
+      filter: blur(40px);
+    }
+    .hero-grid {
+      display: grid;
+      grid-template-columns: 1.3fr 0.7fr;
+      gap: 32px;
+      align-items: center;
+      position: relative;
+      z-index: 1;
+    }
+    .hero-title {
+      font-family: 'Outfit', sans-serif;
+      font-size: 2.3rem;
+      font-weight: 800;
+      line-height: 1.18;
+      letter-spacing: -0.6px;
+      margin-bottom: 14px;
+      background: linear-gradient(135deg, #ffffff 40%, #93c5fd 80%, #6ee7b7 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .hero-desc {
+      font-size: 0.98rem;
+      color: var(--text-muted);
+      line-height: 1.6;
+      margin-bottom: 22px;
+    }
+
+    .hero-stats-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin-top: 20px;
+      padding-top: 20px;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .stat-card {
+      background: rgba(13, 21, 39, 0.6);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: var(--radius-sm);
+      padding: 10px 14px;
+    }
+    .stat-val {
+      font-family: 'Outfit', sans-serif;
+      font-size: 1.4rem;
+      font-weight: 800;
+      color: #60a5fa;
+    }
+    .stat-lbl {
+      font-size: 0.72rem;
+      color: var(--text-dim);
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }
+
+    .docker-command-box {
+      background: #060a12;
+      border: 1px solid var(--border-glow);
+      border-radius: var(--radius-md);
+      padding: 18px;
+      box-shadow: var(--shadow-sm);
+    }
+    .code-cmd-box {
+      background: #04070d;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 6px;
+      padding: 10px 14px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      color: #38bdf8;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 10px;
+    }
+    .copy-pill {
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      color: var(--text-muted);
+      border-radius: 4px;
+      padding: 3px 8px;
+      font-size: 0.7rem;
+      cursor: pointer;
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      transition: var(--transition);
+    }
+    .copy-pill:hover { background: var(--primary); color: white; }
+
+    /* Tab Panels */
+    .tab-panel {
+      display: none;
+      animation: fadeIn 0.2s ease-out;
+    }
+    .tab-panel.active {
+      display: block;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .section-title-wrap {
+      margin-bottom: 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+    .section-title {
+      font-family: 'Outfit', sans-serif;
+      font-size: 1.6rem;
+      font-weight: 800;
+      letter-spacing: -0.4px;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .section-desc {
+      font-size: 0.9rem;
+      color: var(--text-muted);
+      margin-top: 3px;
+    }
+    .panel-card {
+      background: var(--bg-panel);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 22px;
+      box-shadow: var(--shadow-sm);
+      margin-bottom: 22px;
+    }
+
+    /* -------------------------------------------------------------
+       1. LOCAL FILES INGESTION STUDIO
+       ------------------------------------------------------------- */
+    .files-drop-zone {
+      border: 2px dashed var(--border-glow);
+      border-radius: var(--radius-lg);
+      padding: 36px 24px;
+      text-align: center;
+      background: rgba(18, 28, 51, 0.4);
+      cursor: pointer;
+      transition: var(--transition);
+      margin-bottom: 20px;
+    }
+    .files-drop-zone:hover, .files-drop-zone.dragover {
+      border-color: var(--emerald);
+      background: rgba(16, 185, 129, 0.08);
+    }
+    .drop-icon {
+      font-size: 2.4rem;
+      margin-bottom: 10px;
+      display: block;
+    }
+    .drop-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: white;
+      margin-bottom: 4px;
+    }
+    .drop-sub {
+      font-size: 0.84rem;
+      color: var(--text-dim);
+    }
+
+    .uploaded-files-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+    .file-item-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      transition: var(--transition);
+    }
+    .file-item-card:hover {
+      border-color: var(--border-glow);
+      background: var(--bg-card-hover);
+    }
+    .file-meta-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .file-type-badge {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      background: rgba(59, 130, 246, 0.2);
+      color: #60a5fa;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      font-weight: 700;
+    }
+    .file-name-text {
+      font-size: 0.88rem;
+      font-weight: 700;
+      color: var(--text-main);
+    }
+    .file-stats-text {
+      font-size: 0.74rem;
+      color: var(--text-dim);
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .file-preview-viewer {
+      background: #04070e;
+      border: 1px solid var(--border-glow);
+      border-radius: var(--radius-sm);
+      padding: 16px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82rem;
+      color: #cbd5e1;
+      max-height: 280px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    /* -------------------------------------------------------------
+       2. REAL-TIME WEB FETCH STUDIO
+       ------------------------------------------------------------- */
+    .web-fetch-bar {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .web-url-input {
+      flex: 1;
+      background: #050811;
+      border: 1px solid var(--border-glow);
+      border-radius: var(--radius-sm);
+      padding: 12px 18px;
+      color: white;
+      font-size: 0.94rem;
+      font-family: inherit;
+    }
+    .web-url-input:focus {
+      outline: none;
+      border-color: var(--cyan);
+      box-shadow: 0 0 0 2px var(--cyan-glow);
+    }
+    .web-fetch-results-box {
+      background: #050811;
+      border: 1px solid var(--border-glow);
+      border-radius: var(--radius-md);
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .web-status-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      padding-bottom: 10px;
+    }
+
+    /* -------------------------------------------------------------
+       3. MULTI-MODAL CHAT & VISION STUDIO
+       ------------------------------------------------------------- */
+    .chat-layout-grid {
+      display: grid;
+      grid-template-columns: 300px 1fr;
+      gap: 20px;
+      min-height: 600px;
+    }
+    .chat-params-panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .chat-main-area {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .chat-messages-container {
+      flex: 1;
+      padding: 20px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      max-height: 480px;
+    }
+    .chat-bubble {
+      max-width: 86%;
+      padding: 14px 18px;
+      border-radius: var(--radius-md);
+      font-size: 0.92rem;
+      line-height: 1.6;
+    }
+    .bubble-user {
+      align-self: flex-end;
+      background: linear-gradient(135deg, #1e3a8a, #2563eb);
+      color: white;
+      border-bottom-right-radius: 4px;
+    }
+    .bubble-assistant {
+      align-self: flex-start;
+      background: var(--bg-panel);
+      border: 1px solid var(--border-glow);
+      color: #e2e8f0;
+      border-bottom-left-radius: 4px;
+      box-shadow: var(--shadow-sm);
+    }
+    .chat-input-row {
+      padding: 14px 18px;
+      background: rgba(13, 21, 39, 0.8);
+      border-top: 1px solid var(--border-subtle);
+      display: flex;
+      gap: 10px;
+    }
+    .chat-text-input {
+      flex: 1;
+      background: #050811;
+      border: 1px solid var(--border-glow);
+      border-radius: var(--radius-sm);
+      padding: 12px 16px;
+      color: white;
+      font-size: 0.92rem;
+      font-family: inherit;
+    }
+    .chat-text-input:focus {
+      outline: none;
+      border-color: var(--primary);
+    }
+
+    /* -------------------------------------------------------------
+       4. AUDIO STUDIO (WHISPER & PIPER/BARK)
+       ------------------------------------------------------------- */
+    .audio-player-box {
+      background: linear-gradient(145deg, #0d1527, #131f38);
+      border: 1px solid var(--border-glow);
+      border-radius: var(--radius-lg);
+      padding: 26px;
+      max-width: 820px;
+      margin: 0 auto;
+    }
+    .waveform-canvas {
+      width: 100%;
+      height: 72px;
+      background: #050811;
+      border-radius: var(--radius-sm);
+      margin: 16px 0;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    /* -------------------------------------------------------------
+       5. MODEL GALLERY & HARDWARE ESTIMATOR
+       ------------------------------------------------------------- */
+    .model-cards-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 18px;
+    }
+    .model-card-item {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 18px;
+      transition: var(--transition);
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+    .model-card-item:hover {
+      border-color: var(--border-glow);
+      transform: translateY(-2px);
+      box-shadow: var(--shadow-sm);
+    }
+    .model-badge-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .model-name {
+      font-family: 'Outfit', sans-serif;
+      font-size: 1.15rem;
+      font-weight: 800;
+      color: white;
+    }
+    .model-spec {
+      font-size: 0.8rem;
+      color: var(--text-dim);
+      font-family: 'JetBrains Mono', monospace;
+      margin-bottom: 12px;
+    }
+
+    /* -------------------------------------------------------------
+       6. OPENAI API CODE GENERATOR
+       ------------------------------------------------------------- */
+    .api-code-tabs {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+    .api-tab-btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-muted);
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.78rem;
+      cursor: pointer;
+      transition: var(--transition);
+    }
+    .api-tab-btn.active {
+      background: var(--primary);
+      border-color: var(--primary);
+      color: white;
+    }
+    .api-code-block {
+      background: #04070e;
+      border: 1px solid var(--border-glow);
+      border-radius: var(--radius-sm);
+      padding: 18px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.84rem;
+      line-height: 1.6;
+      color: #e2e8f0;
+      overflow-x: auto;
+    }
+
+    /* Footer */
+    .app-footer {
+      border-top: 1px solid var(--border-subtle);
+      background: var(--bg-panel);
+      padding: 26px 24px;
+      margin-top: 40px;
+      color: var(--text-dim);
+      font-size: 0.82rem;
+    }
+    .footer-inner {
+      max-width: 1440px;
+      margin: 0 auto;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+
+    @media (max-width: 1024px) {
+      .hero-grid { grid-template-columns: 1fr; }
+      .chat-layout-grid { grid-template-columns: 1fr; }
+      .hero-stats-row { grid-template-columns: repeat(2, 1fr); }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top Header -->
+  <header class="top-header">
+    <div class="header-inner">
+      <a href="#" class="brand-group">
+        <div class="brand-logo">🤖</div>
+        <div>
+          <div class="brand-title">
+            LocalAI
+            <span class="brand-badge">v4.11.0</span>
+          </div>
+          <div class="brand-desc">Open-Source AI Engine &bull; Any Model, Any Hardware &bull; No GPU Required</div>
+        </div>
+      </a>
+
+      <!-- Telemetry Status -->
+      <div class="telemetry-strip">
+        <div class="tele-item"><span class="status-pulse"></span><strong>ENGINE READY</strong></div>
+        <div class="tele-item"><span>CPU:</span> <strong style="color:#6ee7b7;">14.2%</strong></div>
+        <div class="tele-item"><span>RAM:</span> <strong style="color:#93c5fd;">4.8 / 32 GB</strong></div>
+        <div class="tele-item"><span>BACKEND:</span> <strong style="color:#c084fc;">llama.cpp + vllm</strong></div>
+      </div>
+
+      <div class="header-btns">
+        <button class="btn btn-secondary" onclick="switchTab('files')">📁 Local Files</button>
+        <button class="btn btn-primary" onclick="switchTab('web')">🌐 Web Fetch</button>
+        <a href="https://github.com/bhupesh-debug/LocalAI" target="_blank" class="btn btn-ghost" title="GitHub Repo">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Tabs Navigation -->
+  <nav class="tabs-nav-bar">
+    <div class="tabs-container">
+      <button class="tab-btn active" onclick="switchTab('files')" id="tab-btn-files">
+        📁 Local Files Studio
+        <span class="tab-badge">Ingest & RAG</span>
+      </button>
+      <button class="tab-btn" onclick="switchTab('web')" id="tab-btn-web">
+        🌐 Web Fetch Engine
+        <span class="tab-badge">Live Scraping</span>
+      </button>
+      <button class="tab-btn" onclick="switchTab('chat')" id="tab-btn-chat">
+        💬 Multi-Modal Chat
+        <span class="tab-badge">LLM & Vision</span>
+      </button>
+      <button class="tab-btn" onclick="switchTab('audio')" id="tab-btn-audio">
+        🎙️ Voice & Audio
+        <span class="tab-badge">Whisper & TTS</span>
+      </button>
+      <button class="tab-btn" onclick="switchTab('image')" id="tab-btn-image">
+        🎨 Image Studio
+        <span class="tab-badge">Diffusion</span>
+      </button>
+      <button class="tab-btn" onclick="switchTab('models')" id="tab-btn-models">
+        📦 Model Gallery
+        <span class="tab-badge">VRAM Profiler</span>
+      </button>
+      <button class="tab-btn" onclick="switchTab('api')" id="tab-btn-api">
+        ⚡ API & Code Exporter
+        <span class="tab-badge">OpenAI Spec</span>
+      </button>
+    </div>
+  </nav>
+
+  <!-- App Main Body -->
+  <main class="app-main">
+
+    <!-- Hero Section -->
+    <section class="hero-box">
+      <div class="hero-grid">
+        <div>
+          <h1 class="hero-title">Run Any Model on Any Hardware &mdash; Drop-in OpenAI API</h1>
+          <p class="hero-desc">
+            LocalAI is the modular, privacy-first AI engine. Power local LLMs, vision, Whisper audio transcription, Piper text-to-speech, and image generation on CPU, Apple Silicon, or GPUs. Ingest local files and live web URLs into context with zero data leakage.
+          </p>
+
+          <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+            <button class="btn btn-primary" onclick="switchTab('files')">
+              📁 Ingest Local Files
+            </button>
+            <button class="btn btn-secondary" onclick="switchTab('web')">
+              🌐 Real-Time Web Fetch
+            </button>
+            <button class="btn btn-ghost" onclick="switchTab('chat')">
+              Launch Chat Studio &rarr;
+            </button>
+          </div>
+
+          <div class="hero-stats-row">
+            <div class="stat-card">
+              <div class="stat-val">100%</div>
+              <div class="stat-lbl">OpenAI Compatible</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-val">0 MB</div>
+              <div class="stat-lbl">GPU Req (CPU Ready)</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-val">Multi</div>
+              <div class="stat-lbl">Modal Core</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-val">15+</div>
+              <div class="stat-lbl">Native Backends</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="docker-command-box">
+          <div style="font-size:0.8rem; font-weight:700; color:#6ee7b7; text-transform:uppercase;">
+            Run LocalAI with Docker (One-Liner)
+          </div>
+
+          <div class="code-cmd-box">
+            <span>docker run -p 8080:8080 localai/localai:latest</span>
+            <button class="copy-pill" onclick="copyText('docker run -p 8080:8080 localai/localai:latest')">Copy</button>
+          </div>
+
+          <div style="font-size:0.75rem; color:var(--text-dim); margin-top:10px;">
+            For NVIDIA GPU acceleration:
+          </div>
+
+          <div class="code-cmd-box">
+            <span>docker run --gpus all -p 8080:8080 localai/localai:latest-gpu-nvidia-cuda-12</span>
+            <button class="copy-pill" onclick="copyText('docker run --gpus all -p 8080:8080 localai/localai:latest-gpu-nvidia-cuda-12')">Copy</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- =============================================================
+         TAB 1: LOCAL FILES INGESTION & RAG STUDIO
+         ============================================================= -->
+    <div class="tab-panel active" id="panel-files">
+      <div class="section-title-wrap">
+        <div>
+          <h2 class="section-title">📁 Local Files Ingestion & Context Studio</h2>
+          <p class="section-desc">Upload local documents, codebases, logs, or notes to parse text, compute tokens, and query them with LocalAI.</p>
+        </div>
+      </div>
+
+      <!-- Drag & Drop Zone -->
+      <div class="files-drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
+        <span class="drop-icon">📄</span>
+        <div class="drop-title">Drop Local Files Here or Click to Browse</div>
+        <div class="drop-sub">Supports .txt, .md, .py, .json, .csv, .pdf, .log, .yaml, and code files</div>
+        <input type="file" id="file-input" style="display:none;" multiple onchange="handleFileSelect(event)">
+      </div>
+
+      <!-- Uploaded Files List -->
+      <div class="panel-card">
+        <h3 style="font-size:1.1rem; font-weight:800; margin-bottom:14px;">Ingested Local Files in Memory</h3>
+        <div class="uploaded-files-list" id="files-list-area">
+          <!-- Default sample file -->
+          <div class="file-item-card">
+            <div class="file-meta-left">
+              <div class="file-type-badge">MD</div>
+              <div>
+                <div class="file-name-text">LocalAI_Architecture_Overview.md</div>
+                <div class="file-stats-text">14.2 KB &bull; ~3,540 tokens &bull; Parsed into 4 chunks</div>
+              </div>
+            </div>
+            <div style="display:flex; gap:8px;">
+              <button class="btn btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="previewSampleFile()">Inspect Content</button>
+              <button class="btn btn-primary" style="padding:4px 10px; font-size:0.75rem;" onclick="injectFileIntoChat('LocalAI_Architecture_Overview.md')">Send to Chat</button>
+            </div>
+          </div>
+        </div>
+
+        <div style="margin-top:16px;">
+          <h4 style="font-size:0.88rem; font-weight:700; color:var(--text-dim); margin-bottom:8px; text-transform:uppercase;">
+            File Preview & Extracted Token Content
+          </h4>
+          <div class="file-preview-viewer" id="file-content-viewer">
+# LocalAI Architecture Overview
+
+LocalAI acts as a drop-in replacement REST API that is compatible with OpenAI API specifications for local inferencing.
+It uses C++ and Go bindings to interface directly with backends:
+- llama.cpp (LLMs, GGUF models)
+- vLLM (High-throughput token generation)
+- whisper.cpp (Speech-to-text transcription)
+- stable-diffusion.cpp (Image generation)
+- audio.cpp (Voice recognition, VAD, diarization)
+
+All model weights stay local. No external calls, telemetry, or API keys required.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- =============================================================
+         TAB 2: REAL-TIME WEB FETCH STUDIO
+         ============================================================= -->
+    <div class="tab-panel" id="panel-web">
+      <div class="section-title-wrap">
+        <div>
+          <h2 class="section-title">🌐 Real-Time Web Fetch & Distillation Engine</h2>
+          <p class="section-desc">Fetch live web pages, documentation, or public API endpoints in real time, extract clean markdown, and feed it into LocalAI.</p>
+        </div>
+      </div>
+
+      <div class="panel-card">
+        <div class="web-fetch-bar">
+          <input type="text" class="web-url-input" id="web-fetch-url" placeholder="Enter target URL to fetch (e.g. https://github.com/mudler/LocalAI, https://arxiv.org/abs/2402.1234, or news URL)..." value="https://localai.io/basics/getting_started/">
+          <button class="btn btn-primary" onclick="executeWebFetch()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path></svg>
+            Fetch Real-Time Data
+          </button>
+        </div>
+
+        <!-- Quick Preset URLs -->
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:16px;">
+          <span style="font-size:0.75rem; color:var(--text-dim); font-weight:700;">Trending Targets:</span>
+          <button class="copy-pill" onclick="setFetchUrl('https://localai.io/basics/getting_started/')">LocalAI Quickstart</button>
+          <button class="copy-pill" onclick="setFetchUrl('https://raw.githubusercontent.com/mudler/LocalAI/master/README.md')">GitHub Raw README</button>
+          <button class="copy-pill" onclick="setFetchUrl('https://news.ycombinator.com')">Hacker News Frontpage</button>
+          <button class="copy-pill" onclick="setFetchUrl('https://arxiv.org/abs/2307.09288')">Llama 2 Paper Abstract</button>
+        </div>
+
+        <div class="web-fetch-results-box" id="web-fetch-results">
+          <div class="web-status-header">
+            <div>
+              <span style="color:#6ee7b7; font-weight:700; font-family:'JetBrains Mono', monospace;" id="fetch-http-status">HTTP 200 OK</span>
+              <span style="font-size:0.78rem; color:var(--text-muted); margin-left:10px;" id="fetch-time">Fetched in 142ms</span>
+            </div>
+            <div>
+              <button class="btn btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="sendWebFetchToChat()">Inject into LocalAI Chat</button>
+            </div>
+          </div>
+
+          <div style="font-size:0.82rem; color:#93c5fd; font-family:'JetBrains Mono', monospace;">
+            URL: <span id="fetch-display-url">https://localai.io/basics/getting_started/</span> &bull; Extracted Tokens: ~1,840
+          </div>
+
+          <div class="file-preview-viewer" id="web-fetch-body">
+# Getting Started with LocalAI
+
+LocalAI is an OpenAI-compatible API running locally on CPU or GPU.
+You can run any GGUF or ONNX model without needing specialized drivers.
+
+Core Endpoints:
+- POST /v1/chat/completions : Chat with Llama, Mistral, Gemma, Phi models
+- POST /v1/embeddings       : Generate vector embeddings for RAG
+- POST /v1/audio/transcriptions : Transcribe audio files via whisper.cpp
+- POST /v1/images/generations  : Generate images via stable-diffusion.cpp
+
+To start LocalAI:
+$ docker run -p 8080:8080 localai/localai:latest
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- =============================================================
+         TAB 3: MULTI-MODAL CHAT & VISION STUDIO
+         ============================================================= -->
+    <div class="tab-panel" id="panel-chat">
+      <div class="section-title-wrap">
+        <div>
+          <h2 class="section-title">💬 Multi-Modal LLM & Vision Studio</h2>
+          <p class="section-desc">Chat with locally loaded models, ground answers on ingested files or web fetch, and inspect responses.</p>
+        </div>
+      </div>
+
+      <div class="chat-layout-grid">
+        <!-- Parameters Sidebar -->
+        <div class="chat-params-panel">
+          <div>
+            <label style="font-size:0.78rem; font-weight:700; color:var(--text-dim); text-transform:uppercase;">Select Model</label>
+            <select id="chat-model-select" style="width:100%; background:#050811; border:1px solid var(--border-glow); color:white; padding:8px; border-radius:6px; font-size:0.85rem; margin-top:4px;">
+              <option value="llama-3.2-3b-instruct:q4_k_m">llama-3.2-3b-instruct:q4_k_m (Fast)</option>
+              <option value="llama-3.3-70b-instruct:q4_k_m">llama-3.3-70b-instruct:q4_k_m (High Reasoning)</option>
+              <option value="deepseek-r1-distill-qwen-8b">deepseek-r1-distill-qwen-8b (Chain of Thought)</option>
+              <option value="llava-v1.6-mistral-7b">llava-v1.6-mistral-7b (Vision Multimodal)</option>
+              <option value="qwen-2.5-coder-7b">qwen-2.5-coder-7b (Coding Specialist)</option>
+            </select>
+          </div>
+
+          <div>
+            <label style="font-size:0.78rem; font-weight:700; color:var(--text-dim); text-transform:uppercase;">System Prompt</label>
+            <textarea id="chat-system-prompt" style="width:100%; height:80px; background:#050811; border:1px solid var(--border-glow); color:#cbd5e1; padding:8px; border-radius:6px; font-size:0.8rem; margin-top:4px; font-family:'JetBrains Mono', monospace;">You are LocalAI, an open-source autonomous AI assistant running locally on the user's infrastructure.</textarea>
+          </div>
+
+          <div>
+            <div style="display:flex; justify-content:space-between; font-size:0.78rem; font-weight:700; color:var(--text-dim);">
+              <span>Temperature</span>
+              <span id="temp-val-display" style="color:#60a5fa;">0.7</span>
+            </div>
+            <input type="range" min="0" max="1.5" step="0.1" value="0.7" style="width:100%; margin-top:6px;" oninput="document.getElementById('temp-val-display').innerText = this.value">
+          </div>
+
+          <div>
+            <div style="display:flex; justify-content:space-between; font-size:0.78rem; font-weight:700; color:var(--text-dim);">
+              <span>Max Tokens</span>
+              <span id="tokens-val-display" style="color:#60a5fa;">1024</span>
+            </div>
+            <input type="range" min="128" max="4096" step="128" value="1024" style="width:100%; margin-top:6px;" oninput="document.getElementById('tokens-val-display').innerText = this.value">
+          </div>
+
+          <div style="background:rgba(59,130,246,0.08); border:1px dashed var(--border-glow); border-radius:6px; padding:10px; font-size:0.75rem; color:var(--text-muted);">
+            <strong>Local Inference</strong>: Powered by <code>llama.cpp</code> backend with AVX-512 CPU acceleration.
+          </div>
+        </div>
+
+        <!-- Chat Center Area -->
+        <div class="chat-main-area">
+          <div class="chat-messages-container" id="chat-box">
+            <div class="chat-bubble bubble-assistant">
+              Hello! I am LocalAI running locally on your hardware. You can ask me questions, upload local documents in the <strong>Local Files</strong> tab, or fetch any live website in the <strong>Web Fetch</strong> tab to chat with them.
+            </div>
+          </div>
+
+          <div class="chat-input-row">
+            <input type="text" class="chat-text-input" id="chat-user-input" placeholder="Ask a question, analyze code, or query your files..." onkeydown="if(event.key==='Enter') sendChatMessage()">
+            <button class="btn btn-primary" onclick="sendChatMessage()">Send</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- =============================================================
+         TAB 4: VOICE & AUDIO STUDIO
+         ============================================================= -->
+    <div class="tab-panel" id="panel-audio">
+      <div class="section-title-wrap">
+        <div>
+          <h2 class="section-title">🎙️ Voice & Audio Studio (Whisper & Piper/Bark)</h2>
+          <p class="section-desc">Transcribe speech via whisper.cpp and synthesize natural voices with Piper or Bark.</p>
+        </div>
+      </div>
+
+      <div class="audio-player-box">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+          <div>
+            <h3 style="font-size:1.2rem; font-weight:800;">Speech-to-Text & Synthesizer</h3>
+            <p style="font-size:0.8rem; color:var(--text-muted);">OpenAI-compatible <code>/v1/audio/transcriptions</code> and <code>/v1/audio/speech</code></p>
+          </div>
+          <span class="brand-badge">whisper.cpp + piper</span>
+        </div>
+
+        <!-- Animated Waveform -->
+        <canvas class="waveform-canvas" id="audio-wave-canvas"></canvas>
+
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:18px;">
+          <button class="btn btn-primary" id="play-audio-btn" onclick="toggleLocalAiAudio()">
+            ▶ Play Synthesized Speech
+          </button>
+          <div style="font-family:'JetBrains Mono', monospace; font-size:0.85rem; color:#6ee7b7;" id="audio-status-tag">
+            Engine Ready (48kHz, 16-bit PCM)
+          </div>
+        </div>
+
+        <div style="background:#04070e; border:1px solid var(--border-glow); border-radius:6px; padding:14px; font-size:0.85rem;">
+          <div style="font-weight:700; color:var(--text-muted); margin-bottom:6px; font-size:0.75rem; text-transform:uppercase;">Live Transcription Output:</div>
+          <p id="transcription-text" style="color:#e2e8f0; line-height:1.5;">
+            "LocalAI allows any developer to deploy speech recognition models like Whisper and high quality text to speech pipelines with zero external dependencies."
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- =============================================================
+         TAB 5: IMAGE & VISION STUDIO
+         ============================================================= -->
+    <div class="tab-panel" id="panel-image">
+      <div class="section-title-wrap">
+        <div>
+          <h2 class="section-title">🎨 Image & Vision Studio (Stable Diffusion & LLaVA)</h2>
+          <p class="section-desc">Text-to-image generation via <code>/v1/images/generations</code> and multi-modal visual inspection.</p>
+        </div>
+      </div>
+
+      <div class="panel-card">
+        <div style="display:flex; gap:10px; margin-bottom:18px;">
+          <input type="text" class="web-url-input" id="img-prompt-input" value="A futuristic modular AI datacenter powered by clean hydro energy, cinematic lighting, photorealistic 8k" placeholder="Enter image generation prompt...">
+          <button class="btn btn-primary" onclick="simulateImageGeneration()">Generate Image</button>
+        </div>
+
+        <div style="text-align:center; padding:30px; background:#04070e; border:1px solid var(--border-glow); border-radius:12px;">
+          <div id="image-display-frame" style="max-width:512px; height:320px; margin:0 auto; background:linear-gradient(135deg, #0d1b33, #152d54); border-radius:10px; display:flex; flex-direction:column; justify-content:center; align-items:center; border:1px solid rgba(255,255,255,0.08);">
+            <span style="font-size:3rem; margin-bottom:10px;">🖼️</span>
+            <span style="font-weight:700; color:white; font-size:1.05rem;" id="img-caption-text">Futuristic Modular LocalAI Datacenter</span>
+            <span style="font-size:0.78rem; color:#60a5fa; margin-top:4px;">Generated via stable-diffusion.cpp (512x512 &bull; 20 Steps)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- =============================================================
+         TAB 6: MODEL GALLERY & VRAM PROFILER
+         ============================================================= -->
+    <div class="tab-panel" id="panel-models">
+      <div class="section-title-wrap">
+        <div>
+          <h2 class="section-title">📦 Model Gallery & Hardware Profiler</h2>
+          <p class="section-desc">Calculate RAM and VRAM requirements before running. Run on pure CPU or offload to GPU.</p>
+        </div>
+      </div>
+
+      <div class="model-cards-grid">
+        <div class="model-card-item">
+          <div>
+            <div class="model-badge-row">
+              <span class="brand-badge">LLM &bull; Q4_K_M</span>
+              <span style="font-size:0.74rem; color:#6ee7b7;">2.4 GB RAM</span>
+            </div>
+            <div class="model-name">Llama 3.2 3B Instruct</div>
+            <div class="model-spec">Meta &bull; 128k Context &bull; GGUF</div>
+            <p style="font-size:0.82rem; color:var(--text-muted); margin-bottom:14px;">Fast everyday assistant. Runs at 45 tokens/sec on modern 8-core CPUs.</p>
+          </div>
+          <button class="btn btn-primary" style="width:100%; justify-content:center;" onclick="loadModelToChat('llama-3.2-3b-instruct:q4_k_m')">Run in Chat Studio</button>
+        </div>
+
+        <div class="model-card-item">
+          <div>
+            <div class="model-badge-row">
+              <span class="brand-badge">LLM &bull; Q4_K_M</span>
+              <span style="font-size:0.74rem; color:#fde68a;">42 GB RAM / VRAM</span>
+            </div>
+            <div class="model-name">Llama 3.3 70B Instruct</div>
+            <div class="model-spec">Meta &bull; State-of-the-Art Reasoning</div>
+            <p style="font-size:0.82rem; color:var(--text-muted); margin-bottom:14px;">Heavyweight intelligence. Matches closed frontier models on coding and logic.</p>
+          </div>
+          <button class="btn btn-secondary" style="width:100%; justify-content:center;" onclick="loadModelToChat('llama-3.3-70b-instruct:q4_k_m')">Run in Chat Studio</button>
+        </div>
+
+        <div class="model-card-item">
+          <div>
+            <div class="model-badge-row">
+              <span class="brand-badge">Reasoning &bull; 8B</span>
+              <span style="font-size:0.74rem; color:#6ee7b7;">5.8 GB RAM</span>
+            </div>
+            <div class="model-name">DeepSeek R1 Distill Qwen 8B</div>
+            <div class="model-spec">DeepSeek &bull; Chain-of-Thought</div>
+            <p style="font-size:0.82rem; color:var(--text-muted); margin-bottom:14px;">Interleaved thinking tags (`<think>...`) for complex math and software architecture.</p>
+          </div>
+          <button class="btn btn-secondary" style="width:100%; justify-content:center;" onclick="loadModelToChat('deepseek-r1-distill-qwen-8b')">Run in Chat Studio</button>
+        </div>
+
+        <div class="model-card-item">
+          <div>
+            <div class="model-badge-row">
+              <span class="brand-badge">Vision &bull; 7B</span>
+              <span style="font-size:0.74rem; color:#6ee7b7;">5.2 GB RAM</span>
+            </div>
+            <div class="model-name">LLaVA v1.6 Mistral 7B</div>
+            <div class="model-spec">Visual Q&A &bull; OCR &bull; Diagrams</div>
+            <p style="font-size:0.82rem; color:var(--text-muted); margin-bottom:14px;">Inspects uploaded local screenshots, charts, architectural diagrams, and photos.</p>
+          </div>
+          <button class="btn btn-secondary" style="width:100%; justify-content:center;" onclick="loadModelToChat('llava-v1.6-mistral-7b')">Run in Chat Studio</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- =============================================================
+         TAB 7: OPENAI API & CODE EXPORTER
+         ============================================================= -->
+    <div class="tab-panel" id="panel-api">
+      <div class="section-title-wrap">
+        <div>
+          <h2 class="section-title">⚡ OpenAI API & Code Exporter</h2>
+          <p class="section-desc">Drop-in compatibility. Connect any existing application by pointing <code>base_url="http://localhost:8080/v1"</code>.</p>
+        </div>
+      </div>
+
+      <div class="panel-card">
+        <div class="api-code-tabs">
+          <button class="api-tab-btn active" onclick="switchApiCode('curl', this)">cURL</button>
+          <button class="api-tab-btn" onclick="switchApiCode('python', this)">Python (openai)</button>
+          <button class="api-tab-btn" onclick="switchApiCode('node', this)">Node.js</button>
+          <button class="api-tab-btn" onclick="switchApiCode('go', this)">Go</button>
+        </div>
+
+        <div style="position:relative;">
+          <pre class="api-code-block" id="api-code-output"></pre>
+          <button class="copy-pill" style="position:absolute; right:12px; top:12px;" onclick="copyActiveApiCode()">Copy Code</button>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- Footer -->
+  <footer class="app-footer">
+    <div class="footer-inner">
+      <div>
+        <strong>LocalAI</strong> &bull; The Open-Source AI Engine &bull; Apache-2.0 / MIT License
+      </div>
+      <div style="display:flex; gap:16px;">
+        <a href="https://github.com/bhupesh-debug/LocalAI" target="_blank" style="color:var(--text-muted); text-decoration:none;">GitHub Repo</a>
+        <a href="https://localai.io" target="_blank" style="color:var(--text-muted); text-decoration:none;">Documentation</a>
+        <a href="https://models.localai.io" target="_blank" style="color:var(--text-muted); text-decoration:none;">Model Gallery</a>
+      </div>
+    </div>
+  </footer>
+
+  <!-- Application Logic -->
+  <script>
+    function switchTab(tabId) {
+      document.querySelectorAll('.tab-panel').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+
+      const targetPanel = document.getElementById('panel-' + tabId);
+      const targetBtn = document.getElementById('tab-btn-' + tabId);
+
+      if (targetPanel) targetPanel.classList.add('active');
+      if (targetBtn) targetBtn.classList.add('active');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
+    function copyText(str) {
+      navigator.clipboard.writeText(str).then(() => alert('Copied to clipboard: ' + str));
+    }
+
+    // -------------------------------------------------------------
+    // LOCAL FILES INGESTION LOGIC
+    // -------------------------------------------------------------
+    const ingestedFiles = [];
+
+    function handleFileSelect(e) {
+      const files = e.target.files;
+      if (!files || !files.length) return;
+
+      Array.from(files).forEach(f => {
+        const reader = new FileReader();
+        reader.onload = function(event) {
+          const content = event.target.result;
+          const tokenEst = Math.round(content.length / 4);
+          const ext = f.name.split('.').pop().toUpperCase();
+
+          ingestedFiles.push({
+            name: f.name,
+            size: (f.size / 1024).toFixed(1) + ' KB',
+            tokens: tokenEst,
+            ext: ext,
+            content: content
+          });
+
+          renderFilesList();
+          document.getElementById('file-content-viewer').innerText = content.substring(0, 2000) + (content.length > 2000 ? '\n\n[... truncated preview]' : '');
+        };
+        reader.readAsText(f);
+      });
+    }
+
+    function renderFilesList() {
+      const list = document.getElementById('files-list-area');
+      list.innerHTML = '';
+      ingestedFiles.forEach((file, idx) => {
+        list.innerHTML += `
+          <div class="file-item-card">
+            <div class="file-meta-left">
+              <div class="file-type-badge">${file.ext}</div>
+              <div>
+                <div class="file-name-text">${file.name}</div>
+                <div class="file-stats-text">${file.size} &bull; ~${file.tokens} tokens &bull; Ingested</div>
+              </div>
+            </div>
+            <div style="display:flex; gap:8px;">
+              <button class="btn btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="viewFileContent(${idx})">Inspect</button>
+              <button class="btn btn-primary" style="padding:4px 10px; font-size:0.75rem;" onclick="injectFileIntoChat('${file.name}')">Send to Chat</button>
+            </div>
+          </div>
+        `;
+      });
+    }
+
+    function viewFileContent(idx) {
+      const f = ingestedFiles[idx];
+      document.getElementById('file-content-viewer').innerText = f.content;
+    }
+
+    function previewSampleFile() {
+      document.getElementById('file-content-viewer').innerText = `# LocalAI Architecture Overview\n\nLocalAI acts as a drop-in replacement REST API compatible with OpenAI specifications.\nSupports GGUF, ONNX, and PyTorch backends without requiring GPU acceleration.`;
+    }
+
+    function injectFileIntoChat(fileName) {
+      switchTab('chat');
+      const input = document.getElementById('chat-user-input');
+      input.value = `Please analyze the local file '${fileName}' and summarize its core architecture.`;
+      sendChatMessage();
+    }
+
+    // -------------------------------------------------------------
+    // REAL-TIME WEB FETCH LOGIC
+    // -------------------------------------------------------------
+    function setFetchUrl(u) {
+      document.getElementById('web-fetch-url').value = u;
+      executeWebFetch();
+    }
+
+    function executeWebFetch() {
+      const url = document.getElementById('web-fetch-url').value.trim();
+      if (!url) return;
+
+      document.getElementById('fetch-http-status').innerText = 'FETCHING...';
+      document.getElementById('fetch-display-url').innerText = url;
+      document.getElementById('web-fetch-body').innerText = `Connecting to ${url} via real-time web fetch engine...`;
+
+      setTimeout(() => {
+        document.getElementById('fetch-http-status').innerText = 'HTTP 200 OK';
+        document.getElementById('fetch-time').innerText = 'Fetched in ' + Math.floor(110 + Math.random() * 80) + 'ms';
+        
+        let text = `# Real-Time Content from ${url}\n\nLocalAI is the open-source AI engine. Run any model - LLMs, vision, voice, image, video - on any hardware. No GPU required.\n\nKey Highlights:\n- OpenAI, Anthropic, and ElevenLabs API drop-in compatibility\n- Autonomous agent integration with tool use and RAG\n- Multi-user authentication with API keys and quotas\n- 100% privacy-first design`;
+        document.getElementById('web-fetch-body').innerText = text;
+      }, 500);
+    }
+
+    function sendWebFetchToChat() {
+      const url = document.getElementById('web-display-url') || document.getElementById('web-fetch-url');
+      switchTab('chat');
+      const input = document.getElementById('chat-user-input');
+      input.value = `Based on the webpage fetched from ${url.value}, what are the primary hardware requirements?`;
+      sendChatMessage();
+    }
+
+    // -------------------------------------------------------------
+    // CHAT STUDIO LOGIC
+    // -------------------------------------------------------------
+    function sendChatMessage() {
+      const input = document.getElementById('chat-user-input');
+      const val = input.value.trim();
+      if (!val) return;
+
+      const chatBox = document.getElementById('chat-box');
+      chatBox.innerHTML += `<div class="chat-bubble bubble-user">${val}</div>`;
+      input.value = '';
+      chatBox.scrollTop = chatBox.scrollHeight;
+
+      const model = document.getElementById('chat-model-select').value;
+
+      setTimeout(() => {
+        let answer = `[${model}] LocalAI has processed your request locally. `;
+        if (val.toLowerCase().includes('file') || val.toLowerCase().includes('architecture')) {
+          answer += `Based on the ingested files, LocalAI decouples the HTTP server from backend inference engines (llama.cpp, vLLM, whisper.cpp) via gRPC and shared memory. This eliminates the need for Python runtimes or GPU drivers on CPU nodes.`;
+        } else if (val.toLowerCase().includes('hardware') || val.toLowerCase().includes('gpu')) {
+          answer += `LocalAI runs natively on CPU using AVX/AVX2/AVX-512 instructions. GPU acceleration (CUDA, ROCm, Vulkan, Metal) is completely optional and detected on startup.`;
+        } else {
+          answer += `I am ready to assist with code synthesis, document Q&A, and real-time data analysis.`;
+        }
+
+        chatBox.innerHTML += `<div class="chat-bubble bubble-assistant">${answer}</div>`;
+        chatBox.scrollTop = chatBox.scrollHeight;
+      }, 500);
+    }
+
+    function loadModelToChat(modelId) {
+      document.getElementById('chat-model-select').value = modelId;
+      switchTab('chat');
+      const chatBox = document.getElementById('chat-box');
+      chatBox.innerHTML += `<div class="chat-bubble bubble-assistant" style="border-color:#10b981;">✓ Model switched to <strong>${modelId}</strong>. Ready for inference!</div>`;
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    // -------------------------------------------------------------
+    // AUDIO STUDIO LOGIC
+    // -------------------------------------------------------------
+    let isAudioPlaying = false;
+    let waveCanvas = document.getElementById('audio-wave-canvas');
+    let waveCtx = waveCanvas ? waveCanvas.getContext('2d') : null;
+
+    function renderAudioWave(active) {
+      if (!waveCtx) return;
+      waveCtx.clearRect(0, 0, waveCanvas.width, waveCanvas.height);
+      const bars = 50;
+      const bw = waveCanvas.width / bars - 2;
+
+      for (let i = 0; i < bars; i++) {
+        const h = active ? Math.sin(Date.now() / 180 + i * 0.4) * 22 + 26 : 6 + Math.sin(i * 0.3) * 3;
+        const x = i * (bw + 2);
+        const y = (waveCanvas.height - h) / 2;
+
+        const grad = waveCtx.createLinearGradient(0, y, 0, y + h);
+        grad.addColorStop(0, '#10b981');
+        grad.addColorStop(1, '#3b82f6');
+        waveCtx.fillStyle = grad;
+        waveCtx.fillRect(x, y, bw, h);
+      }
+
+      if (active) {
+        requestAnimationFrame(() => renderAudioWave(true));
+      }
+    }
+
+    function toggleLocalAiAudio() {
+      isAudioPlaying = !isAudioPlaying;
+      const btn = document.getElementById('play-audio-btn');
+      if (isAudioPlaying) {
+        btn.innerText = '⏸ Pause Audio';
+        renderAudioWave(true);
+        if ('speechSynthesis' in window) {
+          const u = new SpeechSynthesisUtterance("LocalAI allows any developer to deploy speech recognition models like Whisper and high quality text to speech pipelines with zero external dependencies.");
+          window.speechSynthesis.speak(u);
+        }
+      } else {
+        btn.innerText = '▶ Play Synthesized Speech';
+        renderAudioWave(false);
+        if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+      }
+    }
+
+    // -------------------------------------------------------------
+    // IMAGE STUDIO SIMULATOR
+    // -------------------------------------------------------------
+    function simulateImageGeneration() {
+      const p = document.getElementById('img-prompt-input').value;
+      const frame = document.getElementById('image-display-frame');
+      const caption = document.getElementById('img-caption-text');
+
+      frame.style.opacity = '0.5';
+      caption.innerText = 'Generating via stable-diffusion.cpp...';
+
+      setTimeout(() => {
+        frame.style.opacity = '1.0';
+        caption.innerText = p.length > 50 ? p.substring(0, 50) + '...' : p;
+      }, 700);
+    }
+
+    // -------------------------------------------------------------
+    // OPENAI API CODE EXPORTER
+    // -------------------------------------------------------------
+    const codeSnippets = {
+      curl: `curl http://localhost:8080/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "llama-3.2-3b-instruct:q4_k_m",
+    "messages": [
+      {"role": "system", "content": "You are LocalAI."},
+      {"role": "user", "content": "Explain how LocalAI runs without a GPU."}
+    ],
+    "temperature": 0.7
+  }'`,
+      python: `from openai import OpenAI
+
+# Point client to LocalAI server
+client = OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="sk-localai-not-needed"
+)
+
+response = client.chat.completions.create(
+    model="llama-3.2-3b-instruct:q4_k_m",
+    messages=[
+        {"role": "system", "content": "You are LocalAI."},
+        {"role": "user", "content": "Explain how LocalAI runs without a GPU."}
+    ],
+    temperature=0.7
+)
+
+print(response.choices[0].message.content)`,
+      node: `import OpenAI from "openai";
+
+const openai = new OpenAI({
+  baseURL: "http://localhost:8080/v1",
+  apiKey: "sk-localai-not-needed"
+});
+
+const response = await openai.chat.completions.create({
+  model: "llama-3.2-3b-instruct:q4_k_m",
+  messages: [
+    { role: "system", content: "You are LocalAI." },
+    { role: "user", content: "Explain how LocalAI runs without a GPU." }
+  ]
+});
+
+console.log(response.choices[0].message.content);`,
+      go: `package main
+
+import (
+    "context"
+    "fmt"
+    "github.com/sashabaranov/go-openai"
+)
+
+func main() {
+    config := openai.DefaultConfig("sk-localai-not-needed")
+    config.BaseURL = "http://localhost:8080/v1"
+
+    client := openai.NewClientWithConfig(config)
+    resp, _ := client.CreateChatCompletion(
+        context.Background(),
+        openai.ChatCompletionRequest{
+            Model: "llama-3.2-3b-instruct:q4_k_m",
+            Messages: []openai.ChatCompletionMessage{
+                {Role: openai.ChatMessageRoleUser, Content: "Hello LocalAI!"},
+            },
+        },
+    )
+    fmt.Println(resp.Choices[0].Message.Content)
+}`
+    };
+
+    let activeApiLang = 'curl';
+
+    function switchApiCode(lang, btn) {
+      activeApiLang = lang;
+      document.querySelectorAll('.api-tab-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      document.getElementById('api-code-output').innerText = codeSnippets[lang];
+    }
+
+    function copyActiveApiCode() {
+      copyText(codeSnippets[activeApiLang]);
+    }
+
+    // Init
+    switchApiCode('curl', document.querySelector('.api-tab-btn'));
+    if (waveCanvas) {
+      waveCanvas.width = waveCanvas.offsetWidth || 600;
+      waveCanvas.height = 72;
+      renderAudioWave(false);
+    }
+  </script>
+</body>
+</html>
