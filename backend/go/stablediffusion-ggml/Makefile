@@ -8,9 +8,15 @@ JOBS?=$(shell nproc --ignore=1)
 
 # stablediffusion.cpp (ggml)
 STABLEDIFFUSION_GGML_REPO?=https://github.com/leejet/stable-diffusion.cpp
-STABLEDIFFUSION_GGML_VERSION?=a564fdf642780d1df123f1c413b19961375b8346
+STABLEDIFFUSION_GGML_VERSION?=f89d9b13d730eabeede7314ce49dacd18d3c90c2
 
 CMAKE_ARGS+=-DGGML_MAX_NAME=128
+
+# Enable the ggml RPC backend so generation can be sharded across remote
+# rpc-server workers (the same backend-agnostic ggml rpc-server used by the
+# llama.cpp backend). Servers are selected via the `rpc_servers` option or the
+# LLAMACPP_GRPC_SERVERS env var (populated automatically in p2p worker mode).
+CMAKE_ARGS+=-DSD_RPC=ON
 
 ifeq ($(NATIVE),false)
 	CMAKE_ARGS+=-DGGML_NATIVE=OFF
@@ -32,17 +38,16 @@ else ifeq ($(BUILD_TYPE),hipblas)
 	ROCM_PATH ?= /opt/rocm
 	export CXX=$(ROCM_HOME)/llvm/bin/clang++
 	export CC=$(ROCM_HOME)/llvm/bin/clang
-	AMDGPU_TARGETS?=gfx908,gfx90a,gfx942,gfx950,gfx1030,gfx1100,gfx1101,gfx1102,gfx1200,gfx1201
-	CMAKE_ARGS+=-DSD_HIPBLAS=ON -DGGML_HIPBLAS=ON -DAMDGPU_TARGETS=$(AMDGPU_TARGETS)
+	AMDGPU_TARGETS?=gfx908,gfx90a,gfx942,gfx950,gfx1030,gfx1100,gfx1101,gfx1102,gfx1151,gfx1200,gfx1201
+	# SD_HIPBLAS turns on ggml's HIP backend itself; GGML_HIPBLAS is the name ggml
+	# used before it was renamed to GGML_HIP, so passing it here only produced an
+	# unused-variable warning.
+	CMAKE_ARGS+=-DSD_HIPBLAS=ON -DAMDGPU_TARGETS=$(AMDGPU_TARGETS)
 else ifeq ($(BUILD_TYPE),vulkan)
 	CMAKE_ARGS+=-DSD_VULKAN=ON -DGGML_VULKAN=ON
-else ifeq ($(OS),Darwin)
-	ifneq ($(BUILD_TYPE),metal)
-		CMAKE_ARGS+=-DSD_METAL=OFF -DGGML_METAL=OFF
-	else
-		CMAKE_ARGS+=-DSD_METAL=ON -DGGML_METAL=ON
-		CMAKE_ARGS+=-DGGML_METAL_EMBED_LIBRARY=ON
-	endif
+else ifeq ($(BUILD_TYPE),metal)
+	CMAKE_ARGS+=-DSD_METAL=ON -DGGML_METAL=ON
+	CMAKE_ARGS+=-DGGML_METAL_EMBED_LIBRARY=ON
 endif
 
 ifeq ($(BUILD_TYPE),sycl_f16)
@@ -65,8 +70,21 @@ sources/stablediffusion-ggml.cpp:
 	cd sources/stablediffusion-ggml.cpp && \
 	git checkout $(STABLEDIFFUSION_GGML_VERSION) && \
 	git submodule update --init --recursive --depth 1 --single-branch
+	$(MAKE) sync-rpc-op-count
 
-# Detect OS
+# leejet's ggml fork adds ops (e.g. GGML_OP_SAGE_ATTN) without updating the
+# GGML_OP_COUNT static_assert in ggml-rpc.h, which breaks the build because we
+# enable SD_RPC while upstream CI does not. The new ops are appended before
+# GGML_OP_COUNT, so existing op ids on the wire are unchanged and the RPC
+# handshake only compares major/minor versions. Align the assert with the
+# count that ggml.c asserts; this is a no-op once upstream fixes it.
+sync-rpc-op-count:
+	@count=$$(grep -oE 'GGML_OP_COUNT == [0-9]+' sources/stablediffusion-ggml.cpp/ggml/src/ggml.c | head -n1 | grep -oE '[0-9]+'); \
+	if [ -n "$$count" ]; then \
+		sed -i.bak -E "s/GGML_OP_COUNT == [0-9]+/GGML_OP_COUNT == $$count/" sources/stablediffusion-ggml.cpp/ggml/include/ggml-rpc.h && \
+		rm -f sources/stablediffusion-ggml.cpp/ggml/include/ggml-rpc.h.bak; \
+	fi
+
 UNAME_S := $(shell uname -s)
 
 # Only build CPU variants on Linux
@@ -119,12 +137,13 @@ libgosd-fallback.so: sources/stablediffusion-ggml.cpp
 	SO_TARGET=libgosd-fallback.so CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_AVX=off -DGGML_AVX2=off -DGGML_AVX512=off -DGGML_FMA=off -DGGML_F16C=off -DGGML_BMI2=off" $(MAKE) libgosd-custom
 	rm -rfv build*
 
-libgosd-custom: CMakeLists.txt gosd.cpp gosd.h
+libgosd-custom: CMakeLists.txt cpp/gosd.cpp cpp/gosd.h
 	mkdir -p build-$(SO_TARGET) && \
 	cd build-$(SO_TARGET) && \
 	cmake .. $(CMAKE_ARGS) && \
 	cmake --build . --config Release -j$(JOBS) && \
 	cd .. && \
-	mv build-$(SO_TARGET)/libgosd.so ./$(SO_TARGET)
+	(mv build-$(SO_TARGET)/libgosd.so ./$(SO_TARGET) 2>/dev/null || \
+	 mv build-$(SO_TARGET)/libgosd.dylib ./$(SO_TARGET) 2>/dev/null)
 
 all: stablediffusion-ggml package

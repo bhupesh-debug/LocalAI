@@ -11,7 +11,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -22,17 +21,21 @@ import (
 
 	"github.com/Masterminds/sprig/v3"
 	"github.com/google/uuid"
-	"github.com/mudler/LocalAI/core/config"
-	mcpTools "github.com/mudler/LocalAI/core/http/endpoints/mcp"
-	"github.com/mudler/LocalAI/core/schema"
-	"github.com/mudler/LocalAI/core/services/jobs"
-	"github.com/mudler/LocalAI/core/templates"
-	"github.com/mudler/LocalAI/pkg/model"
-	"github.com/mudler/LocalAI/pkg/xsync"
 	"github.com/mudler/cogito"
 	"github.com/mudler/cogito/clients"
 	"github.com/mudler/xlog"
 	"github.com/robfig/cron/v3"
+
+	"github.com/mudler/LocalAI/core/config"
+	mcpTools "github.com/mudler/LocalAI/core/http/endpoints/mcp"
+	"github.com/mudler/LocalAI/core/schema"
+	"github.com/mudler/LocalAI/core/services/jobs"
+	"github.com/mudler/LocalAI/core/services/messaging"
+	"github.com/mudler/LocalAI/core/services/syncstate"
+	"github.com/mudler/LocalAI/core/templates"
+	"github.com/mudler/LocalAI/pkg/httpclient"
+	"github.com/mudler/LocalAI/pkg/model"
+	"github.com/mudler/LocalAI/pkg/xsync"
 )
 
 // AgentJobService manages agent tasks and job execution
@@ -42,12 +45,20 @@ type AgentJobService struct {
 	configLoader *config.ModelConfigLoader
 	evaluator    *templates.Evaluator
 
+	// tasks is the cross-replica task store: an in-memory map kept consistent
+	// across replicas via NATS, with read-through to the configured persister
+	// (file in standalone, PostgreSQL in distributed). Unlike jobs - which already
+	// converge via the dispatcher + DB read-through - tasks previously read
+	// in-memory only, so ListTasks went stale on non-originating replicas.
+	tasks *syncstate.SyncedMap[string, schema.Task]
+	// taskNats is the distributed NATS client backing the tasks SyncedMap. It is
+	// not available at construction time, so it is injected via SetTaskSyncNATS
+	// during distributed wiring; nil keeps tasks in-memory-only (standalone).
+	taskNats messaging.Broadcaster
+
 	// Storage (in-memory primary, persister for secondary persistence)
-	tasks     *xsync.SyncedMap[string, schema.Task]
 	jobs      *xsync.SyncedMap[string, schema.Job]
 	persister JobPersister
-	tasksFile string // Path to agent_tasks.json (kept for backward compat)
-	jobsFile  string // Path to agent_jobs.json (kept for backward compat)
 	userID    string // Scoping: empty for global (main service), set for per-user instances
 
 	// Job execution channel
@@ -70,9 +81,6 @@ type AgentJobService struct {
 	// Service lifecycle
 	ctx    context.Context
 	cancel context.CancelFunc
-
-	// Mutex for file operations
-	fileMutex sync.Mutex
 }
 
 // DistributedDispatcher is the interface for distributed job dispatching via NATS.
@@ -100,6 +108,31 @@ func (s *AgentJobService) SetDistributedJobStore(store *jobs.JobStore) {
 	s.persister = &dbJobPersister{store: store}
 }
 
+// SetTaskSyncNATS wires the distributed NATS client used to keep agent *tasks*
+// consistent across replicas (jobs already converge via the dispatcher + DB
+// read-through, so they are left untouched). The client is not available when the
+// service is constructed, so it is injected here during distributed wiring and the
+// tasks SyncedMap is rebuilt to pick it up. It is always called before Start /
+// hydrate, while the map is still empty, so rebuilding loses no state. Passing nil
+// (standalone) keeps the map in-memory-only with no broadcast.
+func (s *AgentJobService) SetTaskSyncNATS(nats messaging.Broadcaster) {
+	s.taskNats = nats
+	s.buildTasksMap()
+}
+
+// buildTasksMap (re)constructs the cross-replica tasks SyncedMap from the current
+// taskNats. The Store adapter reads s.persister/s.userID live, so a persister swap
+// (SetDistributedJobStore) needs no rebuild; only the NATS client, fixed at
+// New-time, forces one - hence SetTaskSyncNATS calls this.
+func (s *AgentJobService) buildTasksMap() {
+	s.tasks = syncstate.New(syncstate.Config[string, schema.Task]{
+		Name:  "agent.tasks",
+		Key:   func(t schema.Task) string { return t.ID },
+		Nats:  s.taskNats,
+		Store: &taskStoreAdapter{svc: s},
+	})
+}
+
 // Dispatcher returns the distributed dispatcher (nil if not in distributed mode).
 func (s *AgentJobService) Dispatcher() DistributedDispatcher {
 	return s.dispatcher
@@ -108,13 +141,6 @@ func (s *AgentJobService) Dispatcher() DistributedDispatcher {
 // DBStore returns the database-backed job store (nil if not configured).
 func (s *AgentJobService) DBStore() *jobs.JobStore {
 	return s.rawDBStore
-}
-
-// saveTasks persists tasks via the configured persister (file or DB).
-func (s *AgentJobService) saveTasks(task schema.Task) {
-	if err := s.persister.SaveTask(s.userID, task); err != nil {
-		xlog.Warn("Failed to persist task", "error", err, "task_id", task.ID)
-	}
 }
 
 // saveJobs persists jobs via the configured persister (file or DB).
@@ -133,18 +159,8 @@ func (s *AgentJobService) LoadFromDB() {
 
 // loadFromPersister loads tasks and jobs from the configured persister into memory.
 func (s *AgentJobService) loadFromPersister() {
-	if tasks, err := s.persister.LoadTasks(s.userID); err != nil {
+	if err := s.hydrateTasks(s.appConfig.Context); err != nil {
 		xlog.Warn("Failed to load tasks from persister", "error", err)
-	} else {
-		for _, task := range tasks {
-			s.tasks.Set(task.ID, task)
-			if task.Enabled && task.Cron != "" {
-				if err := s.ScheduleCronTask(task); err != nil {
-					xlog.Warn("Failed to schedule cron task on load", "error", err, "task_id", task.ID)
-				}
-			}
-		}
-		xlog.Info("Loaded tasks from persister", "count", len(tasks))
 	}
 
 	if loadedJobs, err := s.persister.LoadJobs(s.userID); err != nil {
@@ -155,6 +171,27 @@ func (s *AgentJobService) loadFromPersister() {
 		}
 		xlog.Info("Loaded jobs from persister", "count", len(loadedJobs))
 	}
+}
+
+// hydrateTasks loads tasks into the cross-replica SyncedMap and (re)schedules
+// cron entries for enabled tasks. Hydration goes through the SyncedMap's Store
+// read-through (Start), not Set, so it neither re-persists nor re-broadcasts the
+// loaded tasks. Each service instance hydrates exactly once: the main service via
+// Start -> loadFromPersister, per-user services via LoadFromDB or LoadTasksFromFile.
+func (s *AgentJobService) hydrateTasks(ctx context.Context) error {
+	if err := s.tasks.Start(ctx); err != nil {
+		return err
+	}
+	tasks := s.tasks.List()
+	for _, task := range tasks {
+		if task.Enabled && task.Cron != "" {
+			if err := s.ScheduleCronTask(task); err != nil {
+				xlog.Warn("Failed to schedule cron task on load", "error", err, "task_id", task.ID)
+			}
+		}
+	}
+	xlog.Info("Loaded tasks from persister", "count", len(tasks))
+	return nil
 }
 
 // JobExecution represents a job to be executed
@@ -204,153 +241,65 @@ func NewAgentJobServiceWithPaths(
 ) *AgentJobService {
 	retentionDays := cmp.Or(appConfig.AgentJobRetentionDays, 30)
 
-	tasks := xsync.NewSyncedMap[string, schema.Task]()
 	jobsMap := xsync.NewSyncedMap[string, schema.Job]()
 
-	return &AgentJobService{
+	s := &AgentJobService{
 		appConfig:    appConfig,
 		modelLoader:  modelLoader,
 		configLoader: configLoader,
 		evaluator:    evaluator,
-		tasks:        tasks,
 		jobs:         jobsMap,
 		persister: &fileJobPersister{
-			tasks:     tasks,
 			jobs:      jobsMap,
 			tasksFile: tasksFile,
 			jobsFile:  jobsFile,
+			taskSet:   make(map[string]schema.Task),
 		},
-		tasksFile:     tasksFile,
-		jobsFile:      jobsFile,
 		jobQueue:      make(chan JobExecution, 100), // Buffer for 100 jobs
 		cancellations: xsync.NewSyncedMap[string, context.CancelFunc](),
 		cronScheduler: cron.New(), // Support seconds in cron
 		cronEntries:   xsync.NewSyncedMap[string, cron.EntryID](),
 		retentionDays: retentionDays,
 	}
+	// Build the cross-replica tasks map standalone (nil NATS); SetTaskSyncNATS
+	// rebuilds it with the distributed client once that is available, before Start.
+	s.buildTasksMap()
+	return s
 }
 
-// LoadTasksFromFile loads tasks from agent_tasks.json
+// LoadTasksFromFile loads tasks from the persister into the in-memory map
+// and schedules cron entries. Named "FromFile" for backward compat; in DB
+// mode it loads from the database.
 func (s *AgentJobService) LoadTasksFromFile() error {
-	if s.tasksFile == "" {
-		return nil // No file path configured
-	}
-
-	s.fileMutex.Lock()
-	defer s.fileMutex.Unlock()
-
-	if _, err := os.Stat(s.tasksFile); os.IsNotExist(err) {
-		xlog.Debug("agent_tasks.json not found, starting with empty tasks")
-		return nil
-	}
-
-	fileContent, err := os.ReadFile(s.tasksFile)
-	if err != nil {
-		return fmt.Errorf("failed to read tasks file: %w", err)
-	}
-
-	var tasksFile schema.TasksFile
-	if err := json.Unmarshal(fileContent, &tasksFile); err != nil {
-		return fmt.Errorf("failed to parse tasks file: %w", err)
-	}
-
-	for _, task := range tasksFile.Tasks {
-		s.tasks.Set(task.ID, task)
-		// Schedule cron if enabled and has cron expression
-		if task.Enabled && task.Cron != "" {
-			if err := s.ScheduleCronTask(task); err != nil {
-				xlog.Warn("Failed to schedule cron task on load", "error", err, "task_id", task.ID)
-			}
-		}
-	}
-
-	xlog.Info("Loaded tasks from file", "count", len(tasksFile.Tasks))
-
-	return nil
+	return s.hydrateTasks(s.appConfig.Context)
 }
 
-// SaveTasksToFile saves tasks to agent_tasks.json
+// SaveTasksToFile flushes the current tasks map via the persister. File
+// persister bulk-writes the JSON file atomically; DB persister no-ops
+// because per-task SaveTask calls already wrote through.
 func (s *AgentJobService) SaveTasksToFile() error {
-	if s.tasksFile == "" {
-		return nil // No file path configured
-	}
-
-	s.fileMutex.Lock()
-	defer s.fileMutex.Unlock()
-
-	tasksFile := schema.TasksFile{
-		Tasks: s.tasks.Values(),
-	}
-
-	fileContent, err := json.MarshalIndent(tasksFile, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal tasks: %w", err)
-	}
-
-	if err := os.WriteFile(s.tasksFile, fileContent, 0600); err != nil {
-		return fmt.Errorf("failed to write tasks file: %w", err)
-	}
-
-	return nil
+	return s.persister.FlushTasks()
 }
 
-// LoadJobsFromFile loads jobs from agent_jobs.json
+// LoadJobsFromFile loads jobs from the persister into the in-memory map.
+// Named "FromFile" for backward compat; in DB mode it loads from the
+// database.
 func (s *AgentJobService) LoadJobsFromFile() error {
-	if s.jobsFile == "" {
-		return nil // No file path configured
-	}
-
-	s.fileMutex.Lock()
-	defer s.fileMutex.Unlock()
-
-	if _, err := os.Stat(s.jobsFile); os.IsNotExist(err) {
-		xlog.Debug("agent_jobs.json not found, starting with empty jobs")
-		return nil
-	}
-
-	fileContent, err := os.ReadFile(s.jobsFile)
+	jobs, err := s.persister.LoadJobs(s.userID)
 	if err != nil {
-		return fmt.Errorf("failed to read jobs file: %w", err)
+		return err
 	}
-
-	var jobsFile schema.JobsFile
-	if err := json.Unmarshal(fileContent, &jobsFile); err != nil {
-		return fmt.Errorf("failed to parse jobs file: %w", err)
-	}
-
-	// Load jobs into memory
-	for _, job := range jobsFile.Jobs {
+	for _, job := range jobs {
 		s.jobs.Set(job.ID, job)
 	}
-
-	xlog.Info("Loaded jobs from file", "count", len(jobsFile.Jobs))
 	return nil
 }
 
-// SaveJobsToFile saves jobs to agent_jobs.json
+// SaveJobsToFile flushes the current jobs map via the persister. File
+// persister bulk-writes the JSON file atomically; DB persister no-ops
+// because per-job SaveJob calls already wrote through.
 func (s *AgentJobService) SaveJobsToFile() error {
-	if s.jobsFile == "" {
-		return nil // No file path configured
-	}
-
-	s.fileMutex.Lock()
-	defer s.fileMutex.Unlock()
-
-	jobsFile := schema.JobsFile{
-		Jobs:        s.jobs.Values(),
-		LastCleanup: time.Now(),
-	}
-
-	fileContent, err := json.MarshalIndent(jobsFile, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal jobs: %w", err)
-	}
-
-	if err := os.WriteFile(s.jobsFile, fileContent, 0600); err != nil {
-		return fmt.Errorf("failed to write jobs file: %w", err)
-	}
-
-	return nil
+	return s.persister.FlushJobs()
 }
 
 // CreateTask creates a new task
@@ -375,8 +324,12 @@ func (s *AgentJobService) CreateTask(task schema.Task) (string, error) {
 		task.Enabled = true // Default to enabled
 	}
 
-	// Store task
-	s.tasks.Set(id, task)
+	// Store task: Set updates the in-memory map, write-throughs to the persister
+	// (file or DB), and broadcasts the create to peer replicas. Background ctx
+	// because CreateTask carries no request ctx (mirrors the finetune service).
+	if err := s.tasks.Set(context.Background(), task); err != nil {
+		return "", fmt.Errorf("failed to persist task: %w", err)
+	}
 
 	// Schedule cron if enabled and has cron expression
 	if task.Enabled && task.Cron != "" {
@@ -385,16 +338,15 @@ func (s *AgentJobService) CreateTask(task schema.Task) (string, error) {
 		}
 	}
 
-	s.saveTasks(task)
 	return id, nil
 }
 
 // UpdateTask updates an existing task
 func (s *AgentJobService) UpdateTask(id string, task schema.Task) error {
-	if !s.tasks.Exists(id) {
+	existing, ok := s.tasks.Get(id)
+	if !ok {
 		return fmt.Errorf("%w: %s", ErrTaskNotFound, id)
 	}
-	existing := s.tasks.Get(id)
 
 	// Preserve ID and CreatedAt
 	task.ID = id
@@ -406,8 +358,10 @@ func (s *AgentJobService) UpdateTask(id string, task schema.Task) error {
 		s.UnscheduleCronTask(id)
 	}
 
-	// Store updated task
-	s.tasks.Set(id, task)
+	// Store updated task: write-through + broadcast (see CreateTask).
+	if err := s.tasks.Set(context.Background(), task); err != nil {
+		return fmt.Errorf("failed to persist task: %w", err)
+	}
 
 	// Schedule new cron if enabled and has cron expression
 	if task.Enabled && task.Cron != "" {
@@ -416,24 +370,22 @@ func (s *AgentJobService) UpdateTask(id string, task schema.Task) error {
 		}
 	}
 
-	s.saveTasks(task)
 	return nil
 }
 
 // DeleteTask deletes a task
 func (s *AgentJobService) DeleteTask(id string) error {
-	if !s.tasks.Exists(id) {
+	if _, ok := s.tasks.Get(id); !ok {
 		return fmt.Errorf("%w: %s", ErrTaskNotFound, id)
 	}
 
 	// Unschedule cron
 	s.UnscheduleCronTask(id)
 
-	// Remove from memory
-	s.tasks.Delete(id)
-
-	if err := s.persister.DeleteTask(id); err != nil {
-		xlog.Warn("Failed to delete task from persister", "error", err, "task_id", id)
+	// Delete removes from the in-memory map, deletes from the persister, and
+	// broadcasts the removal to peer replicas.
+	if err := s.tasks.Delete(context.Background(), id); err != nil {
+		xlog.Warn("Failed to delete task from store", "error", err, "task_id", id)
 	}
 
 	return nil
@@ -441,8 +393,8 @@ func (s *AgentJobService) DeleteTask(id string) error {
 
 // GetTask retrieves a task by ID
 func (s *AgentJobService) GetTask(id string) (*schema.Task, error) {
-	task := s.tasks.Get(id)
-	if task.ID == "" {
+	task, ok := s.tasks.Get(id)
+	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrTaskNotFound, id)
 	}
 	return &task, nil
@@ -450,7 +402,7 @@ func (s *AgentJobService) GetTask(id string) (*schema.Task, error) {
 
 // ListTasks returns all tasks, sorted by creation date (newest first)
 func (s *AgentJobService) ListTasks() []schema.Task {
-	tasks := s.tasks.Values()
+	tasks := s.tasks.List()
 	// Sort by CreatedAt descending (newest first), then by Name for stability
 	slices.SortFunc(tasks, func(a, b schema.Task) int {
 		if a.CreatedAt.Equal(b.CreatedAt) {
@@ -479,8 +431,8 @@ func (s *AgentJobService) buildPrompt(templateStr string, params map[string]stri
 // ExecuteJob creates and queues a job for execution
 // multimedia can be nil for backward compatibility
 func (s *AgentJobService) ExecuteJob(taskID string, params map[string]string, triggeredBy string, multimedia *schema.MultimediaAttachment) (string, error) {
-	task := s.tasks.Get(taskID)
-	if task.ID == "" {
+	task, ok := s.tasks.Get(taskID)
+	if !ok {
 		return "", fmt.Errorf("%w: %s", ErrTaskNotFound, taskID)
 	}
 
@@ -731,7 +683,7 @@ func (s *AgentJobService) fetchMultimediaFromURL(url string, headers map[string]
 	}
 
 	// Execute request
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := httpclient.NewWithTimeout(30 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch URL: %w", err)
@@ -1333,7 +1285,7 @@ func (s *AgentJobService) sendWebhook(job schema.Job, task schema.Task, webhookC
 	}
 
 	// Execute with retry
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := httpclient.NewWithTimeout(30 * time.Second)
 	err = s.executeWithRetry(client, req)
 	if err != nil {
 		xlog.Error("Webhook delivery failed", "error", err, "job_id", job.ID, "webhook_url", webhookConfig.URL)
@@ -1532,6 +1484,12 @@ func (s *AgentJobService) Stop() error {
 	}
 	if s.cronScheduler != nil {
 		s.cronScheduler.Stop()
+	}
+	// Release the tasks SyncedMap subscription / background workers.
+	if s.tasks != nil {
+		if err := s.tasks.Close(); err != nil {
+			xlog.Warn("Error closing tasks sync map", "error", err)
+		}
 	}
 	xlog.Info("AgentJobService stopped")
 	return nil

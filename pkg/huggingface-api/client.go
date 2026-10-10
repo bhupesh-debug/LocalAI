@@ -1,12 +1,20 @@
 package hfapi
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
+
+	"github.com/mudler/LocalAI/pkg/httpclient"
 )
 
 // Model represents a model from the Hugging Face API
@@ -61,6 +69,16 @@ type ModelDetails struct {
 	Files         []ModelFile
 	ReadmeFile    *ModelFile
 	ReadmeContent string
+
+	// PipelineTag mirrors the HuggingFace model-level "pipeline_tag" field
+	// (e.g. "text-to-speech", "sentence-similarity"). Empty when the /api/models
+	// metadata endpoint is unreachable or the repo does not declare one.
+	PipelineTag string
+
+	// LibraryName mirrors the HuggingFace "library_name" field
+	// (e.g. "transformers", "diffusers", "sentence-transformers"). Empty when
+	// the metadata endpoint is unreachable or the repo does not declare one.
+	LibraryName string
 }
 
 // SearchParams represents the parameters for searching models
@@ -73,57 +91,139 @@ type SearchParams struct {
 
 // Client represents a Hugging Face API client
 type Client struct {
-	baseURL string
-	client  *http.Client
+	baseURL      string
+	client       *http.Client
+	maxRetries   int
+	retryBackoff time.Duration
+	maxBackoff   time.Duration
+	sleepFn      func(time.Duration)
 }
+
+var ErrRateLimited = errors.New("huggingface API rate limited")
 
 // NewClient creates a new Hugging Face API client
 func NewClient() *Client {
 	return &Client{
-		baseURL: "https://huggingface.co/api/models",
-		client:  &http.Client{},
+		baseURL:      "https://huggingface.co/api/models",
+		client:       httpclient.New(httpclient.WithFollowRedirects()),
+		maxRetries:   5,
+		retryBackoff: 1 * time.Second,
+		maxBackoff:   30 * time.Second,
+		sleepFn:      time.Sleep,
 	}
+}
+
+func (c *Client) newRequest(ctx context.Context, method, rawURL, token string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return req, nil
 }
 
 // SearchModels searches for models using the Hugging Face API
 func (c *Client) SearchModels(params SearchParams) ([]Model, error) {
-	req, err := http.NewRequest("GET", c.baseURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+	for attempt := 1; attempt <= c.maxRetries; attempt++ {
+		req, err := http.NewRequest("GET", c.baseURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+
+		// Add query parameters
+		q := req.URL.Query()
+		q.Add("sort", params.Sort)
+		q.Add("direction", fmt.Sprintf("%d", params.Direction))
+		q.Add("limit", fmt.Sprintf("%d", params.Limit))
+		q.Add("search", params.Search)
+		req.URL.RawQuery = q.Encode()
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			if attempt < c.maxRetries {
+				c.sleepFn(c.exponentialBackoff(attempt))
+				continue
+			}
+			return nil, fmt.Errorf("failed to make request: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			if err := resp.Body.Close(); err != nil {
+				return nil, fmt.Errorf("failed to close response body: %w", err)
+			}
+			if c.isRetryableStatus(resp.StatusCode) && attempt < c.maxRetries {
+				c.sleepFn(c.retryDelay(resp, attempt))
+				continue
+			}
+			if resp.StatusCode == http.StatusTooManyRequests {
+				return nil, fmt.Errorf("%w: failed to fetch models. Status code: %d", ErrRateLimited, resp.StatusCode)
+			}
+			return nil, fmt.Errorf("failed to fetch models. Status code: %d", resp.StatusCode)
+		}
+
+		// Read the response body
+		body, err := io.ReadAll(resp.Body)
+		closeErr := resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response body: %w", err)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("failed to close response body: %w", closeErr)
+		}
+
+		// Parse the JSON response
+		var models []Model
+		if err := json.Unmarshal(body, &models); err != nil {
+			return nil, fmt.Errorf("failed to parse JSON response: %w", err)
+		}
+
+		return models, nil
 	}
 
-	// Add query parameters
-	q := req.URL.Query()
-	q.Add("sort", params.Sort)
-	q.Add("direction", fmt.Sprintf("%d", params.Direction))
-	q.Add("limit", fmt.Sprintf("%d", params.Limit))
-	q.Add("search", params.Search)
-	req.URL.RawQuery = q.Encode()
+	return nil, fmt.Errorf("%w: failed to fetch models. Status code: %d", ErrRateLimited, http.StatusTooManyRequests)
+}
 
-	// Make the HTTP request
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to make request: %w", err)
-	}
-	defer resp.Body.Close()
+func (c *Client) isRetryableStatus(code int) bool {
+	return code == http.StatusTooManyRequests || (code >= http.StatusInternalServerError && code <= http.StatusNetworkAuthenticationRequired)
+}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to fetch models. Status code: %d", resp.StatusCode)
-	}
-
-	// Read the response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	// Parse the JSON response
-	var models []Model
-	if err := json.Unmarshal(body, &models); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON response: %w", err)
+func (c *Client) retryDelay(resp *http.Response, attempt int) time.Duration {
+	if retryAfter := strings.TrimSpace(resp.Header.Get("Retry-After")); retryAfter != "" {
+		if seconds, err := strconv.Atoi(retryAfter); err == nil && seconds > 0 {
+			delay := time.Duration(seconds) * time.Second
+			if delay > c.maxBackoff {
+				return c.maxBackoff
+			}
+			return delay
+		}
+		if at, err := http.ParseTime(retryAfter); err == nil {
+			delay := time.Until(at)
+			if delay > 0 {
+				if delay > c.maxBackoff {
+					return c.maxBackoff
+				}
+				return delay
+			}
+		}
 	}
 
-	return models, nil
+	return c.exponentialBackoff(attempt)
+}
+
+func (c *Client) exponentialBackoff(attempt int) time.Duration {
+	delay := c.retryBackoff
+	for i := 1; i < attempt; i++ {
+		delay *= 2
+		if delay >= c.maxBackoff {
+			return c.maxBackoff
+		}
+	}
+	if delay > c.maxBackoff {
+		return c.maxBackoff
+	}
+	return delay
 }
 
 // GetLatest fetches the latest GGUF models
@@ -204,14 +304,12 @@ func (c *Client) listFilesInPath(repoID, path string) ([]FileInfo, error) {
 		switch item.Type {
 		// If it's a directory/folder, recursively list its contents
 		case "directory", "folder":
-			// Build the subfolder path
+			// The tree API returns every entry's path relative to the repo
+			// root ("assets/plots", not "plots"), so it is already the path
+			// to recurse into. Prefixing the parent again requested
+			// "assets/assets/plots", which 404s and failed the whole listing
+			// for any repo nested more than one directory deep.
 			subPath := item.Path
-			if path != "" {
-				subPath = fmt.Sprintf("%s/%s", path, item.Path)
-			}
-
-			// Recursively get files from subfolder
-			// The recursive call will already prepend the subPath to each file's path
 			subFiles, err := c.listFilesInPath(repoID, subPath)
 			if err != nil {
 				return nil, fmt.Errorf("failed to list files in subfolder %s: %w", subPath, err)
@@ -219,10 +317,6 @@ func (c *Client) listFilesInPath(repoID, path string) ([]FileInfo, error) {
 
 			allFiles = append(allFiles, subFiles...)
 		case "file":
-			// It's a file, prepend the current path to make it relative to root
-			//	if path != "" {
-			//		item.Path = fmt.Sprintf("%s/%s", path, item.Path)
-			//	}
 			allFiles = append(allFiles, item)
 		}
 	}
@@ -256,6 +350,51 @@ func (c *Client) GetFileSHA(repoID, fileName string) (string, error) {
 	return "", fmt.Errorf("file %s not found", fileName)
 }
 
+// modelMetadataResponse mirrors the subset of fields returned by
+// GET /api/models/{repoID} that we care about. The public HF endpoint uses
+// snake_case (pipeline_tag, library_name) while the list endpoint used by
+// SearchModels historically returned camelCase — hence the dedicated struct
+// rather than reusing Model.
+type modelMetadataResponse struct {
+	PipelineTag string `json:"pipeline_tag"`
+	LibraryName string `json:"library_name"`
+}
+
+// fetchModelMetadata hits GET /api/models/{repoID} to retrieve high-level
+// model metadata such as pipeline_tag and library_name. Best-effort: a non-
+// 200 response or transport error returns a zero value and a nil error so
+// callers can proceed with file-only data.
+func (c *Client) fetchModelMetadata(repoID string) (modelMetadataResponse, error) {
+	baseURL := strings.TrimSuffix(c.baseURL, "/api/models")
+	url := fmt.Sprintf("%s/api/models/%s", baseURL, repoID)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return modelMetadataResponse{}, err
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return modelMetadataResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return modelMetadataResponse{}, nil
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return modelMetadataResponse{}, err
+	}
+
+	var m modelMetadataResponse
+	if err := json.Unmarshal(body, &m); err != nil {
+		return modelMetadataResponse{}, err
+	}
+	return m, nil
+}
+
 // GetModelDetails gets detailed information about a model including files and checksums
 func (c *Client) GetModelDetails(repoID string) (*ModelDetails, error) {
 	files, err := c.ListFiles(repoID)
@@ -267,6 +406,14 @@ func (c *Client) GetModelDetails(repoID string) (*ModelDetails, error) {
 		ModelID: repoID,
 		Author:  strings.Split(repoID, "/")[0],
 		Files:   make([]ModelFile, 0, len(files)),
+	}
+
+	// Best-effort: PipelineTag / LibraryName are advisory — some callers
+	// (offline tests, restricted networks) can't reach the metadata endpoint.
+	// Swallow errors so downstream file detection still works.
+	if meta, err := c.fetchModelMetadata(repoID); err == nil {
+		details.PipelineTag = meta.PipelineTag
+		details.LibraryName = meta.LibraryName
 	}
 
 	// Process each file
@@ -346,13 +493,111 @@ func FilterFilesByQuantization(files []ModelFile, quantization string) []ModelFi
 	return filtered
 }
 
-// FindPreferredModelFile finds the preferred model file based on quantization preferences
+// shardSuffixRegex matches the `-NNNNN-of-MMMMM.gguf` suffix that llama.cpp
+// uses to split large GGUF models across multiple files. Widths of 1–6 digits
+// are accepted because shard counts seen in the wild range from single digits
+// (unusual) to the common 5-digit zero-padded form (e.g. `-00001-of-00014`).
+var shardSuffixRegex = regexp.MustCompile(`(?i)-(\d{1,6})-of-(\d{1,6})\.gguf$`)
+
+// SplitShardSuffix detects llama.cpp-style sharded GGUF filenames. When the
+// filename ends with `-NNNNN-of-MMMMM.gguf` it returns the base filename
+// (with `.gguf` re-appended), the 1-based shard index, the total shard
+// count, and ok=true. Non-sharded filenames return zero values and ok=false.
+func SplitShardSuffix(fileName string) (base string, index, total int, ok bool) {
+	loc := shardSuffixRegex.FindStringSubmatchIndex(fileName)
+	if loc == nil {
+		return "", 0, 0, false
+	}
+	idx, err := strconv.Atoi(fileName[loc[2]:loc[3]])
+	if err != nil {
+		return "", 0, 0, false
+	}
+	tot, err := strconv.Atoi(fileName[loc[4]:loc[5]])
+	if err != nil {
+		return "", 0, 0, false
+	}
+	return fileName[:loc[0]] + ".gguf", idx, tot, true
+}
+
+// ShardGroup bundles every file that belongs to the same logical GGUF model.
+// Single-file models produce a one-entry group; multi-part shard sets produce
+// one group holding every part in shard-index order.
+type ShardGroup struct {
+	// Base is the logical filename: for sharded groups this is the common
+	// prefix with `.gguf` re-appended; for single-file groups it equals the
+	// sole entry's basename.
+	Base string
+	// Sharded is true when the group represents a multi-part shard set.
+	Sharded bool
+	// Total is the declared shard count (0 when Sharded is false).
+	Total int
+	// Files are the group's entries; sharded groups are sorted by index.
+	Files []ModelFile
+}
+
+// GroupShards buckets ModelFile entries by their shard base. Files that do
+// not match the sharded-filename pattern become one-entry groups. Group
+// order follows the first appearance of each group in the input (so the
+// historical "last-seen wins" fallback logic in the llama-cpp importer
+// keeps producing the same group); shards within a group are sorted by
+// their 1-based index so downstream consumers can rely on Files[0] being
+// shard 1.
+func GroupShards(files []ModelFile) []ShardGroup {
+	groupIdx := make(map[string]int)
+	var groups []ShardGroup
+
+	for _, file := range files {
+		name := filepath.Base(file.Path)
+		base, _, total, isShard := SplitShardSuffix(name)
+		if !isShard {
+			groups = append(groups, ShardGroup{
+				Base:  name,
+				Files: []ModelFile{file},
+			})
+			continue
+		}
+		if idx, ok := groupIdx[base]; ok {
+			groups[idx].Files = append(groups[idx].Files, file)
+			if total > groups[idx].Total {
+				groups[idx].Total = total
+			}
+			continue
+		}
+		groupIdx[base] = len(groups)
+		groups = append(groups, ShardGroup{
+			Base:    base,
+			Sharded: true,
+			Total:   total,
+			Files:   []ModelFile{file},
+		})
+	}
+
+	for i := range groups {
+		if !groups[i].Sharded {
+			continue
+		}
+		sort.SliceStable(groups[i].Files, func(a, b int) bool {
+			_, ai, _, _ := SplitShardSuffix(filepath.Base(groups[i].Files[a].Path))
+			_, bi, _, _ := SplitShardSuffix(filepath.Base(groups[i].Files[b].Path))
+			return ai < bi
+		})
+	}
+	return groups
+}
+
+// FindPreferredModelFile returns shard #1 of the first group whose base
+// filename contains any of the quantization preferences, checking each
+// preference in priority order. For single-file models this collapses to
+// "the first file whose name contains the preference", preserving the
+// historical behaviour while correctly pointing at shard 1 for multi-part
+// GGUF models — llama.cpp's split loader needs shard 1 to walk the set.
 func FindPreferredModelFile(files []ModelFile, preferences []string) *ModelFile {
+	groups := GroupShards(files)
 	for _, preference := range preferences {
-		for i := range files {
-			fileName := filepath.Base(files[i].Path)
-			if strings.Contains(strings.ToLower(fileName), strings.ToLower(preference)) {
-				return &files[i]
+		lowerPref := strings.ToLower(preference)
+		for i := range groups {
+			if strings.Contains(strings.ToLower(groups[i].Base), lowerPref) {
+				return &groups[i].Files[0]
 			}
 		}
 	}

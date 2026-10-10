@@ -547,3 +547,131 @@ realvalue
 		})
 	})
 })
+
+var _ = Describe("JSON schema property ordering (issue #10052)", func() {
+	// A function-call shaped schema. The grammar must honor the configured
+	// properties_order. Before the fix, the sort guard `aOrder != 0 && bOrder != 0`
+	// treated the first listed key (index 0) as "unset" and fell back to
+	// alphabetical order, so "arguments" was emitted before "name" even when
+	// properties_order put name first.
+	const schema = `{
+		"type": "object",
+		"properties": {
+			"name": {"type": "string"},
+			"arguments": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+		}
+	}`
+
+	// keyIndex finds the position of an object-key literal (escaped as \"key\"
+	// in GBNF), which only appears where the key is emitted in the rule — not
+	// in derived rule names like root-name.
+	keyIndex := func(grammar, key string) int {
+		return strings.Index(grammar, `\"`+key+`\"`)
+	}
+
+	It("honors properties_order with name listed first (index 0)", func() {
+		grammar, err := NewJSONSchemaConverter("name,arguments").GrammarFromBytes([]byte(schema))
+		Expect(err).To(BeNil())
+		ni := keyIndex(grammar, "name")
+		ai := keyIndex(grammar, "arguments")
+		Expect(ni).To(BeNumerically(">=", 0))
+		Expect(ai).To(BeNumerically(">=", 0))
+		Expect(ni).To(BeNumerically("<", ai),
+			"properties_order lists name first, so the grammar must emit \"name\" before \"arguments\"")
+	})
+
+	It("keeps alphabetical order when properties_order is empty", func() {
+		grammar, err := NewJSONSchemaConverter("").GrammarFromBytes([]byte(schema))
+		Expect(err).To(BeNil())
+		// No explicit order: keys fall back to alphabetical, so "arguments"
+		// precedes "name". This is the documented default and must not change.
+		Expect(keyIndex(grammar, "arguments")).To(BeNumerically("<", keyIndex(grammar, "name")))
+	})
+
+	It("sorts keys present in properties_order ahead of unlisted keys", func() {
+		const schemaWithExtra = `{
+			"type": "object",
+			"properties": {
+				"name": {"type": "string"},
+				"arguments": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+				"aaa_unlisted": {"type": "string"}
+			}
+		}`
+		// "aaa_unlisted" is alphabetically first but not in the order list, so
+		// it must still come after the listed name/arguments keys.
+		grammar, err := NewJSONSchemaConverter("name,arguments").GrammarFromBytes([]byte(schemaWithExtra))
+		Expect(err).To(BeNil())
+		Expect(keyIndex(grammar, "name")).To(BeNumerically("<", keyIndex(grammar, "arguments")))
+		Expect(keyIndex(grammar, "arguments")).To(BeNumerically("<", keyIndex(grammar, "aaa_unlisted")))
+	})
+})
+
+var _ = Describe("JSON schema grammar cyclic $ref handling", func() {
+	// A client-supplied grammar_json_functions schema with a cyclic $ref used to
+	// recurse until the goroutine stack overflowed, crashing the whole process
+	// instead of failing the single request. The converter must now return an
+	// error for such schemas rather than recursing forever.
+	It("returns an error for a directly self-referential $ref", func() {
+		const schema = `{
+			"$defs": {"A": {"$ref": "#/$defs/A"}},
+			"oneOf": [{"type": "object", "properties": {"x": {"$ref": "#/$defs/A"}}}]
+		}`
+		_, err := NewJSONSchemaConverter("").GrammarFromBytes([]byte(schema))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("cyclic $ref"))
+	})
+
+	It("returns an error for an indirect $ref cycle (A -> B -> A)", func() {
+		const schema = `{
+			"$defs": {
+				"A": {"type": "object", "properties": {"b": {"$ref": "#/$defs/B"}}},
+				"B": {"type": "object", "properties": {"a": {"$ref": "#/$defs/A"}}}
+			},
+			"$ref": "#/$defs/A"
+		}`
+		_, err := NewJSONSchemaConverter("").GrammarFromBytes([]byte(schema))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("cyclic $ref"))
+	})
+
+	It("still resolves a non-cyclic $ref reused by sibling properties", func() {
+		const schema = `{
+			"$defs": {"Leaf": {"type": "string"}},
+			"type": "object",
+			"properties": {
+				"x": {"$ref": "#/$defs/Leaf"},
+				"y": {"$ref": "#/$defs/Leaf"}
+			}
+		}`
+		grammar, err := NewJSONSchemaConverter("").GrammarFromBytes([]byte(schema))
+		Expect(err).To(BeNil())
+		Expect(grammar).ToNot(BeEmpty())
+	})
+
+	// A deeply nested but acyclic schema has no $ref cycle to catch, yet it can
+	// still recurse deeply enough to exhaust the goroutine stack. The bounded
+	// depth counter must reject it with an ordinary error instead of crashing.
+	It("returns an error for a schema nested deeper than the depth limit", func() {
+		// Wrap a string leaf in enough nested "array"/"items" layers to exceed
+		// maxSchemaDepth; each layer is one visit() recursion.
+		const layers = 400
+		schema := `{"type": "string"}`
+		for i := 0; i < layers; i++ {
+			schema = `{"type": "array", "items": ` + schema + `}`
+		}
+		_, err := NewJSONSchemaConverter("").GrammarFromBytes([]byte(schema))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("maximum depth"))
+	})
+
+	It("still builds a grammar for a moderately nested acyclic schema", func() {
+		const layers = 32
+		schema := `{"type": "string"}`
+		for i := 0; i < layers; i++ {
+			schema = `{"type": "array", "items": ` + schema + `}`
+		}
+		grammar, err := NewJSONSchemaConverter("").GrammarFromBytes([]byte(schema))
+		Expect(err).To(BeNil())
+		Expect(grammar).ToNot(BeEmpty())
+	})
+})

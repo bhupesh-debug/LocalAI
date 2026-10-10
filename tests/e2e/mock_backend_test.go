@@ -1,9 +1,12 @@
 package e2e_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"strings"
 	"time"
@@ -73,6 +76,25 @@ var _ = Describe("Mock Backend E2E Tests", Label("MockBackend"), func() {
 			})
 		})
 
+		Context("Context overflow", func() {
+			It("should return HTTP 400 for a non-streaming request that exceeds the context", func() {
+				_, err := client.Chat.Completions.New(
+					context.TODO(),
+					openai.ChatCompletionNewParams{
+						Model: "mock-model",
+						Messages: []openai.ChatCompletionMessageParamUnion{
+							openai.UserMessage("MOCK_ERROR_CONTEXT_OVERFLOW"),
+						},
+					},
+				)
+				Expect(err).To(HaveOccurred())
+				var apiErr *openai.Error
+				Expect(errors.As(err, &apiErr)).To(BeTrue(), err.Error())
+				Expect(apiErr.StatusCode).To(Equal(http.StatusBadRequest))
+				Expect(err.Error()).To(ContainSubstring("exceeds the available context size"))
+			})
+		})
+
 		Context("Streaming errors", func() {
 			It("should return error for streaming request with immediate error trigger", func() {
 				stream := client.Chat.Completions.NewStreaming(
@@ -88,6 +110,38 @@ var _ = Describe("Mock Backend E2E Tests", Label("MockBackend"), func() {
 					// drain
 				}
 				Expect(stream.Err()).To(HaveOccurred())
+			})
+
+			// A backend that fails before it streams anything leaves the
+			// response unwritten, so LocalAI can still answer with a real
+			// status. Clients (the OpenAI SDKs, cogito) then see an HTTP error
+			// instead of an in-stream chunk they may not parse.
+			postStream := func(content string) (*http.Response, string) {
+				body := `{"model":"mock-model","messages":[{"role":"user","content":"` + content + `"}],"stream":true}`
+				req, err := http.NewRequest("POST", apiURL+"/chat/completions", strings.NewReader(body))
+				Expect(err).ToNot(HaveOccurred())
+				req.Header.Set("Content-Type", "application/json")
+				resp, err := http.DefaultClient.Do(req)
+				Expect(err).ToNot(HaveOccurred())
+				defer func() { _ = resp.Body.Close() }()
+				data, err := io.ReadAll(resp.Body)
+				Expect(err).ToNot(HaveOccurred())
+				return resp, string(data)
+			}
+
+			It("should return HTTP 400 when the prompt exceeds the context before streaming", func() {
+				resp, body := postStream("MOCK_ERROR_CONTEXT_OVERFLOW")
+				Expect(resp.StatusCode).To(Equal(http.StatusBadRequest), body)
+				Expect(resp.Header.Get("Content-Type")).To(ContainSubstring("application/json"))
+				Expect(body).To(ContainSubstring("exceeds the available context size (8192 tokens)"))
+				Expect(body).ToNot(ContainSubstring("[DONE]"))
+			})
+
+			It("should return an HTTP error when the backend fails before streaming", func() {
+				resp, body := postStream("MOCK_ERROR_IMMEDIATE")
+				Expect(resp.StatusCode).To(Equal(http.StatusInternalServerError), body)
+				Expect(resp.Header.Get("Content-Type")).To(ContainSubstring("application/json"))
+				Expect(body).To(ContainSubstring("simulated failure"))
 			})
 
 			It("should return structured error for mid-stream failure", func() {
@@ -129,6 +183,36 @@ var _ = Describe("Mock Backend E2E Tests", Label("MockBackend"), func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(len(resp.Data)).To(Equal(1))
 			Expect(len(resp.Data[0].Embedding)).To(Equal(768))
+		})
+
+		// LocalAI extension: a chat conversation can be embedded by sending
+		// messages[] instead of input — raw http.Post because the OpenAI SDK
+		// has no such parameter.
+		It("should embed a chat conversation sent via messages[]", func() {
+			body := `{"model":"mock-model","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hello"}]}`
+			resp, err := http.Post(apiURL+"/embeddings", "application/json", strings.NewReader(body))
+			Expect(err).ToNot(HaveOccurred())
+			defer func() { _ = resp.Body.Close() }()
+			Expect(resp.StatusCode).To(Equal(200))
+			var decoded struct {
+				Data []struct {
+					Embedding []float64 `json:"embedding"`
+				} `json:"data"`
+			}
+			payload, err := io.ReadAll(resp.Body)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(json.Unmarshal(payload, &decoded)).To(Succeed())
+			// One conversation per request -> exactly one data item.
+			Expect(decoded.Data).To(HaveLen(1))
+			Expect(decoded.Data[0].Embedding).To(HaveLen(768))
+		})
+
+		It("should reject input combined with messages", func() {
+			body := `{"model":"mock-model","input":"x","messages":[{"role":"user","content":"hello"}]}`
+			resp, err := http.Post(apiURL+"/embeddings", "application/json", strings.NewReader(body))
+			Expect(err).ToNot(HaveOccurred())
+			defer func() { _ = resp.Body.Close() }()
+			Expect(resp.StatusCode).To(Equal(400))
 		})
 	})
 
@@ -225,6 +309,146 @@ var _ = Describe("Mock Backend E2E Tests", Label("MockBackend"), func() {
 		})
 	})
 
+	Describe("Audio Diarization API", func() {
+		// Helper: build a multipart/form-data request to /v1/audio/diarization
+		// with a tiny stub WAV. The backend ignores the audio payload
+		// (it returns a deterministic three-segment layout), so a 4-byte
+		// stub is enough to exercise the HTTP layer.
+		postDiarize := func(extraFields map[string]string) (*http.Response, []byte) {
+			body := &bytes.Buffer{}
+			mw := multipart.NewWriter(body)
+
+			Expect(mw.WriteField("model", "mock-diarize")).To(Succeed())
+			for k, v := range extraFields {
+				Expect(mw.WriteField(k, v)).To(Succeed())
+			}
+
+			part, err := mw.CreateFormFile("file", "stub.wav")
+			Expect(err).ToNot(HaveOccurred())
+			_, err = part.Write([]byte{0, 0, 0, 0})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(mw.Close()).To(Succeed())
+
+			req, err := http.NewRequest("POST", apiURL+"/audio/diarization", body)
+			Expect(err).ToNot(HaveOccurred())
+			req.Header.Set("Content-Type", mw.FormDataContentType())
+
+			httpClient := &http.Client{Timeout: 30 * time.Second}
+			resp, err := httpClient.Do(req)
+			Expect(err).ToNot(HaveOccurred())
+			defer func() { _ = resp.Body.Close() }()
+			data, err := io.ReadAll(resp.Body)
+			Expect(err).ToNot(HaveOccurred())
+			return resp, data
+		}
+
+		It("normalizes raw backend speaker labels to SPEAKER_NN in first-seen order", func() {
+			resp, data := postDiarize(nil)
+			Expect(resp.StatusCode).To(Equal(http.StatusOK))
+
+			var got map[string]any
+			Expect(json.Unmarshal(data, &got)).To(Succeed())
+
+			Expect(got["task"]).To(Equal("diarize"))
+			Expect(got["num_speakers"]).To(BeEquivalentTo(2))
+			// json (default) drops the heavy speakers summary
+			Expect(got).ToNot(HaveKey("speakers"))
+
+			segs, ok := got["segments"].([]any)
+			Expect(ok).To(BeTrue())
+			Expect(segs).To(HaveLen(3))
+
+			// Mock emits raw labels "5", "2", "5" — first-seen order maps:
+			// 5 → SPEAKER_00, 2 → SPEAKER_01.
+			seg0 := segs[0].(map[string]any)
+			seg1 := segs[1].(map[string]any)
+			seg2 := segs[2].(map[string]any)
+			Expect(seg0["speaker"]).To(Equal("SPEAKER_00"))
+			Expect(seg0["label"]).To(Equal("5"))
+			Expect(seg1["speaker"]).To(Equal("SPEAKER_01"))
+			Expect(seg2["speaker"]).To(Equal("SPEAKER_00"))
+
+			// json default suppresses per-segment text even when the backend
+			// happened to emit some (here, IncludeText was not set so the
+			// backend already stripped — but the HTTP layer also gates).
+			_, hasText := seg0["text"].(string)
+			if hasText {
+				Expect(seg0["text"]).To(Equal(""))
+			}
+		})
+
+		It("verbose_json emits speakers summary and per-segment transcripts when include_text is set", func() {
+			resp, data := postDiarize(map[string]string{
+				"response_format": "verbose_json",
+				"include_text":    "true",
+			})
+			Expect(resp.StatusCode).To(Equal(http.StatusOK))
+
+			var got map[string]any
+			Expect(json.Unmarshal(data, &got)).To(Succeed())
+
+			speakers, ok := got["speakers"].([]any)
+			Expect(ok).To(BeTrue(), "verbose_json must include speakers summary")
+			Expect(speakers).To(HaveLen(2))
+
+			// SPEAKER_00 should reflect both 1.0s segments (1.0 + 1.5 = 2.5s, 2 segments)
+			byID := map[string]map[string]any{}
+			for _, sp := range speakers {
+				m := sp.(map[string]any)
+				byID[m["id"].(string)] = m
+			}
+			Expect(byID).To(HaveKey("SPEAKER_00"))
+			Expect(byID["SPEAKER_00"]["total_speech_duration"]).To(BeNumerically("~", 2.5, 0.001))
+			Expect(byID["SPEAKER_00"]["segment_count"]).To(BeEquivalentTo(2))
+
+			segs := got["segments"].([]any)
+			Expect(segs[0].(map[string]any)["text"]).To(Equal("hello there"))
+			Expect(segs[1].(map[string]any)["text"]).To(Equal("general kenobi"))
+		})
+
+		It("returns closed sound events only when include_sounds is set", func() {
+			resp, data := postDiarize(map[string]string{"response_format": "verbose_json", "include_sounds": "true"})
+			Expect(resp.StatusCode).To(Equal(http.StatusOK))
+			var got map[string]any
+			Expect(json.Unmarshal(data, &got)).To(Succeed())
+			sounds, ok := got["sounds"].([]any)
+			Expect(ok).To(BeTrue(), "include_sounds must add a sounds array")
+			Expect(sounds).To(HaveLen(2))
+			first := sounds[0].(map[string]any)
+			Expect(first["label"]).To(Equal("Door"))
+			Expect(first["start"]).To(BeNumerically("~", 0.5, 0.001))
+			Expect(first["end"]).To(BeNumerically("~", 1.25, 0.001))
+			Expect(first["confidence"]).To(BeNumerically("~", 0.8, 0.001))
+
+			resp, data = postDiarize(map[string]string{"response_format": "verbose_json"})
+			Expect(resp.StatusCode).To(Equal(http.StatusOK))
+			Expect(string(data)).ToNot(ContainSubstring(`"sounds"`))
+
+			resp, _ = postDiarize(map[string]string{"response_format": "rttm", "include_sounds": "true"})
+			Expect(resp.StatusCode).To(Equal(http.StatusBadRequest))
+		})
+
+		It("rttm response_format returns NIST RTTM rows", func() {
+			resp, data := postDiarize(map[string]string{"response_format": "rttm"})
+			Expect(resp.StatusCode).To(Equal(http.StatusOK))
+			Expect(resp.Header.Get("Content-Type")).To(HavePrefix("text/plain"))
+
+			body := string(data)
+			lines := strings.Split(strings.TrimSpace(body), "\n")
+			Expect(lines).To(HaveLen(3))
+			// "SPEAKER stub 1 0.000 1.000 <NA> <NA> SPEAKER_00 <NA> <NA>"
+			Expect(lines[0]).To(HavePrefix("SPEAKER stub 1 "))
+			Expect(lines[0]).To(ContainSubstring(" SPEAKER_00 "))
+			Expect(lines[1]).To(ContainSubstring(" SPEAKER_01 "))
+			Expect(lines[2]).To(ContainSubstring(" SPEAKER_00 "))
+		})
+
+		It("rejects unknown response_format with 4xx/5xx", func() {
+			resp, _ := postDiarize(map[string]string{"response_format": "csv"})
+			Expect(resp.StatusCode).To(BeNumerically(">=", 400))
+		})
+	})
+
 	Describe("Rerank API", func() {
 		It("should return mocked reranking results", func() {
 			req, err := http.NewRequest("POST", apiURL+"/rerank", nil)
@@ -264,6 +488,78 @@ var _ = Describe("Mock Backend E2E Tests", Label("MockBackend"), func() {
 				defer resp.Body.Close()
 				Expect(resp.StatusCode).To(BeNumerically("<", 500))
 			}
+		})
+	})
+
+	Describe("Detokenization API", func() {
+		It("should return content for known token IDs", func() {
+			body := `{"model":"mock-model","tokens":[101,2023,2003,1037,3231,1012]}`
+			req, err := http.NewRequest("POST", apiURL+"/detokenize", strings.NewReader(body))
+			Expect(err).ToNot(HaveOccurred())
+			req.Header.Set("Content-Type", "application/json")
+
+			httpClient := &http.Client{Timeout: 30 * time.Second}
+			resp, err := httpClient.Do(req)
+			Expect(err).ToNot(HaveOccurred())
+			defer func() { _ = resp.Body.Close() }()
+			Expect(resp.StatusCode).To(Equal(200))
+
+			data, err := io.ReadAll(resp.Body)
+			Expect(err).ToNot(HaveOccurred())
+			var result map[string]any
+			Expect(json.Unmarshal(data, &result)).To(Succeed())
+			content, ok := result["content"].(string)
+			Expect(ok).To(BeTrue(), "response missing 'content' field: %s", string(data))
+			Expect(content).ToNot(BeEmpty())
+		})
+
+		It("should round-trip tokenize then detokenize", func() {
+			httpClient := &http.Client{Timeout: 30 * time.Second}
+
+			// Step 1: tokenize
+			tokenizeReq, err := http.NewRequest("POST", apiURL+"/tokenize",
+				strings.NewReader(`{"model":"mock-model","content":"Hello world"}`))
+			Expect(err).ToNot(HaveOccurred())
+			tokenizeReq.Header.Set("Content-Type", "application/json")
+
+			tokenizeResp, err := httpClient.Do(tokenizeReq)
+			Expect(err).ToNot(HaveOccurred())
+			defer func() { _ = tokenizeResp.Body.Close() }()
+			Expect(tokenizeResp.StatusCode).To(Equal(200))
+
+			tokenizeData, err := io.ReadAll(tokenizeResp.Body)
+			Expect(err).ToNot(HaveOccurred())
+			var tokenizeResult map[string]any
+			Expect(json.Unmarshal(tokenizeData, &tokenizeResult)).To(Succeed())
+
+			tokensRaw, ok := tokenizeResult["tokens"].([]any)
+			Expect(ok).To(BeTrue(), "tokenize response missing 'tokens': %s", string(tokenizeData))
+			Expect(tokensRaw).ToNot(BeEmpty())
+
+			// Step 2: detokenize the returned token IDs
+			tokens := make([]int, len(tokensRaw))
+			for i, t := range tokensRaw {
+				tokens[i] = int(t.(float64))
+			}
+			tokenJSON, err := json.Marshal(map[string]any{"model": "mock-model", "tokens": tokens})
+			Expect(err).ToNot(HaveOccurred())
+
+			detokenizeReq, err := http.NewRequest("POST", apiURL+"/detokenize", strings.NewReader(string(tokenJSON)))
+			Expect(err).ToNot(HaveOccurred())
+			detokenizeReq.Header.Set("Content-Type", "application/json")
+
+			detokenizeResp, err := httpClient.Do(detokenizeReq)
+			Expect(err).ToNot(HaveOccurred())
+			defer func() { _ = detokenizeResp.Body.Close() }()
+			Expect(detokenizeResp.StatusCode).To(Equal(200))
+
+			detokenizeData, err := io.ReadAll(detokenizeResp.Body)
+			Expect(err).ToNot(HaveOccurred())
+			var detokenizeResult map[string]any
+			Expect(json.Unmarshal(detokenizeData, &detokenizeResult)).To(Succeed())
+			content, ok := detokenizeResult["content"].(string)
+			Expect(ok).To(BeTrue(), "detokenize response missing 'content': %s", string(detokenizeData))
+			Expect(content).ToNot(BeEmpty())
 		})
 	})
 

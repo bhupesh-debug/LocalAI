@@ -12,6 +12,7 @@ import (
 )
 
 func Detection(
+	ctx context.Context,
 	sourceFile string,
 	prompt string,
 	points []float32,
@@ -32,18 +33,27 @@ func Detection(
 		return nil, fmt.Errorf("could not load detection model")
 	}
 
-	var startTime time.Time
-	if appConfig.EnableTracing {
-		trace.InitBackendTracingIfEnabled(appConfig.TracingMaxItems)
-		startTime = time.Now()
+	release, err := AcquireGlobalBackendSlot()
+	if err != nil {
+		return nil, err
 	}
+	defer release()
+	var startTime time.Time
+	var traceID string
+	if appConfig.EnableTracing {
+		trace.InitBackendTracingIfEnabled(appConfig.TracingMaxItems, appConfig.TracingMaxBodyBytes)
+		startTime = time.Now()
+		traceID = trace.BeginBackendTrace(trace.BackendTrace{Timestamp: startTime, Type: trace.BackendTraceDetection, ModelName: modelConfig.Name, Backend: modelConfig.Backend, Summary: trace.TruncateString(sourceFile, 200)})
+	}
+	defer trace.CancelBackendTrace(traceID)
 
-	res, err := detectionModel.Detect(context.Background(), &proto.DetectOptions{
-		Src:       sourceFile,
-		Prompt:    prompt,
-		Points:    points,
-		Boxes:     boxes,
-		Threshold: threshold,
+	res, err := detectionModel.Detect(ctx, &proto.DetectOptions{
+		ModelIdentity: modelConfig.Model,
+		Src:           sourceFile,
+		Prompt:        prompt,
+		Points:        points,
+		Boxes:         boxes,
+		Threshold:     threshold,
 	})
 
 	if appConfig.EnableTracing {
@@ -53,6 +63,7 @@ func Detection(
 		}
 
 		trace.RecordBackendTrace(trace.BackendTrace{
+			ID:        traceID,
 			Timestamp: startTime,
 			Duration:  time.Since(startTime),
 			Type:      trace.BackendTraceDetection,

@@ -1,25 +1,96 @@
 package backend
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/core/trace"
+	"github.com/mudler/LocalAI/pkg/downloader"
 	pb "github.com/mudler/LocalAI/pkg/grpc/proto"
 	"github.com/mudler/LocalAI/pkg/model"
+	"github.com/mudler/LocalAI/pkg/modelartifacts"
+	"github.com/mudler/LocalAI/pkg/vram"
 	"github.com/mudler/xlog"
 )
+
+// ModelLoadTraceObserver returns the ModelLoader load observer that records
+// a model_load backend trace for every successful real load (backend process
+// spawn + LoadModel RPC; cache hits never reach the observer). Failures are
+// deliberately skipped here: the modality wrappers already record them via
+// recordModelLoadFailure with request context, and the backend auto-discovery
+// scan probes several backends before one succeeds — tracing every probe
+// failure would bury the buffer in noise.
+//
+// The traced data includes the resolved backend runtime (the installed
+// backend's launcher path, which names the variant directory) — that is what
+// identifies WHICH build served the load. A stale installed backend is
+// invisible in the model config but obvious here.
+func ModelLoadTraceObserver(appConfig *config.ApplicationConfig) func(model.BackendLoadEvent) (func(model.BackendLoadEvent), error) {
+	return func(ev model.BackendLoadEvent) (func(model.BackendLoadEvent), error) {
+		release, err := AcquireGlobalBackendSlot()
+		if err != nil {
+			return nil, err
+		}
+		if !appConfig.EnableTracing {
+			return func(model.BackendLoadEvent) { release() }, nil
+		}
+		trace.InitBackendTracingIfEnabled(appConfig.TracingMaxItems, appConfig.TracingMaxBodyBytes)
+		started := time.Now()
+		id := trace.BeginBackendTrace(trace.BackendTrace{Timestamp: started, Type: trace.BackendTraceModelLoad, ModelName: ev.ModelID, Backend: ev.Backend, Summary: "Loading model"})
+		return func(done model.BackendLoadEvent) {
+			defer release()
+			if done.Err != nil {
+				trace.CancelBackendTrace(id)
+				return
+			}
+			trace.RecordBackendTrace(trace.BackendTrace{
+				ID:        id,
+				Timestamp: started,
+				Duration:  done.Duration,
+				Type:      trace.BackendTraceModelLoad,
+				ModelName: done.ModelID,
+				Backend:   done.Backend,
+				Summary:   "Model loaded",
+				Data: map[string]any{
+					"model_file":      done.ModelName,
+					"backend_runtime": done.BackendURI,
+				},
+			})
+		}, nil
+	}
+}
+
+// PreloadModel warms a model into memory without running any inference, so the
+// first real request doesn't pay the backend's cold-start load cost. It uses
+// the same ModelOptions + ml.Load path the modality functions use, so a
+// subsequent inference call hits the loader cache instead of reloading. Load
+// failures are recorded and returned; callers that warm models opportunistically
+// (e.g. realtime session warm-up) typically log and continue, since the lazy
+// path will retry on first use.
+func PreloadModel(ctx context.Context, ml *model.ModelLoader, modelConfig config.ModelConfig, appConfig *config.ApplicationConfig) error {
+	opts := ModelOptions(modelConfig, appConfig, model.WithContext(ctx))
+	if _, err := ml.Load(opts...); err != nil {
+		recordModelLoadFailure(appConfig, modelConfig.Name, modelConfig.Backend, err, nil)
+		return err
+	}
+	return nil
+}
 
 // recordModelLoadFailure records a backend trace when model loading fails.
 func recordModelLoadFailure(appConfig *config.ApplicationConfig, modelName, backend string, err error, data map[string]any) {
 	if !appConfig.EnableTracing {
 		return
 	}
-	trace.InitBackendTracingIfEnabled(appConfig.TracingMaxItems)
+	trace.InitBackendTracingIfEnabled(appConfig.TracingMaxItems, appConfig.TracingMaxBodyBytes)
 	trace.RecordBackendTrace(trace.BackendTrace{
 		Timestamp: time.Now(),
 		Type:      trace.BackendTraceModelLoad,
@@ -31,29 +102,126 @@ func recordModelLoadFailure(appConfig *config.ApplicationConfig, modelName, back
 	})
 }
 
-func ModelOptions(c config.ModelConfig, so *config.ApplicationConfig, opts ...model.Option) []model.Option {
-	name := c.Name
-	if name == "" {
-		name = c.Model
+// estimateModelSizeBytes uses the unified EstimateModel entry point to compute
+// the total weight-file size for a model config.  It collects all weight files
+// from DownloadFiles, Model, and MMProj, and also extracts the HuggingFace
+// repo ID so EstimateModel can fall back to the HF API when local file
+// metadata is unavailable (e.g. not-yet-downloaded models).
+func estimateModelSizeBytes(c config.ModelConfig, modelsPath string) int64 {
+	seen := make(map[string]bool)
+	input := vram.ModelEstimateInput{}
+	managedPrimary := len(c.Artifacts) > 0 && c.Artifacts[0].Resolved != nil
+
+	addFile := func(uri string, size int64) {
+		if !vram.IsWeightFile(uri) {
+			return
+		}
+		resolved := uri
+		if !strings.Contains(uri, "://") {
+			resolved = "file://" + filepath.Join(modelsPath, uri)
+		}
+		if seen[resolved] {
+			return
+		}
+		seen[resolved] = true
+		input.Files = append(input.Files, vram.FileInput{URI: resolved, Size: size})
 	}
 
+	// tryHFRepo resolves any huggingface:// or hf:// URI to an HTTPS URL and
+	// then extracts the org/model repo ID for use as the HF fallback path.
+	tryHFRepo := func(uri string) {
+		if input.HFRepo != "" {
+			return
+		}
+		resolved := downloader.URI(uri).ResolveURL()
+		if repoID, ok := vram.ExtractHFRepoID(resolved); ok {
+			input.HFRepo = repoID
+		}
+	}
+
+	for _, f := range c.DownloadFiles {
+		uriStr := string(f.URI)
+		addFile(uriStr, 0)
+		if !managedPrimary {
+			tryHFRepo(uriStr)
+		}
+	}
+	if managedPrimary {
+		// The snapshot directory is derived from the cache key, not from
+		// ModelFileName(): for a single-file artifact ModelFileName() resolves to
+		// the file inside the snapshot, whereas the manifest and every artifact
+		// file live relative to the snapshot directory itself.
+		if snapshotDir, err := modelartifacts.RelativeSnapshotPath(c.Artifacts[0].Resolved.CacheKey); err == nil {
+			manifest, err := modelartifacts.ReadManifest(filepath.Join(modelsPath, filepath.Dir(snapshotDir), "manifest.json"))
+			if err == nil {
+				for _, file := range manifest.Files {
+					addFile(filepath.Join(snapshotDir, filepath.FromSlash(file.Path)), file.Size)
+				}
+			}
+		}
+	} else {
+		addFile(c.Model, 0)
+		tryHFRepo(c.Model)
+	}
+	if c.MMProj != "" {
+		addFile(c.MMProj, 0)
+	}
+
+	if len(input.Files) == 0 && input.HFRepo == "" {
+		return 0
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := vram.EstimateModelMultiContext(ctx, input, nil)
+	if err != nil || result.SizeBytes == 0 {
+		return 0
+	}
+	return int64(result.SizeBytes)
+}
+
+// effectiveThreads resolves the thread count a backend is asked to use.
+// Per-model threads wins: SetDefaults already fills an unset per-model value
+// from the app-level --threads, so overriding a set value with the app value
+// here would make the YAML `threads:` knob dead config (it did, for years —
+// e.g. a tiny VAD model could never opt down from the global pool size).
+func effectiveThreads(c config.ModelConfig, appThreads int) int {
+	if c.Threads != nil && *c.Threads > 0 {
+		return *c.Threads
+	}
+	if appThreads > 0 {
+		return appThreads
+	}
+	return 1
+}
+
+func ModelOptions(c config.ModelConfig, so *config.ApplicationConfig, opts ...model.Option) []model.Option {
 	defOpts := []model.Option{
 		model.WithBackendString(c.Backend),
 		model.WithModel(c.Model),
 		model.WithContext(so.Context),
-		model.WithModelID(name),
+		model.WithModelID(c.ModelID()),
+	}
+	// Use the revision stamped when the configuration was parsed, and only
+	// that. By this point c has been merged with the request's prediction
+	// parameters and had SetDefaults applied, so hashing it here would produce
+	// a revision that depends on the request body and on whether the model file
+	// parsed, which the controller reads as a config change and rejects. Every
+	// config the loader hands out is stamped; an unstamped one was synthesized
+	// elsewhere and is routed without a revision rather than with a wrong one.
+	if revision := c.PersistedConfigRevision(); revision != "" {
+		defOpts = append(defOpts, model.WithConfigRevision(revision))
+	} else {
+		xlog.Warn("Model configuration carries no revision stamp; routing without one",
+			"model", c.ModelID())
+	}
+	managedPrimary := len(c.Artifacts) > 0 && c.Artifacts[0].Resolved != nil
+	if managedPrimary {
+		defOpts = append(defOpts, model.WithModelFile(c.ModelFileName()))
 	}
 
-	threads := 1
-
-	if c.Threads != nil {
-		threads = *c.Threads
-	}
-
-	if so.Threads != 0 {
-		threads = so.Threads
-	}
-
+	threads := effectiveThreads(c, so.Threads)
 	c.Threads = &threads
 
 	grpcOpts := grpcModelOpts(c, so.SystemState.Model.ModelsPath)
@@ -73,6 +241,14 @@ func ModelOptions(c config.ModelConfig, so *config.ApplicationConfig, opts ...mo
 		defOpts = append(defOpts, model.WithExternalBackend(k, v))
 	}
 
+	if sizeBytes := estimateModelSizeBytes(c, so.SystemState.Model.ModelsPath); sizeBytes > 0 {
+		defOpts = append(defOpts, model.WithModelSizeBytes(sizeBytes))
+	}
+
+	if c.Environment != nil && len(c.Environment) > 0 {
+		defOpts = append(defOpts, model.WithEnvVars(c.Environment))
+	}
+
 	return append(defOpts, opts...)
 }
 
@@ -90,13 +266,142 @@ func getSeed(c config.ModelConfig) int32 {
 	return seed
 }
 
-func grpcModelOpts(c config.ModelConfig, modelPath string) *pb.ModelOptions {
-	b := 512
+// DefaultContextSize and DefaultBatchSize are the backend's fallbacks when a
+// model config leaves them unset. Exported so callers that must respect the
+// effective decode window — notably the router's prompt trimmer — resolve the
+// same numbers grpcModelOpts does instead of guessing. The values are owned by
+// core/config (single source of truth shared with the config default tiers).
+const (
+	DefaultContextSize = config.DefaultContextSize
+	DefaultBatchSize   = config.DefaultPhysicalBatch
+)
+
+// EffectiveContextSize is the context window the backend will run with: the
+// configured value, or DefaultContextSize when unset. A negative value (the
+// context_size: -1 auto-max sentinel) that survived config resolution, e.g. on
+// a backend that never ran the GGUF resolver, is clamped here so a negative
+// n_ctx never reaches a backend.
+func EffectiveContextSize(c config.ModelConfig) int {
+	if c.ContextSize != nil && *c.ContextSize > 0 {
+		return *c.ContextSize
+	}
+	return DefaultContextSize
+}
+
+// EffectiveRequestContextSize is the most tokens one request can use. It
+// differs from EffectiveContextSize only for llama.cpp with parallel slots and
+// the KV cache not unified ("kv_unified:false"): llama.cpp then gives each slot
+// n_ctx/n_parallel, padded up to a multiple of 256 (llama-context.cpp). With the
+// unified cache (the grpc-server default) every slot may use all of n_ctx.
+//
+// Clients read this through /v1/models/capabilities to budget a request, so it
+// must be the per-request limit, not the size of the whole KV cache.
+func EffectiveRequestContextSize(c config.ModelConfig) int {
+	ctx := EffectiveContextSize(c)
+	parallel, unified := 1, true
+	for _, o := range c.Options {
+		k, v, ok := strings.Cut(o, ":")
+		if !ok {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		switch k {
+		case "parallel", "n_parallel":
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				parallel = n
+			}
+		case "kv_unified", "unified_kv":
+			switch v {
+			case "false", "0", "no", "off", "disabled":
+				unified = false
+			}
+		}
+	}
+	if unified || parallel <= 1 {
+		return ctx
+	}
+	const pad = 256
+	return (ctx/parallel + pad - 1) / pad * pad
+}
+
+// localGPU resolves the device that will run the model, for single-pass batch
+// sizing. It is a package var so tests inject a deterministic device; production
+// reads config.LocalGPU, whose detection is sync.Once-cached in xsysinfo — so the
+// per-request call from the router's prompt trimmer (modelTokenTrim) stays cheap.
+var localGPU = config.LocalGPU
+
+// EffectiveBatchSize is the single-decode batch the backend will run with.
+// Score, embedding and rerank all process the whole input in one pass: score
+// decodes prompt+candidate (asserts n_tokens <= n_batch), and embedding/rerank
+// pool over the full sequence in one physical batch (n_ubatch). Ideally the batch
+// covers the whole context so any input that fits the context fits one pass,
+// avoiding both the GGML_ASSERT crash and the "input is too large to process"
+// error — BUT a full ctx-sized n_ubatch makes the per-device CUDA compute buffer
+// multi-GiB (it scales ~ n_ubatch * n_ctx and can't be split across GPUs), so a
+// large-context embedding model aborts on load with free VRAM to spare (#10485).
+// So we cap the batch to the largest that fits the per-device VRAM headroom; an
+// input longer than that cap is the accepted tradeoff (it can't be pooled in one
+// pass, but the load no longer OOMs). Explicit `batch:` always wins.
+func EffectiveBatchSize(c config.ModelConfig) int {
 	if c.Batch != 0 {
-		b = c.Batch
+		return c.Batch
+	}
+	singlePass := c.HasUsecases(config.FLAG_SCORE) ||
+		c.HasUsecases(config.FLAG_EMBEDDINGS) ||
+		c.HasUsecases(config.FLAG_RERANK)
+	if ctx := EffectiveContextSize(c); singlePass && ctx > DefaultBatchSize {
+		return config.SinglePassBatchForContext(localGPU(), ctx)
+	}
+	return DefaultBatchSize
+}
+
+// withCompanionArtifactOptions surfaces each resolved companion snapshot to the
+// backend as "<artifact name>:<snapshot path>", reusing the key:value option
+// convention backends already parse.
+//
+// The value is deliberately relative to the models directory and deliberately
+// not persisted to the config YAML. It is derived from a content-addressed cache
+// key that only exists after the artifact resolves, so a static gallery override
+// could not carry it, and a persisted copy would rot the moment a re-resolve
+// produced a new key. Staying relative also lets a remote worker resolve it
+// under its own ModelPath after staging rewrites the model root.
+//
+// An option the author set explicitly always wins: pinning a companion to a
+// local checkout has to beat the managed snapshot.
+func withCompanionArtifactOptions(options []string, artifacts []modelartifacts.Spec) []string {
+	configured := make(map[string]struct{}, len(options))
+	for _, option := range options {
+		if name, _, found := strings.Cut(option, ":"); found {
+			configured[name] = struct{}{}
+		}
 	}
 
-	flashAttention := "auto"
+	// Copy before appending: opts.Options would otherwise share (and could
+	// reallocate away from) the config's own slice.
+	combined := slices.Clone(options)
+	for _, artifact := range artifacts {
+		if artifact.Target != modelartifacts.TargetCompanion || artifact.Resolved == nil {
+			continue
+		}
+		if _, exists := configured[artifact.Name]; exists {
+			xlog.Debug("keeping the configured companion option over the managed snapshot", "artifact", artifact.Name)
+			continue
+		}
+		snapshot, err := modelartifacts.RelativeSnapshotPath(artifact.Resolved.CacheKey)
+		if err != nil {
+			xlog.Warn("skipping companion artifact with an unusable cache key", "artifact", artifact.Name, "error", err)
+			continue
+		}
+		combined = append(combined, artifact.Name+":"+snapshot)
+	}
+	return combined
+}
+
+func grpcModelOpts(c config.ModelConfig, modelPath string) *pb.ModelOptions {
+	ctxSize := EffectiveContextSize(c)
+	b := EffectiveBatchSize(c)
+
+	flashAttention := config.DefaultFlashAttention
 
 	if c.FlashAttention != nil {
 		flashAttention = *c.FlashAttention
@@ -137,17 +442,12 @@ func grpcModelOpts(c config.ModelConfig, modelPath string) *pb.ModelOptions {
 		}
 	}
 
-	ctxSize := 4096
-	if c.ContextSize != nil {
-		ctxSize = *c.ContextSize
-	}
-
 	mmlock := false
 	if c.MMlock != nil {
 		mmlock = *c.MMlock
 	}
 
-	nGPULayers := 9999999
+	nGPULayers := config.DefaultNGPULayers
 	if c.NGPULayers != nil {
 		nGPULayers = *c.NGPULayers
 	}
@@ -157,6 +457,19 @@ func grpcModelOpts(c config.ModelConfig, modelPath string) *pb.ModelOptions {
 		triggers = append(triggers, &pb.GrammarTrigger{
 			Word: t.Word,
 		})
+	}
+
+	engineArgsJSON := ""
+	if len(c.EngineArgs) > 0 {
+		buf, err := json.Marshal(c.EngineArgs)
+		if err != nil {
+			// ModelConfig.Validate() rejects unmarshalable engine_args at
+			// config load, so reaching here means the validator was bypassed.
+			// Silently dropping user-set options would change runtime behaviour
+			// without warning — fail loud instead.
+			panic(fmt.Sprintf("engine_args marshal failed for model %q: %v (Validate() should have caught this)", c.Model, err))
+		}
+		engineArgsJSON = string(buf)
 	}
 
 	opts := &pb.ModelOptions{
@@ -174,10 +487,13 @@ func grpcModelOpts(c config.ModelConfig, modelPath string) *pb.ModelOptions {
 		IMG2IMG:              c.Diffusers.IMG2IMG,
 		CLIPModel:            c.Diffusers.ClipModel,
 		CLIPSubfolder:        c.Diffusers.ClipSubFolder,
-		Options:              c.Options,
+		Options:              withCompanionArtifactOptions(c.Options, c.Artifacts),
 		Overrides:            c.Overrides,
+		EngineArgs:           engineArgsJSON,
+		EnableScore:          c.HasUsecases(config.FLAG_SCORE),
 		CLIPSkip:             int32(c.Diffusers.ClipSkip),
 		ControlNet:           c.Diffusers.ControlNet,
+		OriginalConfigFile:   c.Diffusers.OriginalConfigFile,
 		ContextSize:          int32(ctxSize),
 		Seed:                 getSeed(c),
 		NBatch:               int32(b),
@@ -226,8 +542,45 @@ func grpcModelOpts(c config.ModelConfig, modelPath string) *pb.ModelOptions {
 		Tokenizer: c.Tokenizer,
 	}
 
+	if c.IsRemoteProxy() {
+		opts.Proxy = &pb.ProxyOptions{
+			UpstreamUrl:           c.Proxy.UpstreamURL,
+			Mode:                  c.Proxy.Mode,
+			Provider:              c.Proxy.Provider,
+			ApiKeyEnv:             c.Proxy.APIKeyEnv,
+			ApiKeyFile:            c.Proxy.APIKeyFile,
+			UpstreamModel:         c.Proxy.UpstreamModel,
+			RequestTimeoutSeconds: int32(c.Proxy.RequestTimeoutSeconds),
+			CachePrompt:           c.Proxy.CachePrompt,
+		}
+		// localai-proxy calls a LocalAI that knows the model by name, so an
+		// unset upstream_model means this config's name, the same derivation
+		// failover.UpstreamModel uses. Not for cloud-proxy: its translate mode
+		// falls back to parameters.model and passthrough keeps the client's
+		// model when upstream_model is empty.
+		if c.Backend == model.LocalAIProxyBackend && opts.Proxy.UpstreamModel == "" {
+			opts.Proxy.UpstreamModel = c.Name
+		}
+	}
+
 	if c.MMProj != "" {
 		opts.MMProj = filepath.Join(modelPath, c.MMProj)
+	}
+
+	// Resolve draft_model against the models directory, mirroring the
+	// handling of parameters.model and mmproj. Always joining (without an
+	// IsAbs shortcut) prevents user-supplied configs from pointing the
+	// backend at arbitrary host files via an absolute path.
+	if c.DraftModel != "" {
+		opts.DraftModel = filepath.Join(modelPath, c.DraftModel)
+	}
+
+	// Add environment variables from model configuration
+	if c.Environment != nil && len(c.Environment) > 0 {
+		opts.EnvVars = make(map[string]string)
+		for k, v := range c.Environment {
+			opts.EnvVars[k] = v
+		}
 	}
 
 	return opts
@@ -245,15 +598,30 @@ func gRPCPredictOpts(c config.ModelConfig, modelPath string) *pb.PredictOptions 
 		}
 	}
 
+	// TopK may be nil after SetDefaults for backends that don't use llama.cpp's
+	// top_k=40 default (issue #6632, e.g. mlx). proto3 int32 can't be unset, so
+	// send 0 — the value mlx actually wants (top-k disabled).
+	var topK int32
+	if c.TopK != nil {
+		topK = int32(*c.TopK)
+	}
+
 	pbOpts := &pb.PredictOptions{
+		// c.Model, not c.ModelID()/c.ModelFileName(): this must be the SAME
+		// expression ModelOptions feeds to model.WithModel, which is what the
+		// backend receives as ModelOptions.Model at LoadModel time. Both are
+		// read from this same config value, so the backend's equality check
+		// cannot false-reject. See PredictOptions.ModelIdentity in
+		// backend/backend.proto and #10952.
+		ModelIdentity:       c.Model,
 		Temperature:         float32(*c.Temperature),
 		TopP:                float32(*c.TopP),
 		NDraft:              c.NDraft,
-		TopK:                int32(*c.TopK),
+		TopK:                topK,
 		MinP:                float32(*c.MinP),
 		Tokens:              int32(*c.Maxtokens),
 		Threads:             int32(*c.Threads),
-		PromptCacheAll:      c.PromptCacheAll,
+		PromptCacheAll:      *c.PromptCacheAll,
 		PromptCacheRO:       c.PromptCacheRO,
 		PromptCachePath:     promptCachePath,
 		F16KV:               *c.F16,
@@ -290,6 +658,31 @@ func gRPCPredictOpts(c config.ModelConfig, modelPath string) *pb.PredictOptions 
 			metadata["enable_thinking"] = "false"
 		} else {
 			metadata["enable_thinking"] = "true"
+		}
+	}
+	// Forward the effective reasoning effort so the backend can pass it to the
+	// jinja chat template (chat_template_kwargs.reasoning_effort) — the lever
+	// models like gpt-oss / LFM2.5 actually read, distinct from enable_thinking.
+	if c.ReasoningEffort != "" {
+		metadata["reasoning_effort"] = c.ReasoningEffort
+	}
+	// Client request metadata overrides the server-derived reasoning levers and
+	// reaches every backend through these standalone string keys (Python backends
+	// read them directly). The reserved blob key is server-owned and skipped.
+	for k, v := range c.RequestMetadata {
+		if k == "chat_template_kwargs" {
+			continue
+		}
+		metadata[k] = v
+	}
+	// Build the generic chat_template_kwargs blob (model config map + coerced
+	// metadata) for llama.cpp and write it LAST so a client cannot clobber it.
+	if blob := c.ResolveChatTemplateKwargs(metadata); len(blob) > 0 {
+		b, err := json.Marshal(blob)
+		if err != nil {
+			xlog.Warn("failed to marshal chat_template_kwargs", "error", err)
+		} else {
+			metadata["chat_template_kwargs"] = string(b)
 		}
 	}
 	pbOpts.Metadata = metadata

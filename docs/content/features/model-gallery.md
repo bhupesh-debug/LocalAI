@@ -2,7 +2,7 @@
 +++
 disableToc = false
 title = "Model Gallery"
-weight = 18
+weight = 81
 url = '/models'
 +++
 
@@ -23,22 +23,281 @@ GPT and text generation models might have a license which is not permissive for 
 
 ![output](https://github.com/mudler/LocalAI/assets/2420543/7b16676e-d5b1-4c97-89bd-9fa5065c21ad)
 
-## Useful Links and resources
-
-- [Open LLM Leaderboard](https://huggingface.co/spaces/HuggingFaceH4/open_llm_leaderboard) - here you can find a list of the most performing models on the Open LLM benchmark. Keep in mind models compatible with LocalAI must be quantized in the `gguf` format.
-
 ## How it works
 
-Navigate the WebUI interface in the "Models" section from the navbar at the top. Here you can find a list of models that can be installed, and you can install them by clicking the "Install" button.
+Open **Models** in the WebUI. It is the canonical page for a model's complete
+lifecycle and has two views:
+
+- **Explore** browses configured galleries and installs models. It is one
+  dense table: each row shows the model's size, a bar for the memory it needs at
+  the chosen context length, and the headroom in words ("3.7 free", "+1.5 on
+  CPU", "0.9 over"). Capability chips show how many models each one matches.
+  Select a row to open the details beside the table: the fit on this machine,
+  VRAM by context length, variants, files, links, tags and licence. This is the
+  default view.
+- **Installed** lists local model configurations in the same table, with their
+  running, idle, disabled, pinned, and distributed state and their size on disk.
+  Load or stop a model from its row, or select it to edit its configuration,
+  open a supported use case, inspect backend logs, or remove it.
+
+Both views store the view, search, filter, and selection in the URL. Installing
+from Explore does not move you away from the catalog; the entry updates in place
+when the operation finishes.
+
+### Repairing an existing model configuration
+
+Gallery template updates do not rewrite YAML files for already installed models.
+If an older installation puts `context_size`, `f16`, or `mmap` under
+`parameters`, move those fields to the YAML root. LocalAI reads them at the
+root; nested copies are ignored. Keep `model` and sampling options under
+`parameters`.
+
+For example, the relevant fields in `models/qwen3-vl-4b-thinking.yaml` should be:
+
+```yaml
+context_size: 8192
+f16: true
+mmap: true
+parameters:
+  model: Qwen3-VL-4B-Thinking-Q4_K_M.gguf
+```
+
+Back up the installed YAML before editing it, preserve its other settings, and
+remove the misplaced nested copies. Use your configured models directory if it
+is not `models`. Preserve model-specific context values: `supra2-100m-instruct`
+uses `2048`, while `shieldstral-1.0-3b` and `shieldstral-1.0-3b-q8` use `32768`.
+Restart LocalAI after editing so it reads the repaired configuration and reloads
+the model. You do not need to download the weights again.
+
+### A model's own page
+
+Every model also has a page of its own at `/app/models/<name>`, so it can be
+linked. Open it with the arrow at the end of a row, a double click on the row,
+or `o` on the selected row. On a phone, a tap on a row opens it. The details
+beside the table stay as the quick look.
+
+The title block names the model and holds the main action: **Install**, with a
+chevron to choose which build to install, or **Load** and **Stop** with a menu
+for an installed model (disable, pin, edit configuration, logs, delete). A strip
+under it answers three questions: whether the model fits this machine, what it
+does, and what installing leaves free on the models disk (or its state, when it
+is installed). The tabs are:
+
+- **Overview**: the description, backend, licence, largest context, tags, links
+  and a memory bar. For an installed model it also shows its state, the pages it
+  opens in, and which agents, agent tasks, failover chains and aliases name it.
+- **Fit and memory**: the verdict in words, a context size selector, the memory
+  bar split into weights and the part that grows with context, and a chart of the
+  memory needed at each context size against the memory this machine offers.
+  When a model has several builds, pick the build to see its own figures.
+- **Variants and files**: the builds with their size and fit, and the files the
+  chosen build downloads. Install any build from its row.
+- **Usage and history**, **Configuration** and **Logs**, for installed models.
+  LocalAI does not record requests, timings, loads or configuration changes for
+  each model, so the usage tab lists what it cannot show yet instead of an empty
+  chart. The same tab lists the files the model uses on disk, with their size,
+  the other models that use them, and any file the configuration names that is
+  not on disk (see [Disk and cleanup](#disk-and-cleanup)). Configuration holds the [Placement](/advanced/model-configuration/#placement)
+  section. Logs is the backend log viewer of the Operate section.
+
+The page reads the same lists as the table, so it works for a model the gallery
+does not list (it has no variants or files tab) and for a gallery model that is
+not installed (it has no usage, configuration or logs tab). If the gallery cannot
+be reached, an installed model keeps working and Install says why it is off.
+
+Going back with `Esc`, `Backspace` or the **Models** button returns to the list
+with its view, search, filters, selection and scroll as you left them. The
+previous and next buttons step through the rows of the list you came from, in
+the order you saw them.
+
+### Keyboard
+
+On the Models page, `/` jumps to the search field, the up and down arrows move
+the selection, `Enter` installs the selected model in Explore, `d` switches
+between comfortable and compact rows, `o` opens the selected model's page, and
+`Esc` closes the details.
+
+On a model's page, `1` to `6` switch tabs, `[` and `]` (or `k` and `j`) step to
+the previous and next model of the list, and `Esc` goes back to the list.
+
+### Disk and cleanup
+
+When the server reports the disk that holds the models directory, a strip in the
+page header shows how much of it is free. It turns amber when less than 10
+percent, or less than 20 GB, is free. In Explore, the details of a model say how
+much disk an install leaves free. The strip is hidden when the disk cannot be
+read, and on a distributed controller, where the models live on the workers.
+
+Select the strip to open the cleanup review. LocalAI does not record when a
+model was last used or how often, so the review says so and ranks installed
+models only by what it can see:
+
+- **Safe to remove**: another build of the same gallery model is installed, and
+  the build LocalAI would pick on this host is the one that stays.
+- **Probably safe**: disabled, unused, and available in the gallery to download
+  again.
+- **Your call**: not loaded and not used by anything, but with nothing more
+  known. A model that is not in the gallery cannot be downloaded again, and the
+  review says so.
+- **Protected**: loaded, pinned, or named by an agent, an agent task, a failover
+  chain or an alias. These are never suggested. If an agent or task cannot be
+  read, nothing is marked safe.
+
+For an admin, sizes are what each model uses on disk, read from
+`GET /api/models/storage`. A file that another installed model also uses stays
+on disk when you remove one of the two, so the review counts only the files a
+model does not share. It says which models share files, and the amount freed
+by a selection counts a shared file only when every model that uses it is in
+the selection. A configuration that names files that are not on disk (a download
+that did not finish, or files removed by hand) is listed as a finding. If the
+report cannot be read, for example because the user is not an admin, sizes fall
+back to the sizes of the files the gallery lists. A model that is not in the
+gallery then shows no size and is not counted in what a removal frees. Before you
+confirm, the review checks again and lists what will go, why, and how much it
+frees. Removal then waits 30 seconds, during which you can undo it; the delete
+request is sent only when that time ends. If you leave the page during the wait,
+nothing is deleted.
+
+## Cyber-Ornith 1.5 9B
+
+Cyber-Ornith 1.5 is a Qwen3.5 fine-tune for security auditing, terminal tasks, and tool use.
+The gallery includes Q4_K_M and Q6_K GGUF builds for text chat with llama.cpp.
+Both use the embedded chat template and a 32,768-token context by default.
+
+Install with automatic variant selection:
+
+```bash
+local-ai models install cyber-ornith-1.5-9b-obliterated
+```
+
+To select Q6_K explicitly:
+
+```bash
+local-ai models install cyber-ornith-1.5-9b-obliterated --variant cyber-ornith-1.5-9b-obliterated-q6
+```
+
+See the [model card](https://huggingface.co/DuoNeural/Cyber-Ornith-1.5-9B-OBLITERATED)
+and [GGUF downloads](https://huggingface.co/mradermacher/Cyber-Ornith-1.5-9B-OBLITERATED-i1-GGUF).
+
+## Cyber-Tiel-Coder
+
+Install `cyber-tiel-coder-35b-a3b-q4-mtp` for coding and image chat with llama.cpp.
+The gallery groups UD-Q4_K_XL and UD-Q8_K_XL builds; both enable MTP speculative decoding and include a BF16 vision projector.
+To select Q8 explicitly, run `local-ai models install cyber-tiel-coder-35b-a3b-q4-mtp --variant cyber-tiel-coder-35b-a3b-q8-mtp`.
+Both configurations use the embedded chat template and default to 32,768 context tokens.
+The [model card](https://huggingface.co/peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF-MTP) describes its abliterated Ornith-1.5 base and MIT license.
+
+## Qwen3.8-27B Agention Precision
+
+The gallery includes Agention Precision IQ4_XS and Q4_K_M GGUF builds of
+Qwen3.8-27B for llama.cpp. Both include the BF16 vision projector for image
+input and use a 32,768-token context by default.
+
+Install with automatic variant selection:
+
+```bash
+local-ai models install qwen3.8-27b-agention-iq4-xs
+```
+
+To select a specific build, pass `--variant qwen3.8-27b-agention-iq4-xs`
+or `--variant qwen3.8-27b-agention-q4-k-m` to the same command.
+The files use standard llama.cpp quantization types and the Apache-2.0 license.
+See the [publisher's model card](https://huggingface.co/agentionai/Qwen3.8-27B-AP-GGUF)
+for quantization details. These entries do not enable MTP speculative decoding.
+
+## Swift 1.5 Qwen3.8-27B GSQ-RCO
+
+Install `swift-1.5-qwen3.8-27b-gsq-rco` for text chat with llama.cpp.
+The gallery groups IQ2_XS, IQ2_S, IQ3_XXS, and IQ3_S quantizations of this 27B reasoning and coding model.
+To select IQ3_S explicitly, run:
+
+```bash
+local-ai models install swift-1.5-qwen3.8-27b-gsq-rco --variant swift-1.5-qwen3.8-27b-gsq-rco-iq3-s
+```
+
+The configurations use the embedded chat template and default to 32,768 context tokens.
+These builds support text chat only: the publisher has no verified vision projector for this release.
+They use standard GGUF files without MTP decoding.
+See the [model card](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF) and [Swift Open License v1.0](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF/blob/main/LICENSE) for usage terms.
+
+## Sharp-Spark-X2.5-4B
+
+Install `sharp-spark-x2.5-4b` for coding and text chat with llama.cpp.
+The gallery groups Q4_K_XL, Q5_K_XL, and Q6_K_XL builds as variants.
+To select the publisher's recommended Q6 build, run:
+
+```bash
+local-ai models install sharp-spark-x2.5-4b --variant sharp-spark-x2.5-4b-q6
+```
+
+All builds use a 32,768-token default context and the embedded Sharp-Spark chat template.
+That template adds a terseness instruction to the system prompt.
+See the [publisher's model card](https://huggingface.co/peculiar-ragdoll/Sharp-Spark-X2.5-4B-GGUF) for quantization and template details.
+
+## MiMo-V2.6-Distill-Qwen-9B
+
+Install `mimo-v2.6-distill-qwen-9b` for text and image chat with llama.cpp.
+This MIT-licensed 9B Qwen3.5 fine-tune targets coding, agent tasks, and visual coding.
+The gallery groups Q4_K_M and Q8_0 builds as variants; both include the F16 vision projector.
+To select Q8_0 explicitly, run `local-ai models install mimo-v2.6-distill-qwen-9b --variant mimo-v2.6-distill-qwen-9b-q8`.
+The configurations default to 32,768 context tokens and use the model's embedded chat template.
+See the [model card](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B) for training details.
+
+## Qwopus3.8 Flash V2
+
+Install `qwopus3.8-27b-flash-v2` for the Q4_K_M GGUF build, with Q8_0 available through variant selection:
+
+```bash
+local-ai models install qwopus3.8-27b-flash-v2
+local-ai models install qwopus3.8-27b-flash-v2 --variant qwopus3.8-27b-flash-v2-q8
+```
+
+Both builds use llama.cpp with the embedded chat template, MTP speculative decoding, and the F32 vision projector.
+Weights and projector downloads are pinned to a Hugging Face revision and verified with SHA256.
+This Apache-2.0 release is a further post-training of Qwopus3.8 Flash for reasoning and agent tasks.
+See the [publisher's model card](https://huggingface.co/Jackrong/Qwopus3.8-27B-Flash-V2-GGUF) for evaluation details and limitations.
+
+## ThinkingCap Qwen3.8-27B
+
+Install `thinkingcap-qwen3.8-27b` for a 27B reasoning model with text and image input.
+The llama.cpp entries include Q4_K_M and Q8_0 weights, each paired with the F16 vision projector.
+LocalAI selects between the builds using the gallery variant rules. To request Q8_0 explicitly:
+
+```bash
+local-ai models install thinkingcap-qwen3.8-27b --variant thinkingcap-qwen3.8-27b-q8
+```
+
+Both builds use the embedded chat template, a 32,768-token default context, and the publisher's sampled decoding settings.
+MTP speculative decoding is not enabled by these entries.
+The weights use [PolyForm Small Business 1.0.0 with a personal-use grant](https://huggingface.co/bottlecapai/ThinkingCap-Qwen3.8-27B-GGUF/blob/main/LICENSE).
+Review that license for permitted use.
+
+## Hemmingway-1
+
+Install `hemmingway-1` for English text generation with llama.cpp. The gallery groups its Q4_K_M and Q8_0 builds as variants.
+To select a specific build, use `local-ai models install hemmingway-1 --variant hemmingway-1-q8` for Q8_0.
+The configurations default to 32,768 context tokens. Increase the context size only if available memory permits.
+The [model license](https://huggingface.co/Altworld/Hemmingway-1) is CC BY-NC 4.0; commercial use requires a separate agreement.
+
+## Qwen-Image 2.1
+
+For image generation, install `qwen-image-2.1-q4_k-ggml` or its `qwen-image-2.1-q8_0-ggml` variant.
+These entries use `stablediffusion-ggml` and include the text encoder, vision projector, and VAE.
+The invalid `qwen-image-2.1-uncensored` chat entry was removed because llama.cpp cannot load its diffusion weights.
+This removal does not delete previously installed models. Remove that configuration before installing an image-generation entry.
 
 ## VRAM and download size estimates
 
 When browsing the gallery or importing a model by URI, LocalAI can show **estimated download size** and **estimated VRAM** for models.
 
-- **Where they appear**: In the model gallery table (Size / VRAM column), in the model detail modal, and after starting an import from URI (in the success message).
-- **How they are computed**: GGUF models use file size (HTTP HEAD or local stat) and optional GGUF metadata (HTTP Range) for KV cache and overhead; other formats use Hugging Face file sizes and optional config when available. If metadata is unavailable, a size-only heuristic is used.
-- **Hardware fit indicator**: When your system reports GPU or RAM capacity, the gallery shows whether the estimated VRAM fits (green) or may not fit (red) using a 95% headroom rule.
+- **Where they appear**: In the model gallery table (Size and Fit columns), in the model inspector beside it, and after starting an import from URI (in the success message).
+- **How they are computed**: GGUF models use file size (HTTP HEAD or local stat) and optional GGUF metadata (HTTP Range) for KV cache and overhead; other formats use Hugging Face file sizes and optional config when available. If metadata is unavailable, a size-only heuristic is used. GGUF metadata lengths that exceed the file size are rejected before allocation; these files also use the size-only estimate.
+- **Hardware fit indicator**: When your system reports GPU or RAM capacity, each row shows whether the estimated memory at the chosen context length fits, using a 95% headroom rule. A model that is too big for the GPU but would run from system RAM is marked as spilling to the CPU, with how much; a model too big for both is marked as over by the shortfall.
 - Estimates are best-effort and may be missing if the server does not support HEAD/Range or the request times out.
+
+## Useful Links and resources
+
+- [Open LLM Leaderboard](https://huggingface.co/spaces/HuggingFaceH4/open_llm_leaderboard) - here you can find a list of the most performing models on the Open LLM benchmark. Keep in mind models compatible with LocalAI must be quantized in the `gguf` format.
 
 ## Add other galleries
 
@@ -56,6 +315,111 @@ GALLERIES=[{"name":"<GALLERY_NAME>", "url":"<GALLERY_URL"}]
 
 The models in the gallery will be automatically indexed and available for installation.
 
+To use a gallery that needs authentication, such as a private GitHub repository or an internal server, add a matching entry to the credentials file. See [Private Registries and Galleries]({{% relref "advanced/private-sources" %}}).
+
+## Gallery mirrors
+
+A gallery entry can declare a `mirrors` list of alternative locations for the same index file. Mirrors exist for availability, not for load balancing: LocalAI always prefers the `url`, and only falls back to the mirrors, in the order you listed them, when the one before it cannot be fetched. If the primary works, the mirrors are never contacted.
+
+Mirrors accept any URI the gallery loader understands — `https://`, `github:`, `huggingface://` (also `hf://` and `hf.co/`), `file://`, and `oci://` — and the same rules apply to them as to a primary URL, so a `file://` mirror must still live inside your models directory.
+
+```json
+GALLERIES=[{"name":"localai", "url":"https://example.org/gallery/index.yaml", "mirrors":["github:mudler/LocalAI/gallery/index.yaml@master"]}]
+```
+
+Each attempt is bounded by a 120 second timeout, and a source that fails — a connection error, a timeout, or an HTTP error status such as 404 or 502 — is skipped for the next 10 minutes so a dead host is not re-dialled on every gallery listing. A source that answers is usable again immediately, and a request you cancel yourself is not counted against it. If every source happens to be inside that 10 minute window, LocalAI tries them all anyway rather than refuse to serve the gallery.
+
+{{% notice warning %}}
+**Neither mirrors nor the offline cache cover a `.ref` URL.** If a gallery's `url` ends in `.ref`, that reference file is fetched and resolved to the real index location *before* mirrors or the cached copy are consulted, and a failure to fetch it fails the gallery outright. That includes the offline case: a `.ref` gallery fails when the network is gone even if it has been fetched successfully before. Mirrors are alternates for the index, not for the reference that points at it. If you want mirror coverage or offline listings, point `url` directly at the index file.
+{{% /notice %}}
+
+The key is optional: a gallery without `mirrors` behaves exactly as before.
+
+## Offline gallery listings
+
+Every successful gallery fetch is written to a cache directory alongside your models directory (`<MODELS_PATH>/../cache/gallery/`), one file per gallery URL. If nothing can serve the index — the primary and every mirror failed, there is no network at all, the host is airgapped — LocalAI serves that last successfully fetched copy instead of failing the listing, and logs a warning saying it did so. This applies to every gallery whose `url` points directly at an index file, with or without `mirrors` — but not to a `.ref` URL, which is resolved before the cache is consulted (see the warning above).
+
+Only a response that actually parses as a gallery index is stored. A captive portal, a proxy or a CDN can answer an index request with HTTP 200 and an HTML error page; caching that would replace a working offline copy with something no listing can read. An empty index is rejected for the same reason, so the previous copy survives.
+
+Entries served this way may be stale: the copy is only as fresh as the last time the gallery could be reached, so models added or changed upstream since then will not show up, and an entry may point at a file that has since moved. A listing served from disk is a degraded mode, not a substitute for a reachable gallery.
+
+The copy is deliberately kept out of the models directory itself, where LocalAI reads a `.yaml` file as an installed model's configuration. Deleting the cache directory is safe — the next successful fetch recreates it — and a machine that has never reached a gallery has nothing cached, so its first listing still fails.
+
+## Galleries published as OCI artifacts
+
+A gallery can live in a container registry instead of on a web server. Give the gallery a `url` with the `oci://` scheme and point it at an artifact reference:
+
+```json
+GALLERIES=[{"name":"premium", "url":"oci://quay.io/acme/gallery:latest"}]
+```
+
+LocalAI pulls the artifact, unpacks it into a cache directory beside your models directory (`<MODELS_PATH>/../cache/gallery/oci/`) and reads `index.yaml` from it. The unpacked copy is reused for one hour before the registry is asked again. Everything else works as it does for an HTTP gallery: an `oci://` URL can be a primary `url` or one of the `mirrors`, a failed pull puts the source in the same 10 minute cooldown, and the offline cache still serves the last good listing.
+
+Downloaded artifact files are readable and writable only by the LocalAI process owner. File writes stay inside the cache directory, including when an existing subdirectory is a symbolic link.
+
+
+This is the only format that carries a whole gallery in one object, so it is what to publish when the index and the model configuration files must travel together.
+
+### Entry URLs relative to the gallery
+
+An artifact holds the index and the files it refers to, so an entry can name its base configuration by its place in the tree:
+
+```yaml
+- name: premium-model
+  url: base/virtual.yaml
+```
+
+A `url` with no scheme is resolved against the root of the gallery it was read from: the unpacked artifact for an `oci://` gallery, and the directory of the index URL for an `http://`, `https://`, `github:`, `huggingface://` or `file://` gallery. A `url` that names a scheme, such as `https://example.org/base.yaml`, is always used as written.
+
+A relative `url` cannot leave the gallery root. An entry that tries to climb out of it, for example `url: ../../etc/passwd`, is refused: LocalAI drops that entry from the listing, logs the reason and keeps the rest of the gallery.
+
+### Signature verification
+
+An `oci://` gallery can be signed, and LocalAI verifies the signature before it unpacks anything. Add an `artifact_verification` block with the Fulcio issuer and the signing identity, in the same form the [backend galleries]({{%relref "features/backends#verifying-oci-backends" %}}) use:
+
+```json
+GALLERIES=[{"name":"premium","url":"oci://quay.io/acme/gallery:latest","artifact_verification":{"issuer":"https://token.actions.githubusercontent.com","identity_regex":"^https://github\\.com/acme/gallery/\\.github/workflows/publish\\.yml@refs/tags/.+$"}}]
+```
+
+The tag is resolved to a digest, the signature is checked against that digest, and the same digest is then pulled. A gallery that fails verification is never written to the cache, so no unverified file reaches your disk. The optional `not_before` RFC3339 value revokes signatures logged before that time, exactly as it does for backends.
+
+Cached copies of a gallery are kept per verification policy on disk, and the in-memory listings are dropped when the gallery settings change. When you change the `verification` block (for example, you add `source_repository` or move `not_before` forward), in the configuration, at runtime through the settings API, or by editing `runtime_settings.json`, the next listing fetches the gallery again and verifies it under the new policy. LocalAI does not serve a copy that an older policy admitted.
+
+LocalAI tells a refusal apart from an outage:
+
+- **Refusal.** The artifact has no signature, or its signature does not match the issuer, identity, `source_repository` or `not_before` of the policy, or the policy itself cannot be used (for example, `not_before` is not an RFC3339 time). LocalAI shows an error and does not serve a cached copy.
+- **Outage.** The registry or the Sigstore trust root cannot be reached, answers with a server error, or the fetch times out. This includes failures during the signature check itself. LocalAI serves the last copy that was verified under the current policy. If no such copy exists, it shows an error. It never serves a copy that was verified under a different policy.
+
+An `oci://` gallery with a `verification` block is only served from `oci://` sources. LocalAI cannot check a signature on an `https://`, `github:` or `file://` mirror, so it ignores these mirrors for that gallery and logs a warning. List only `oci://` mirrors for a signed gallery.
+
+With strict integrity on (`--require-backend-integrity` or `LOCALAI_REQUIRE_BACKEND_INTEGRITY`), an `oci://` gallery without a `verification` block is refused. This is also true when a copy from an earlier fetch is in the cache, because that copy was never verified, and when the gallery has an `https://`, `github:` or `file://` mirror, because LocalAI ignores these mirrors in strict mode too.
+
+The optional `source_repository` value works the same for `oci://` galleries as it does for backends: it pins the repository the signature was made for when a shared reusable workflow does the signing. See [Verifying OCI Backends]({{%relref "features/backends#verifying-oci-backends" %}}).
+
+{{% notice warning %}}
+`artifact_verification` applies only to the gallery artifact. Backend image signatures use `verification`. For compatibility, the artifact loader uses `verification` when `artifact_verification` is absent. Set both fields when the gallery and its backend images have different signing identities.
+
+With `--require-backend-integrity` (`LOCALAI_REQUIRE_BACKEND_INTEGRITY=1`), an `oci://` gallery with neither policy is refused when the models are listed, not only when one is installed. An `oci://` gallery without a policy still lists outside strict mode, with a warning in the log.
+{{% /notice %}}
+
+### Official gallery publishing
+
+The `gallery_publish.yml` workflow publishes both official galleries on relevant changes to `master`, or through a manual dispatch on `master`. It uses the existing `LOCALAI_REGISTRY_USERNAME` and `LOCALAI_REGISTRY_PASSWORD` secrets. It reuses the public backend repository `go-skynet/local-ai-backends`. The `gallery-models` and `gallery-backends` tags move only after their artifact digest has been signed. Revision tags include the source commit SHA.
+
+To prepare the same files locally, run `go run ./scripts/build/gallery . gallery /tmp/model-gallery` or use `backend` as the source directory. The helper rewrites repository-local base configuration URLs to artifact-relative paths and copies the files. The published artifact type is `application/vnd.localai.gallery.v1`; each file is a separate layer with its relative path as its title.
+
+### Private registries
+
+A gallery in a private registry needs a credentials entry that matches the registry, the same entry an image pull from it would use:
+
+```yaml
+- match: quay.io/acme
+  username: bot
+  password_env: QUAY_TOKEN
+```
+
+See [Private Registries and Galleries]({{% relref "advanced/private-sources" %}}) for the file location, the other authentication types and the rules for registries on a local network, which also need `allow_insecure: true`.
+
 ## API Reference
 
 ### Model repositories
@@ -72,13 +436,13 @@ To use additional repositories you need to start `local-ai` with the `GALLERIES`
 GALLERIES=[{"name":"<GALLERY_NAME>", "url":"<GALLERY_URL"}]
 ```
 
-For example, to enable the default `localai` repository, you can start `local-ai` with:
+For example, to spell out the default `localai` repository, you can start `local-ai` with:
 
 ```
-GALLERIES=[{"name":"localai", "url":"github:mudler/localai/gallery/index.yaml"}]
+GALLERIES=[{"name":"localai","url":"https://index.localai.io/models","mirrors":["github:mudler/LocalAI/gallery/index.yaml@master","oci://quay.io/go-skynet/local-ai-backends:gallery-models"],"artifact_verification":{"issuer":"https://token.actions.githubusercontent.com","identity":"https://github.com/mudler/LocalAI/.github/workflows/gallery_publish.yml@refs/heads/master"}}]
 ```
 
-where `github:mudler/localai/gallery/index.yaml` will be expanded automatically to `https://raw.githubusercontent.com/mudler/LocalAI/main/index.yaml`.
+LocalAI tries `https://index.localai.io/models` first, GitHub second, and the signed OCI gallery last. The OCI artifact includes the repository-local base configurations, so reading those configurations does not require GitHub. Model weights and external URLs still require their original hosts. `github:mudler/LocalAI/gallery/index.yaml@master` is expanded automatically to `https://raw.githubusercontent.com/mudler/LocalAI/master/gallery/index.yaml`.
 
 Note: the url are expanded automatically for `github` and `huggingface`, however `https://` and `http://` prefix works as well.
 
@@ -143,13 +507,176 @@ To install a model from the gallery repository, you can pass the model name in t
 LOCALAI=http://localhost:8080
 curl $LOCALAI/models/apply -H "Content-Type: application/json" -d '{
      "id": "localai@bert-embeddings"
-   }'  
+   }' 
 ```
 
 where:
 - `localai` is the repository. It is optional and can be omitted. If the repository is omitted LocalAI will search the model by name in all the repositories. In the case the same model name is present in both galleries the first match wins.
 - `bert-embeddings` is the model name in the gallery
-  (read its [config here](https://github.com/mudler/LocalAI/tree/master/gallery/blob/main/bert-embeddings.yaml)).
+  (read its [config here](https://github.com/mudler/LocalAI/blob/master/gallery/index.yaml)).
+
+### Model variants
+
+Some gallery entries offer several builds of the same model: different
+quantizations, or the same weights served by a different engine. Such an entry
+carries a `variants` list, and installing it normally lets LocalAI choose:
+
+- variants whose backend cannot run on this machine are dropped;
+- variants that do not fit the available memory are dropped. That budget is
+  VRAM on a discrete-GPU host, and system RAM otherwise — including on
+  unified-memory machines such as Apple Silicon, where the GPU shares system
+  RAM and reports no separate VRAM pool;
+- the entry's own build is never dropped. It competes with whatever survived
+  rather than waiting for everything else to fail, so an entry that is itself
+  the largest build that fits keeps its own payload;
+- among the remaining builds the engine this machine prefers wins first: a vLLM
+  build on an NVIDIA or AMD host, an MLX build on Apple Silicon, llama.cpp
+  otherwise. The native accelerated runtime is worth more than a bigger
+  download, so preference is settled before size;
+- the largest build on the preferred engine then wins, because a bigger
+  footprint means a higher quality build of the same model. A machine with no
+  preferred engine picks purely by size;
+- a build whose size could not be measured ranks below the entry's own build,
+  so an unreadable size never quietly displaces the payload the entry ships;
+- if nothing else survives, the entry's own build is installed. The entry is
+  always installable, on any machine.
+
+Because the entry's own build competes like every other candidate, the order of
+the list means nothing and a `variants` list may offer smaller builds, larger
+ones, or both.
+
+Sizes are measured from the model's weights rather than downloaded, and cached.
+
+The gallery listing only flags which entries offer variants, with a
+`has_variants` field. It deliberately does not describe them: measuring a
+variant is a network round trip per referenced build, so describing every
+entry inline would make one listing request cost as many round trips as the
+whole page has variants.
+
+```bash
+curl http://localhost:8080/api/models | jq '.models[] | select(.has_variants) | .name'
+```
+
+### Collapsing the listing to one row per model
+
+By default the listing returns every entry, including the individual builds a
+parent entry offers as variants, so one model can occupy several rows. Pass
+`collapse_variants=true` for the deduplicated view: every entry that is
+installable in its own right, with nothing shown twice.
+
+```bash
+curl 'http://localhost:8080/api/models?collapse_variants=true'
+```
+
+An entry is hidden only when another entry already offers it as a variant, so
+it stays reachable by installing that entry. Entries that declare variants are
+always kept, and so is any entry nobody references. The filter is applied
+before pagination, so page counts stay correct.
+
+**Searching respects the collapse.** `term` is matched against every entry the
+gallery holds, builds another entry offers included, so nothing becomes
+unfindable. The collapse then decides how a match is reported: a hit on a build
+another entry offers comes back as that entry, since that is the row installable
+in its own right. Looking a model up by name must not answer "not found" for an
+entry the gallery holds, and must not answer with a row the requested view has
+no place for either. A term that is empty or only whitespace does not count as a
+search:
+
+```bash
+# Collapsed: the parent stands in for the build it offers.
+curl 'http://localhost:8080/api/models?collapse_variants=true'
+# Collapsed, searching a build the parent offers: the parent comes back.
+curl 'http://localhost:8080/api/models?collapse_variants=true&term=nanbeige4.1-3b-q8'
+# Uncollapsed, same term: the build itself comes back.
+curl 'http://localhost:8080/api/models?term=nanbeige4.1-3b-q8'
+```
+
+A parent appears once however many of its builds match, and once when it matches
+in its own right as well. The substitution runs before the count and the page
+math, so both describe the rows actually handed out.
+
+`term`, `tag` and `backend` are all applied before the substitution, so each is
+judged against the build that really carries the name, tag or backend rather
+than against a parent that merely offers it. The consequence is worth knowing:
+filtering by a backend only one variant declares returns that variant's parent,
+whose own `backend` field may say something else. The alternative would be to
+claim the gallery holds no such build.
+
+The web UI requests the collapsed view by default and has a toggle for the other
+one. The parameter stays on the API, off by default, for clients that want
+either view.
+
+Ask for the description one entry at a time, as the web UI does when you open
+a model's variant menu:
+
+```bash
+curl http://localhost:8080/api/models/variants/localai@nanbeige4.1-3b-q4
+```
+
+```json
+{
+  "auto_selected": "nanbeige4.1-3b-q8",
+  "variants": [
+    { "model": "nanbeige4.1-3b-q8", "backend": "llama-cpp", "memory_bytes": 4187593113, "fits": true, "is_base": false },
+    { "model": "nanbeige4.1-3b-q4", "backend": "llama-cpp", "fits": true, "is_base": true }
+  ]
+```
+
+`auto_selected` is what installing without a choice would pick right now. `fits`
+is whether auto-selection would consider that variant on this machine, and
+`is_base` marks the entry's own build. `memory_bytes` is omitted entirely, as on
+the second entry above, when the size could not be measured; read a missing
+`memory_bytes` as unknown rather than as a free build.
+
+An entry that declares no variants carries no `has_variants` field and answers
+this endpoint with an empty list, so a client never has to ask about it.
+
+To install a specific one, pass its name as `variant`:
+
+```bash
+curl $LOCALAI/models/apply -H "Content-Type: application/json" -d '{
+     "id": "localai@nanbeige4.1-3b-q4",
+     "variant": "nanbeige4.1-3b-q8"
+   }'
+```
+
+An explicit choice is honored even when the machine looks too small for it, so
+you can deliberately install a build LocalAI would not have picked. A `variant`
+the entry does not declare fails the install and names what was requested; it
+never quietly falls back to auto-selection. The choice is recorded, so a later
+reinstall or upgrade of the same model stays on the variant you picked.
+
+The same option exists on the CLI:
+
+```bash
+local-ai models install nanbeige4.1-3b-q4 --variant nanbeige4.1-3b-q8
+```
+
+The `install_model` MCP tool takes the same `variant` argument, so an assistant
+managing installs conversationally can pick a build too.
+
+Entries without a `variants` list are unaffected by any of this and install
+exactly as they always have.
+
+### Artifact-backed models
+
+Gallery models with an `artifacts` declaration are fully materialized during
+installation. Their operation progresses through these phases:
+
+```text
+resolving -> downloading -> verifying -> committing -> persisting
+```
+
+The admin operations strip, the [Activity]({{% relref "operations/activity" %}})
+page and `GET /api/operations` expose `currentBytes` and `totalBytes` as raw
+transport bytes. Cancelling an active download leaves its partial files in
+place so a retry can resume. A verification failure never
+exposes a completed snapshot, while a retry or another installation reuses an
+already verified content-addressed snapshot.
+
+Deleting a model configuration does not delete its content-addressed snapshot
+bytes. This allows another configuration or a later reinstall to reuse the
+cache; safe cache garbage collection is deferred.
 
 ### How to install a model not part of a gallery
 
@@ -200,6 +727,7 @@ echo "Job completed"
 
 To preload models on start instead you can use the `PRELOAD_MODELS` environment variable.
 
+
 <details>
 
 To preload models on start, use the `PRELOAD_MODELS` environment variable by setting it to a JSON array of model uri:
@@ -207,6 +735,8 @@ To preload models on start, use the `PRELOAD_MODELS` environment variable by set
 ```bash
 PRELOAD_MODELS='[{"url": "<MODEL_URL>"}]'
 ```
+
+The value must be a JSON array. Boolean values such as `true` are not valid model preload configurations.
 
 Note: `url` or `id` must be specified. `url` is used to a url to a model gallery configuration, while an `id` is used to refer to models inside repositories. If both are specified, the `id` will be used.
 
@@ -270,7 +800,7 @@ LOCALAI=http://localhost:8080
 curl $LOCALAI/models/apply -H "Content-Type: application/json" -d '{
      "url": "<MODEL_CONFIG_FILE>",
      "name": "<MODEL_NAME>"
-   }'  
+   }' 
 ```
 
 For example, to install a model as `gpt-3.5-turbo`:
@@ -280,7 +810,7 @@ LOCALAI=http://localhost:8080
 curl $LOCALAI/models/apply -H "Content-Type: application/json" -d '{
       "url": "github:mudler/LocalAI/gallery/gpt4all-j.yaml",
       "name": "gpt-3.5-turbo"
-   }'  
+   }' 
 ```
 ### Additional Files
 
@@ -300,7 +830,7 @@ curl $LOCALAI/models/apply -H "Content-Type: application/json" -d '{
             "filename": "<additional_file_name>"
         }
      ]
-   }'  
+   }' 
 ```
 
 </details>
@@ -321,37 +851,14 @@ curl $LOCALAI/models/apply -H "Content-Type: application/json" -d '{
         "f16": true,
         ...
      }
-   }'  
+   }' 
 ```
 
 </details>
 
-
+ 
 
 ## Examples
-
-### Embeddings: Bert
-
-<details>
-
-```bash
-curl $LOCALAI/models/apply -H "Content-Type: application/json" -d '{
-     "id": "bert-embeddings",
-     "name": "text-embedding-ada-002"
-   }'  
-```
-
-To test it:
-
-```bash
-LOCALAI=http://localhost:8080
-curl $LOCALAI/v1/embeddings -H "Content-Type: application/json" -d '{
-    "input": "Test",
-    "model": "text-embedding-ada-002"
-  }'
-```
-
-</details>
 
 ### Image generation: Stable diffusion
 
@@ -398,7 +905,7 @@ YAML:
 
 Test it:
 
-```
+```bash
 curl $LOCALAI/v1/images/generations -H "Content-Type: application/json" -d '{
             "prompt": "floating hair, portrait, ((loli)), ((one girl)), cute face, hidden hands, asymmetrical bangs, beautiful detailed eyes, eye shadow, hair ornament, ribbons, bowties, buttons, pleated skirt, (((masterpiece))), ((best quality)), colorful|((part of the head)), ((((mutated hands and fingers)))), deformed, blurry, bad anatomy, disfigured, poorly drawn face, mutation, mutated, extra limb, ugly, poorly drawn hands, missing limb, blurry, floating limbs, disconnected limbs, malformed hands, blur, out of focus, long neck, long body, Octane renderer, lowres, bad anatomy, bad hands, text",
             "mode": 2,  "seed":9000,
@@ -469,7 +976,7 @@ curl http://localhost:8080/models/apply -H "Content-Type: application/json" -d '
         },
       "overrides": { "backend": "...", "f16": true }
      ]
-   }
+   }'
 ```
 
 An optional, list of additional files can be specified to be downloaded within `files`. The `name` allows to override the model name. Finally it is possible to override the model config file with `override`.
@@ -503,3 +1010,14 @@ Returns a json containing the error, and if the job is being processed:
 ```json
 {"error":null,"processed":true,"message":"completed"}
 ```
+
+Installations are processed one at a time. A job submitted while another install
+is still running is reported as queued until the installer picks it up:
+
+```json
+{"error":null,"processed":false,"message":"queued","phase":"queued"}
+```
+
+A job ID is queryable from the moment `/models/apply` returns it, so a `404`/`500`
+from this endpoint means the ID is genuinely unknown rather than merely waiting
+its turn.

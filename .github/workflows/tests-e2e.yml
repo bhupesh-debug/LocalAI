@@ -3,6 +3,14 @@ name: 'E2E Backend Tests'
 
 on:
   pull_request:
+    # The e2e suite drives backends over gRPC directly and reads none of these
+    # paths, so a diff confined to them cannot move it.
+    # See .agents/ci-caching.md.
+    paths-ignore:
+      - 'gallery/**'
+      - 'docs/**'
+      - 'examples/**'
+      - '**/*.md'
   push:
     branches:
       - master
@@ -10,8 +18,8 @@ on:
       - '*'
 
 concurrency:
-  group: ci-tests-e2e-backend-${{ github.head_ref || github.ref }}-${{ github.repository }}
-  cancel-in-progress: true
+  group: ci-tests-e2e-backend-${{ github.event.pull_request.number || github.sha }}-${{ github.repository }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   tests-e2e-backend:
@@ -21,9 +29,11 @@ jobs:
         go-version: ['1.25.x']
     steps:
       - name: Clone
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           submodules: true
+      - name: Configure apt mirror on runner
+        uses: ./.github/actions/configure-apt-mirror
       - name: Setup Go ${{ matrix.go-version }}
         uses: actions/setup-go@v5
         with:
@@ -45,7 +55,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libopus-dev
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
       - name: Build React UI
@@ -53,8 +63,13 @@ jobs:
       - name: Test Backend E2E
         run: |
           PATH="$PATH:$HOME/go/bin" make build-mock-backend test-e2e
+      # tmate keeps the runner busy until the 6 hour job limit, so a single
+      # failure costs a whole runner slot. Only open a session when someone
+      # asked for one by labelling the pull request `ci-debug`, and cap the
+      # session so a forgotten label cannot idle a runner either.
       - name: Setup tmate session if tests fail
-        if: ${{ failure() }}
+        if: ${{ failure() && contains(github.event.pull_request.labels.*.name, 'ci-debug') }}
+        timeout-minutes: 30
         uses: mxschmitt/action-tmate@v3.23
         with:
           detached: true

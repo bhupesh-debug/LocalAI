@@ -28,8 +28,14 @@ type TranscriptionRequest struct {
 	TimestampGranularities []string
 }
 
-func (r *TranscriptionRequest) toProto(threads uint32) *proto.TranscriptRequest {
+// modelIdentity is ModelConfig.Model, the value the backend received as
+// ModelOptions.Model at LoadModel, so it can reject a request that reached it
+// through a stale distributed route (#10952). It is a parameter rather than a
+// TranscriptionRequest field because the request is built by HTTP handlers that
+// have no ModelConfig, while every caller of this method does.
+func (r *TranscriptionRequest) toProto(threads uint32, modelIdentity string) *proto.TranscriptRequest {
 	return &proto.TranscriptRequest{
+		ModelIdentity:          modelIdentity,
 		Dst:                    r.Audio,
 		Language:               r.Language,
 		Translate:              r.Translate,
@@ -41,11 +47,14 @@ func (r *TranscriptionRequest) toProto(threads uint32) *proto.TranscriptRequest 
 	}
 }
 
-func loadTranscriptionModel(ml *model.ModelLoader, modelConfig config.ModelConfig, appConfig *config.ApplicationConfig) (grpcPkg.Backend, error) {
+func loadTranscriptionModel(ctx context.Context, ml *model.ModelLoader, modelConfig config.ModelConfig, appConfig *config.ApplicationConfig) (grpcPkg.Backend, error) {
 	if modelConfig.Backend == "" {
 		modelConfig.Backend = model.WhisperBackend
 	}
-	opts := ModelOptions(modelConfig, appConfig)
+	// model.WithContext(ctx) overrides the app-context default set in
+	// ModelOptions so distributed routing decisions reach the request's
+	// X-LocalAI-Node holder via distributedhdr.Stamp.
+	opts := ModelOptions(modelConfig, appConfig, model.WithContext(ctx))
 	transcriptionModel, err := ml.Load(opts...)
 	if err != nil {
 		recordModelLoadFailure(appConfig, modelConfig.Name, modelConfig.Backend, err, nil)
@@ -57,8 +66,8 @@ func loadTranscriptionModel(ml *model.ModelLoader, modelConfig config.ModelConfi
 	return transcriptionModel, nil
 }
 
-func ModelTranscription(audio, language string, translate, diarize bool, prompt string, ml *model.ModelLoader, modelConfig config.ModelConfig, appConfig *config.ApplicationConfig) (*schema.TranscriptionResult, error) {
-	return ModelTranscriptionWithOptions(TranscriptionRequest{
+func ModelTranscription(ctx context.Context, audio, language string, translate, diarize bool, prompt string, ml *model.ModelLoader, modelConfig config.ModelConfig, appConfig *config.ApplicationConfig) (*schema.TranscriptionResult, error) {
+	return ModelTranscriptionWithOptions(ctx, TranscriptionRequest{
 		Audio:     audio,
 		Language:  language,
 		Translate: translate,
@@ -67,22 +76,30 @@ func ModelTranscription(audio, language string, translate, diarize bool, prompt 
 	}, ml, modelConfig, appConfig)
 }
 
-func ModelTranscriptionWithOptions(req TranscriptionRequest, ml *model.ModelLoader, modelConfig config.ModelConfig, appConfig *config.ApplicationConfig) (*schema.TranscriptionResult, error) {
-	transcriptionModel, err := loadTranscriptionModel(ml, modelConfig, appConfig)
+func ModelTranscriptionWithOptions(ctx context.Context, req TranscriptionRequest, ml *model.ModelLoader, modelConfig config.ModelConfig, appConfig *config.ApplicationConfig) (*schema.TranscriptionResult, error) {
+	transcriptionModel, err := loadTranscriptionModel(ctx, ml, modelConfig, appConfig)
 	if err != nil {
 		return nil, err
 	}
+	release, err := AcquireGlobalBackendSlot()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 
 	var startTime time.Time
+	var traceID string
 	var audioSnippet map[string]any
 	if appConfig.EnableTracing {
-		trace.InitBackendTracingIfEnabled(appConfig.TracingMaxItems)
+		trace.InitBackendTracingIfEnabled(appConfig.TracingMaxItems, appConfig.TracingMaxBodyBytes)
 		startTime = time.Now()
+		traceID = trace.BeginBackendTrace(trace.BackendTrace{Timestamp: startTime, Type: trace.BackendTraceTranscription, ModelName: modelConfig.Name, Backend: modelConfig.Backend, Summary: trace.TruncateString(req.Audio, 200)})
 		// Capture audio before the backend call — the backend may delete the file.
-		audioSnippet = trace.AudioSnippet(req.Audio)
+		audioSnippet = trace.AudioSnippet(req.Audio, appConfig.TracingMaxBodyBytes)
 	}
+	defer trace.CancelBackendTrace(traceID)
 
-	r, err := transcriptionModel.AudioTranscription(context.Background(), req.toProto(uint32(*modelConfig.Threads)))
+	r, err := transcriptionModel.AudioTranscription(ctx, req.toProto(uint32(*modelConfig.Threads), modelConfig.Model))
 	if err != nil {
 		if appConfig.EnableTracing {
 			errData := map[string]any{
@@ -96,6 +113,7 @@ func ModelTranscriptionWithOptions(req TranscriptionRequest, ml *model.ModelLoad
 				maps.Copy(errData, audioSnippet)
 			}
 			trace.RecordBackendTrace(trace.BackendTrace{
+				ID:        traceID,
 				Timestamp: startTime,
 				Duration:  time.Since(startTime),
 				Type:      trace.BackendTraceTranscription,
@@ -124,6 +142,7 @@ func ModelTranscriptionWithOptions(req TranscriptionRequest, ml *model.ModelLoad
 			maps.Copy(data, audioSnippet)
 		}
 		trace.RecordBackendTrace(trace.BackendTrace{
+			ID:        traceID,
 			Timestamp: startTime,
 			Duration:  time.Since(startTime),
 			Type:      trace.BackendTraceTranscription,
@@ -149,16 +168,21 @@ type TranscriptionStreamChunk struct {
 // invokes onChunk for each event the backend produces. Backends that don't
 // support real streaming should still emit one terminal event with Final set,
 // which the HTTP layer turns into a single delta + done SSE pair.
-func ModelTranscriptionStream(req TranscriptionRequest, ml *model.ModelLoader, modelConfig config.ModelConfig, appConfig *config.ApplicationConfig, onChunk func(TranscriptionStreamChunk)) error {
-	transcriptionModel, err := loadTranscriptionModel(ml, modelConfig, appConfig)
+func ModelTranscriptionStream(ctx context.Context, req TranscriptionRequest, ml *model.ModelLoader, modelConfig config.ModelConfig, appConfig *config.ApplicationConfig, onChunk func(TranscriptionStreamChunk)) error {
+	transcriptionModel, err := loadTranscriptionModel(ctx, ml, modelConfig, appConfig)
 	if err != nil {
 		return err
 	}
 
-	pbReq := req.toProto(uint32(*modelConfig.Threads))
+	pbReq := req.toProto(uint32(*modelConfig.Threads), modelConfig.Model)
 	pbReq.Stream = true
+	release, err := AcquireGlobalBackendSlot()
+	if err != nil {
+		return err
+	}
+	defer release()
 
-	return transcriptionModel.AudioTranscriptionStream(context.Background(), pbReq, func(chunk *proto.TranscriptStreamResponse) {
+	return transcriptionModel.AudioTranscriptionStream(ctx, pbReq, func(chunk *proto.TranscriptStreamResponse) {
 		if chunk == nil {
 			return
 		}
@@ -178,11 +202,24 @@ func transcriptResultFromProto(r *proto.TranscriptResult) *schema.TranscriptionR
 		Text:     r.Text,
 		Language: r.Language,
 		Duration: float64(r.Duration),
+		Eou:      r.Eou,
 	}
+
 	for _, s := range r.Segments {
 		var tks []int
 		for _, t := range s.Tokens {
 			tks = append(tks, int(t))
+		}
+		var words []schema.TranscriptionWord
+		for _, w := range s.Words {
+			var word = schema.TranscriptionWord{
+				Start:   time.Duration(w.Start),
+				End:     time.Duration(w.End),
+				Text:    w.Text,
+				Speaker: w.Speaker,
+			}
+			words = append(words, word)
+			tr.Words = append(tr.Words, word)
 		}
 		tr.Segments = append(tr.Segments,
 			schema.TranscriptionSegment{
@@ -192,6 +229,7 @@ func transcriptResultFromProto(r *proto.TranscriptResult) *schema.TranscriptionR
 				End:     time.Duration(s.End),
 				Tokens:  tks,
 				Speaker: s.Speaker,
+				Words:   words,
 			})
 	}
 	return tr

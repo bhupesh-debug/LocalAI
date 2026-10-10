@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"os"
+	"runtime"
 
 	"github.com/ebitengine/purego"
 	grpc "github.com/mudler/LocalAI/pkg/grpc"
@@ -21,7 +22,11 @@ func main() {
 	// Get library name from environment variable, default to fallback
 	libName := os.Getenv("SD_LIBRARY")
 	if libName == "" {
-		libName = "./libgosd-fallback.so"
+		if runtime.GOOS == "darwin" {
+			libName = "./libgosd-fallback.dylib"
+		} else {
+			libName = "./libgosd-fallback.so"
+		}
 	}
 
 	gosd, err := purego.Dlopen(libName, purego.RTLD_NOW|purego.RTLD_GLOBAL)
@@ -30,8 +35,13 @@ func main() {
 	}
 
 	libFuncs := []LibFuncs{
+		{&UpscalerCreate, "gosd_upscaler_create"},
+		{&UpscalerScale, "gosd_upscaler_scale"},
+		{&UpscalerRun, "gosd_upscaler_run"},
+		{&UpscalerDestroy, "gosd_upscaler_destroy"},
 		{&LoadModel, "load_model"},
 		{&GenImage, "gen_image"},
+		{&GenVideo, "gen_video"},
 		{&TilingParamsSetEnabled, "sd_tiling_params_set_enabled"},
 		{&TilingParamsSetTileSizes, "sd_tiling_params_set_tile_sizes"},
 		{&TilingParamsSetRelSizes, "sd_tiling_params_set_rel_sizes"},
@@ -41,7 +51,14 @@ func main() {
 		{&ImgGenParamsSetPrompts, "sd_img_gen_params_set_prompts"},
 		{&ImgGenParamsSetDimensions, "sd_img_gen_params_set_dimensions"},
 		{&ImgGenParamsSetSeed, "sd_img_gen_params_set_seed"},
+		{&ImgGenParamsSetCustomSigmas, "sd_img_gen_params_set_custom_sigmas"},
 		{&ImgGenParamsGetVaeTilingParams, "sd_img_gen_params_get_vae_tiling_params"},
+
+		{&VidGenParamsNew, "sd_vid_gen_params_new"},
+		{&VidGenParamsSetPrompts, "sd_vid_gen_params_set_prompts"},
+		{&VidGenParamsSetDimensions, "sd_vid_gen_params_set_dimensions"},
+		{&VidGenParamsSetSeed, "sd_vid_gen_params_set_seed"},
+		{&VidGenParamsSetVideoFrames, "sd_vid_gen_params_set_video_frames"},
 	}
 
 	for _, lf := range libFuncs {

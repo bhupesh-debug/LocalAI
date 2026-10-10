@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,11 +17,20 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
-	"github.com/mudler/LocalAI/core/http/auth"
-	"github.com/mudler/LocalAI/core/schema"
-	"github.com/mudler/LocalAI/core/services/nodes"
 	"github.com/mudler/xlog"
 	"gorm.io/gorm"
+
+	"github.com/mudler/LocalAI/core/config"
+	"github.com/mudler/LocalAI/core/gallery"
+	"github.com/mudler/LocalAI/core/http/auth"
+	"github.com/mudler/LocalAI/core/schema"
+	"github.com/mudler/LocalAI/core/services/galleryop"
+	"github.com/mudler/LocalAI/core/services/nodes"
+	"github.com/mudler/LocalAI/core/services/nodes/prefixcache"
+	"github.com/mudler/LocalAI/core/services/workerctl"
+	"github.com/mudler/LocalAI/pkg/httpclient"
+	"github.com/mudler/LocalAI/pkg/natsauth"
+	"github.com/mudler/LocalAI/pkg/vrambudget"
 )
 
 // nodeError builds a schema.ErrorResponse for node endpoints.
@@ -52,7 +62,10 @@ func GetNodeEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		ctx := c.Request().Context()
 		id := c.Param("id")
-		node, err := registry.Get(ctx, id)
+		// GetWithExtras (not Get) so the response carries the node's labels,
+		// loaded-model count, and in-flight total — the bare BackendNode keeps
+		// labels in a separate table, leaving the detail view's label list empty.
+		node, err := registry.GetWithExtras(ctx, id)
 		if err != nil {
 			return c.JSON(http.StatusNotFound, nodeError(http.StatusNotFound, "node not found"))
 		}
@@ -62,23 +75,51 @@ func GetNodeEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
 
 // RegisterNodeRequest is the request body for registering a new worker node.
 type RegisterNodeRequest struct {
-	Name          string `json:"name"`
-	NodeType      string `json:"node_type,omitempty"` // "backend" (default) or "agent"
-	Address       string `json:"address"`
-	HTTPAddress   string `json:"http_address,omitempty"`
-	Token         string `json:"token,omitempty"`
-	TotalVRAM     uint64 `json:"total_vram,omitempty"`
-	AvailableVRAM uint64 `json:"available_vram,omitempty"`
-	TotalRAM      uint64 `json:"total_ram,omitempty"`
-	AvailableRAM  uint64 `json:"available_ram,omitempty"`
-	GPUVendor     string            `json:"gpu_vendor,omitempty"`
-	Labels        map[string]string `json:"labels,omitempty"`
+	Name            string  `json:"name"`
+	NodeType        string  `json:"node_type,omitempty"` // "backend" (default) or "agent"
+	Address         string  `json:"address"`
+	HTTPAddress     string  `json:"http_address,omitempty"`
+	Token           string  `json:"token,omitempty"`
+	TotalVRAM       uint64  `json:"total_vram,omitempty"`
+	AvailableVRAM   uint64  `json:"available_vram,omitempty"`
+	TotalRAM        uint64  `json:"total_ram,omitempty"`
+	AvailableRAM    uint64  `json:"available_ram,omitempty"`
+	CPULogicalCores uint64  `json:"cpu_logical_cores,omitempty"`
+	CPUUsagePercent float64 `json:"cpu_usage_percent,omitempty"`
+	CPULoad1        float64 `json:"cpu_load_1,omitempty"`
+	// TotalDisk / AvailableDisk describe the filesystem backing the worker's
+	// MODELS directory (where staged weights land), not the root filesystem.
+	// Omitted by workers that predate the fields; the scheduler treats
+	// total_disk == 0 as "unknown" and leaves such a node in rotation.
+	TotalDisk     uint64 `json:"total_disk,omitempty"`
+	AvailableDisk uint64 `json:"available_disk,omitempty"`
+	GPUVendor     string `json:"gpu_vendor,omitempty"`
+	// GPUComputeCapability is the worker GPU's compute capability ("major.minor",
+	// e.g. "12.1" for GB10). Used by the router for per-arch option tuning.
+	GPUComputeCapability string `json:"gpu_compute_capability,omitempty"`
+	// Capability is the worker's own meta-backend capability string. The
+	// controller stores it so backend discovery can reflect what the cluster
+	// can run rather than what the (typically GPU-less) controller can run.
+	Capability string            `json:"capability,omitempty"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	// MaxReplicasPerModel is the per-node cap on replicas of any single model.
+	// Workers older than this field omit it; we coerce 0 → 1 below to preserve
+	// historical single-replica behavior.
+	MaxReplicasPerModel int `json:"max_replicas_per_model,omitempty"`
+	// VRAMBudget is the worker's operator-set VRAM cap ("80%" or "12GB"). The
+	// registry resolves and enforces it against the raw reported VRAM.
+	VRAMBudget string `json:"vram_budget,omitempty"`
+	// Version is the LocalAI build version reported by the worker at
+	// registration. Empty for workers registered before this field existed.
+	Version string `json:"version,omitempty"`
+	// Commit is the git commit hash the worker binary was built from.
+	Commit string `json:"commit,omitempty"`
 }
 
 // RegisterNodeEndpoint registers a new backend node.
 // expectedToken is the registration token configured on the frontend (may be empty to disable auth).
 // autoApprove controls whether new nodes go directly to "healthy" or require admin approval.
-func RegisterNodeEndpoint(registry *nodes.NodeRegistry, expectedToken string, autoApprove bool, authDB *gorm.DB, hmacSecret string) echo.HandlerFunc {
+func RegisterNodeEndpoint(registry *nodes.NodeRegistry, expectedToken string, autoApprove bool, authDB *gorm.DB, hmacSecret string, natsCfg natsauth.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		var req RegisterNodeRequest
 		if err := c.Bind(&req); err != nil {
@@ -131,17 +172,36 @@ func RegisterNodeEndpoint(registry *nodes.NodeRegistry, expectedToken string, au
 			tokenHash = hex.EncodeToString(h[:])
 		}
 
+		// Coerce 0 → 1 for backward compat with workers that don't send the field.
+		// GORM's `default:1` only fires for a missing column; once Go zero-values
+		// reach the struct field they're written as 0 unless explicitly set here.
+		maxReplicasPerModel := req.MaxReplicasPerModel
+		if maxReplicasPerModel < 1 {
+			maxReplicasPerModel = 1
+		}
+
 		node := &nodes.BackendNode{
-			Name:          req.Name,
-			NodeType:      nodeType,
-			Address:       req.Address,
-			HTTPAddress:   req.HTTPAddress,
-			TokenHash:     tokenHash,
-			TotalVRAM:     req.TotalVRAM,
-			AvailableVRAM: req.AvailableVRAM,
-			TotalRAM:      req.TotalRAM,
-			AvailableRAM:  req.AvailableRAM,
-			GPUVendor:     req.GPUVendor,
+			Name:                 req.Name,
+			NodeType:             nodeType,
+			Address:              req.Address,
+			HTTPAddress:          req.HTTPAddress,
+			TokenHash:            tokenHash,
+			TotalVRAM:            req.TotalVRAM,
+			AvailableVRAM:        req.AvailableVRAM,
+			TotalRAM:             req.TotalRAM,
+			AvailableRAM:         req.AvailableRAM,
+			CPULogicalCores:      req.CPULogicalCores,
+			CPUUsagePercent:      req.CPUUsagePercent,
+			CPULoad1:             req.CPULoad1,
+			TotalDisk:            req.TotalDisk,
+			AvailableDisk:        req.AvailableDisk,
+			GPUVendor:            req.GPUVendor,
+			GPUComputeCapability: req.GPUComputeCapability,
+			Capability:           req.Capability,
+			MaxReplicasPerModel:  maxReplicasPerModel,
+			VRAMBudget:           req.VRAMBudget,
+			Version:              req.Version,
+			Commit:               req.Commit,
 		}
 
 		ctx := c.Request().Context()
@@ -150,10 +210,16 @@ func RegisterNodeEndpoint(registry *nodes.NodeRegistry, expectedToken string, au
 			return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "failed to register node"))
 		}
 
-		// Store static labels from worker and apply auto-labels
-		if len(req.Labels) > 0 {
-			if err := registry.SetNodeLabels(ctx, node.ID, req.Labels); err != nil {
-				xlog.Warn("Failed to set node labels", "node", node.ID, "error", err)
+		// Merge worker-supplied labels into the node's existing label set,
+		// then apply auto-labels. Using SetNodeLabels here would have
+		// delete-then-recreate semantics — every worker re-register would
+		// wipe any UI-added label (since PR #9583 the worker always sends
+		// the auto-mirror `node.replica-slots`, which made the latent bug
+		// from PR #9186 trigger universally instead of only for workers
+		// with `--node-labels` set).
+		for k, v := range req.Labels {
+			if err := registry.SetNodeLabel(ctx, node.ID, k, v); err != nil {
+				xlog.Warn("Failed to set node label", "node", node.ID, "key", k, "error", err)
 			}
 		}
 		registry.ApplyAutoLabels(ctx, node.ID, node)
@@ -191,13 +257,15 @@ func RegisterNodeEndpoint(registry *nodes.NodeRegistry, expectedToken string, au
 			}
 		}
 
+		attachNatsJWT(response, node, natsCfg)
+
 		return c.JSON(http.StatusCreated, response)
 	}
 }
 
 // ApproveNodeEndpoint approves a pending node, setting its status to healthy.
 // For agent workers, it also provisions an API key so they can call the inference API.
-func ApproveNodeEndpoint(registry *nodes.NodeRegistry, authDB *gorm.DB, hmacSecret string) echo.HandlerFunc {
+func ApproveNodeEndpoint(registry *nodes.NodeRegistry, authDB *gorm.DB, hmacSecret string, natsCfg natsauth.Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		ctx := c.Request().Context()
 		id := c.Param("id")
@@ -227,8 +295,24 @@ func ApproveNodeEndpoint(registry *nodes.NodeRegistry, authDB *gorm.DB, hmacSecr
 			}
 		}
 
+		attachNatsJWT(response, node, natsCfg)
+
 		return c.JSON(http.StatusOK, response)
 	}
+}
+
+// attachNatsJWT adds a per-node NATS user JWT to a register/approve response when minting is enabled.
+func attachNatsJWT(response map[string]any, node *nodes.BackendNode, natsCfg natsauth.Config) {
+	if !natsCfg.CanMintWorkers() || node == nil || node.Status == nodes.StatusPending {
+		return
+	}
+	jwt, seed, err := natsCfg.MintWorkerJWT(node.ID, node.NodeType)
+	if err != nil {
+		xlog.Warn("Failed to mint NATS JWT for node", "node", node.Name, "id", node.ID, "error", err)
+		return
+	}
+	response["nats_jwt"] = jwt
+	response["nats_user_seed"] = seed
 }
 
 // provisionAgentWorkerKey creates a dedicated user and API key for an agent worker node.
@@ -272,11 +356,33 @@ func provisionAgentWorkerKey(ctx context.Context, authDB *gorm.DB, registry *nod
 	return plaintext, nil
 }
 
+// loadCancelService builds the cancel path unload, drain and deregister share
+// with the load-cancel endpoint. A sender that cannot stop operations still
+// gets the cancel recorded; the worker's watchdog and the stop window then
+// bound the work.
+func loadCancelService(registry *nodes.NodeRegistry, unloader nodes.NodeCommandSender) *nodes.LoadCancelService {
+	svc := &nodes.LoadCancelService{Registry: registry}
+	if unloader != nil {
+		svc.Stopper = unloader
+	}
+	return svc
+}
+
+// cancelNodeLoads cancels the loads placed on a node before its rows go. It
+// logs and carries on: a node being removed must not stay because a cancel
+// failed.
+func cancelNodeLoads(ctx context.Context, registry *nodes.NodeRegistry, unloader nodes.NodeCommandSender, nodeID string) {
+	if err := loadCancelService(registry, unloader).CancelNodeLoads(ctx, nodeID); err != nil {
+		xlog.Warn("Failed to cancel the loads placed on a node", "node", nodeID, "error", err)
+	}
+}
+
 // DeregisterNodeEndpoint removes a backend node permanently (admin use).
-func DeregisterNodeEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
+func DeregisterNodeEndpoint(registry *nodes.NodeRegistry, unloader nodes.NodeCommandSender) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		ctx := c.Request().Context()
 		id := c.Param("id")
+		cancelNodeLoads(ctx, registry, unloader, id)
 		if err := registry.Deregister(ctx, id); err != nil {
 			xlog.Error("Failed to deregister node", "id", id, "error", err)
 			return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "failed to deregister node"))
@@ -309,11 +415,18 @@ func HeartbeatEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
 		_ = c.Bind(&update) // best-effort — empty body is fine
 
 		var updatePtr *nodes.HeartbeatUpdate
-		if update.AvailableVRAM != nil || update.TotalVRAM != nil || update.AvailableRAM != nil || update.GPUVendor != "" {
+		if update.AvailableVRAM != nil || update.TotalVRAM != nil || update.AvailableRAM != nil ||
+			update.AvailableDisk != nil || update.TotalDisk != nil || update.GPUVendor != "" ||
+			update.CPUUsagePercent != nil || update.CPULoad1 != nil {
 			updatePtr = &update
 		}
 
 		ctx := c.Request().Context()
+		// A new incarnation means the worker restarted and every load operation of
+		// the previous process ended. Failures here must not fail the heartbeat.
+		if err := registry.ObserveWorkerIncarnation(ctx, id, update.WorkerIncarnation); err != nil {
+			xlog.Warn("Failed to record worker incarnation", "id", id, "error", err)
+		}
 		if err := registry.Heartbeat(ctx, id, updatePtr); err != nil {
 			xlog.Warn("Heartbeat failed for node", "id", id, "error", err)
 			return c.JSON(http.StatusNotFound, nodeError(http.StatusNotFound, "node not found"))
@@ -336,12 +449,36 @@ func GetNodeModelsEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
 	}
 }
 
+// ListAllNodeModelsEndpoint returns all loaded models across all healthy nodes.
+// @Summary List all loaded models cluster-wide
+// @Tags Nodes
+// @Success 200 {array} nodes.NodeModel
+// @Router /api/nodes/models [get]
+func ListAllNodeModelsEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		ctx := c.Request().Context()
+		models, err := registry.ListAllLoadedModels(ctx)
+		if err != nil {
+			xlog.Error("Failed to list all node models", "error", err)
+			return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "failed to list node models"))
+		}
+		return c.JSON(http.StatusOK, models)
+	}
+}
+
 // DrainNodeEndpoint sets a node to draining status (no new requests).
-func DrainNodeEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
+func DrainNodeEndpoint(registry *nodes.NodeRegistry, unloader nodes.NodeCommandSender) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		ctx := c.Request().Context()
 		id := c.Param("id")
+		cancelNodeLoads(ctx, registry, unloader, id)
 		if err := registry.MarkDraining(ctx, id); err != nil {
+			if errors.Is(err, nodes.ErrNodeNotFound) {
+				return c.JSON(http.StatusNotFound, nodeError(http.StatusNotFound, "node not found"))
+			}
+			if errors.Is(err, nodes.ErrNodeStatusConflict) {
+				return c.JSON(http.StatusConflict, nodeError(http.StatusConflict, "node must be healthy to drain"))
+			}
 			xlog.Error("Failed to drain node", "id", id, "error", err)
 			return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "failed to drain node"))
 		}
@@ -354,7 +491,13 @@ func ResumeNodeEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		ctx := c.Request().Context()
 		id := c.Param("id")
-		if err := registry.MarkHealthy(ctx, id); err != nil {
+		if err := registry.ResumeNode(ctx, id); err != nil {
+			if errors.Is(err, nodes.ErrNodeNotFound) {
+				return c.JSON(http.StatusNotFound, nodeError(http.StatusNotFound, "node not found"))
+			}
+			if errors.Is(err, nodes.ErrNodeStatusConflict) {
+				return c.JSON(http.StatusConflict, nodeError(http.StatusConflict, "node must be draining to resume"))
+			}
 			xlog.Error("Failed to resume node", "id", id, "error", err)
 			return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "failed to resume node"))
 		}
@@ -362,30 +505,156 @@ func ResumeNodeEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
 	}
 }
 
-// InstallBackendOnNodeEndpoint triggers backend installation on a worker node via NATS.
-func InstallBackendOnNodeEndpoint(unloader nodes.NodeCommandSender) echo.HandlerFunc {
+// InstallBackendOnNodeEndpoint triggers backend installation on a worker node.
+// Async: enqueues a ManagementOp on the gallery service channel and returns a
+// jobID immediately. The gallery service worker goroutine drives the actual
+// install via DistributedBackendManager.InstallBackend, which honors the op's
+// TargetNodeID to scope the fan-out to one node. The UI polls /api/backends/job/:uid
+// for progress, mirroring /api/backends/install/:id.
+//
+// Backend can be either a gallery ID (resolved against BackendGalleries) or a
+// direct URI install (URI + Name + optional Alias) - same shape as the
+// standalone /api/backends/install-external path, just scoped to one node.
+//
+// The legacy unloader argument is retained for signature symmetry with
+// DeleteBackendOnNodeEndpoint / ListBackendsOnNodeEndpoint but is no longer
+// used here - the async path goes through galleryService.
+func InstallBackendOnNodeEndpoint(_ nodes.NodeCommandSender, galleryService *galleryop.GalleryService, opcache *galleryop.OpCache, appConfig *config.ApplicationConfig) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		if unloader == nil {
-			return c.JSON(http.StatusServiceUnavailable, nodeError(http.StatusServiceUnavailable, "NATS not configured"))
+		if galleryService == nil {
+			return c.JSON(http.StatusServiceUnavailable, nodeError(http.StatusServiceUnavailable, "gallery service not configured"))
 		}
 		nodeID := c.Param("id")
 		var req struct {
 			Backend          string `json:"backend"`
 			BackendGalleries string `json:"backend_galleries,omitempty"`
+			URI              string `json:"uri,omitempty"`
+			Name             string `json:"name,omitempty"`
+			Alias            string `json:"alias,omitempty"`
 		}
-		if err := c.Bind(&req); err != nil || req.Backend == "" {
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, nodeError(http.StatusBadRequest, "invalid request body"))
+		}
+		if req.Backend == "" && req.URI == "" {
+			return c.JSON(http.StatusBadRequest, nodeError(http.StatusBadRequest, "backend name or uri required"))
+		}
+
+		jobUUID, err := uuid.NewUUID()
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "failed to generate job id"))
+		}
+		jobID := jobUUID.String()
+
+		// Cache key: for gallery installs, use the backend slug; for URI
+		// installs prefer the provided Name (falling back to URI). All keys
+		// are node-scoped so concurrent installs of the same backend on
+		// different nodes do not stomp each other in opcache.
+		backendKey := req.Backend
+		if backendKey == "" {
+			backendKey = req.Name
+			if backendKey == "" {
+				backendKey = req.URI
+			}
+		}
+		cacheKey := galleryop.NodeScopedKey(nodeID, backendKey)
+		opcache.SetBackend(cacheKey, jobID)
+
+		// Optional caller-supplied galleries override. Mirrors the standalone
+		// install path so an admin can point at a private gallery.
+		galleries := appConfig.BackendGalleries
+		if req.BackendGalleries != "" {
+			var custom []config.Gallery
+			if err := json.Unmarshal([]byte(req.BackendGalleries), &custom); err != nil {
+				xlog.Warn("Ignoring malformed backend_galleries override; falling back to configured galleries", "error", err, "nodeID", nodeID)
+			} else if len(custom) > 0 {
+				galleries = custom
+			}
+		}
+
+		ctx, cancelFunc := context.WithCancel(context.Background())
+		op := galleryop.ManagementOp[gallery.GalleryBackend, any]{
+			ID:                 jobID,
+			GalleryElementName: req.Backend,
+			Galleries:          galleries,
+			TargetNodeID:       nodeID,
+			ExternalURI:        req.URI,
+			ExternalName:       req.Name,
+			ExternalAlias:      req.Alias,
+			Context:            ctx,
+			CancelFunc:         cancelFunc,
+		}
+		galleryService.StoreCancellation(jobID, cancelFunc)
+		galleryService.EnqueueBackendOp(op)
+
+		xlog.Info("Node-scoped backend install dispatched", "node", nodeID, "backend", req.Backend, "uri", req.URI, "jobID", jobID)
+		return c.JSON(http.StatusAccepted, map[string]string{
+			"jobID":     jobID,
+			"statusUrl": "/api/backends/job/" + jobID,
+			"message":   "backend installation started",
+		})
+	}
+}
+
+// UpgradeBackendOnNodeEndpoint triggers a backend upgrade (force-reinstall)
+// on a single worker node. Async like InstallBackendOnNodeEndpoint: enqueues
+// a ManagementOp with Upgrade=true and TargetNodeID set, returns 202 + jobID.
+// The gallery service routes Upgrade ops to
+// DistributedBackendManager.UpgradeBackend, which fires the NATS
+// backend.upgrade subject: the worker stops running processes for the
+// backend and reinstalls from the gallery even when the artifact already
+// exists on disk. Reusing the install path here would no-op: the worker's
+// backend.install handler is "ensure installed" and short-circuits on an
+// already-present binary (the "backend upgraded but nothing happens" bug).
+//
+// Only gallery-name upgrades are supported: the distributed upgrade path
+// resolves galleries from server config, so unlike install there is no
+// URI/name/alias or galleries-override surface.
+func UpgradeBackendOnNodeEndpoint(galleryService *galleryop.GalleryService, opcache *galleryop.OpCache, appConfig *config.ApplicationConfig) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		if galleryService == nil {
+			return c.JSON(http.StatusServiceUnavailable, nodeError(http.StatusServiceUnavailable, "gallery service not configured"))
+		}
+		nodeID := c.Param("id")
+		var req struct {
+			Backend string `json:"backend"`
+		}
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, nodeError(http.StatusBadRequest, "invalid request body"))
+		}
+		if req.Backend == "" {
 			return c.JSON(http.StatusBadRequest, nodeError(http.StatusBadRequest, "backend name required"))
 		}
-		reply, err := unloader.InstallBackend(nodeID, req.Backend, "", req.BackendGalleries)
+
+		jobUUID, err := uuid.NewUUID()
 		if err != nil {
-			xlog.Error("Failed to install backend on node", "node", nodeID, "backend", req.Backend, "error", err)
-			return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "failed to install backend on node"))
+			return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "failed to generate job id"))
 		}
-		if !reply.Success {
-			xlog.Error("Backend install failed on node", "node", nodeID, "backend", req.Backend, "error", reply.Error)
-			return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "backend installation failed"))
+		jobID := jobUUID.String()
+
+		// Node-scoped cache key so a concurrent upgrade of the same backend on
+		// another node doesn't stomp this job in opcache.
+		cacheKey := galleryop.NodeScopedKey(nodeID, req.Backend)
+		opcache.SetBackend(cacheKey, jobID)
+
+		ctx, cancelFunc := context.WithCancel(context.Background())
+		op := galleryop.ManagementOp[gallery.GalleryBackend, any]{
+			ID:                 jobID,
+			GalleryElementName: req.Backend,
+			Galleries:          appConfig.BackendGalleries,
+			TargetNodeID:       nodeID,
+			Upgrade:            true,
+			Context:            ctx,
+			CancelFunc:         cancelFunc,
 		}
-		return c.JSON(http.StatusOK, map[string]string{"message": "backend installed"})
+		galleryService.StoreCancellation(jobID, cancelFunc)
+		galleryService.EnqueueBackendOp(op)
+
+		xlog.Info("Node-scoped backend upgrade dispatched", "node", nodeID, "backend", req.Backend, "jobID", jobID)
+		return c.JSON(http.StatusAccepted, map[string]string{
+			"jobID":     jobID,
+			"statusUrl": "/api/backends/job/" + jobID,
+			"message":   "backend upgrade started",
+		})
 	}
 }
 
@@ -416,12 +685,23 @@ func DeleteBackendOnNodeEndpoint(unloader nodes.NodeCommandSender) echo.HandlerF
 }
 
 // ListBackendsOnNodeEndpoint lists installed backends on a worker node via NATS.
-func ListBackendsOnNodeEndpoint(unloader nodes.NodeCommandSender) echo.HandlerFunc {
+func ListBackendsOnNodeEndpoint(unloader nodes.NodeCommandSender, registry *nodes.NodeRegistry) echo.HandlerFunc {
 	return func(c echo.Context) error {
+		nodeID := c.Param("id")
+		// Agent-type workers don't run backends and never subscribe to the
+		// nodes.<id>.backend.list NATS subject, so the request would hang
+		// until timeout with "no responders". Their backend list is simply
+		// empty. Mirror the aggregate-list guard in managers_distributed.go
+		// (skip nodes whose NodeType is set and not "backend") so the
+		// single-node and cluster-wide views stay consistent.
+		if node, err := registry.Get(c.Request().Context(), nodeID); err == nil {
+			if node.NodeType != "" && node.NodeType != nodes.NodeTypeBackend {
+				return c.JSON(http.StatusOK, []workerctl.NodeBackendInfo{})
+			}
+		}
 		if unloader == nil {
 			return c.JSON(http.StatusServiceUnavailable, nodeError(http.StatusServiceUnavailable, "NATS not configured"))
 		}
-		nodeID := c.Param("id")
 		reply, err := unloader.ListBackends(nodeID)
 		if err != nil {
 			xlog.Error("Failed to list backends on node", "node", nodeID, "error", err)
@@ -448,6 +728,12 @@ func UnloadModelOnNodeEndpoint(unloader nodes.NodeCommandSender, registry *nodes
 		if err := c.Bind(&req); err != nil || req.ModelName == "" {
 			return c.JSON(http.StatusBadRequest, nodeError(http.StatusBadRequest, "model_name required"))
 		}
+		// A load of this model on this node (or one not placed yet) is cancelled
+		// through the same stop path first. The unload of a loaded replica then
+		// proceeds as usual: it is no longer swallowed by the load.
+		if _, err := loadCancelService(registry, unloader).CancelModelOnNode(c.Request().Context(), nodeID, req.ModelName); err != nil {
+			xlog.Warn("Failed to cancel the load before unloading", "node", nodeID, "model", req.ModelName, "error", err)
+		}
 		if err := unloader.UnloadModelOnNode(nodeID, req.ModelName); err != nil {
 			xlog.Error("Failed to unload model on node", "node", nodeID, "model", req.ModelName, "error", err)
 			return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "failed to unload model on node"))
@@ -457,8 +743,8 @@ func UnloadModelOnNodeEndpoint(unloader nodes.NodeCommandSender, registry *nodes
 			xlog.Error("Failed to stop backend after model unload", "node", nodeID, "model", req.ModelName, "error", err)
 			return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "model unloaded but backend stop failed"))
 		}
-		// Remove from registry
-		registry.RemoveNodeModel(c.Request().Context(), nodeID, req.ModelName)
+		// Remove every replica of this model on the node from the registry.
+		registry.RemoveAllNodeModelReplicas(c.Request().Context(), nodeID, req.ModelName)
 		return c.JSON(http.StatusOK, map[string]string{"message": "model unloaded"})
 	}
 }
@@ -484,14 +770,14 @@ func DeleteModelOnNodeEndpoint(unloader nodes.NodeCommandSender, registry *nodes
 			// Non-fatal — backend process may not be running
 			xlog.Warn("StopBackend failed during model deletion (non-fatal)", "node", nodeID, "model", req.ModelName, "error", err)
 		}
-		registry.RemoveNodeModel(c.Request().Context(), nodeID, req.ModelName)
+		registry.RemoveAllNodeModelReplicas(c.Request().Context(), nodeID, req.ModelName)
 		return c.JSON(http.StatusOK, map[string]string{"message": "model deleted from node"})
 	}
 }
 
 // NodeBackendLogsListEndpoint proxies a request to a worker node's /v1/backend-logs
 // endpoint to list model IDs that have backend logs.
-func NodeBackendLogsListEndpoint(registry *nodes.NodeRegistry, registrationToken string) echo.HandlerFunc {
+func NodeBackendLogsListEndpoint(registry *nodes.NodeRegistry, registrationToken string, dialFor nodes.WorkerNetDialerFor) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		ctx := c.Request().Context()
 		nodeID := c.Param("id")
@@ -504,7 +790,7 @@ func NodeBackendLogsListEndpoint(registry *nodes.NodeRegistry, registrationToken
 			return c.JSON(http.StatusBadGateway, nodeError(http.StatusBadGateway, "node has no HTTP address"))
 		}
 
-		resp, err := proxyHTTPToWorker(node.HTTPAddress, "/v1/backend-logs", registrationToken)
+		resp, err := proxyHTTPToWorker(ctx, dialFor, node.ID, node.HTTPAddress, "/v1/backend-logs", registrationToken)
 		if err != nil {
 			return c.JSON(http.StatusBadGateway, nodeError(http.StatusBadGateway, fmt.Sprintf("failed to reach worker: %v", err)))
 		}
@@ -519,7 +805,7 @@ func NodeBackendLogsListEndpoint(registry *nodes.NodeRegistry, registrationToken
 
 // NodeBackendLogsLinesEndpoint proxies a request to a worker node's
 // /v1/backend-logs/{modelId} endpoint to get buffered log lines.
-func NodeBackendLogsLinesEndpoint(registry *nodes.NodeRegistry, registrationToken string) echo.HandlerFunc {
+func NodeBackendLogsLinesEndpoint(registry *nodes.NodeRegistry, registrationToken string, dialFor nodes.WorkerNetDialerFor) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		ctx := c.Request().Context()
 		nodeID := c.Param("id")
@@ -535,7 +821,7 @@ func NodeBackendLogsLinesEndpoint(registry *nodes.NodeRegistry, registrationToke
 		}
 
 		path := "/v1/backend-logs/" + url.PathEscape(modelID)
-		resp, err := proxyHTTPToWorker(node.HTTPAddress, path, registrationToken)
+		resp, err := proxyHTTPToWorker(ctx, dialFor, node.ID, node.HTTPAddress, path, registrationToken)
 		if err != nil {
 			return c.JSON(http.StatusBadGateway, nodeError(http.StatusBadGateway, fmt.Sprintf("failed to reach worker: %v", err)))
 		}
@@ -550,7 +836,7 @@ func NodeBackendLogsLinesEndpoint(registry *nodes.NodeRegistry, registrationToke
 
 // NodeBackendLogsWSEndpoint proxies a WebSocket connection to a worker node's
 // /v1/backend-logs/{modelId}/ws endpoint for real-time log streaming.
-func NodeBackendLogsWSEndpoint(registry *nodes.NodeRegistry, registrationToken string) echo.HandlerFunc {
+func NodeBackendLogsWSEndpoint(registry *nodes.NodeRegistry, registrationToken string, dialFor nodes.WorkerNetDialerFor) echo.HandlerFunc {
 	browserUpgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			origin := r.Header.Get("Origin")
@@ -589,7 +875,7 @@ func NodeBackendLogsWSEndpoint(registry *nodes.NodeRegistry, registrationToken s
 			workerHeaders.Set("Authorization", "Bearer "+registrationToken)
 		}
 
-		workerDialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+		workerDialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second, NetDialContext: dialFor(node.ID)}
 		workerWS, _, err := workerDialer.Dial(workerURL, workerHeaders)
 		if err != nil {
 			browserWS.WriteMessage(websocket.CloseMessage,
@@ -656,6 +942,146 @@ func GetNodeLabelsEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
 			result[l.Key] = l.Value
 		}
 		return c.JSON(http.StatusOK, result)
+	}
+}
+
+// UpdateMaxReplicasPerModelRequest is the body for the per-node replica cap endpoint.
+type UpdateMaxReplicasPerModelRequest struct {
+	// Value is the new per-model replica cap on this node. Must be >= 1.
+	Value int `json:"value"`
+}
+
+// UpdateMaxReplicasPerModelEndpoint sets the per-node cap on how many replicas
+// of any one model can be loaded concurrently. The corresponding
+// `node.replica-slots` auto-label is refreshed so existing AND-selectors keep
+// matching, and any unsatisfiable scheduling cooldowns are cleared so the
+// reconciler retries on the next tick.
+//
+// This is a transient admin override — a worker re-registration restores the
+// value the worker was started with (--max-replicas-per-model). For permanent
+// fleet changes, change the worker flag.
+//
+// @Summary Update a node's max replicas per model
+// @Tags Nodes
+// @Param id path string true "Node ID"
+// @Param request body UpdateMaxReplicasPerModelRequest true "New value"
+// @Success 200 {object} map[string]int
+// @Failure 400 {object} map[string]any "value must be >= 1"
+// @Failure 404 {object} map[string]any "node not found"
+// @Router /api/nodes/{id}/max-replicas-per-model [put]
+func UpdateMaxReplicasPerModelEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		ctx := c.Request().Context()
+		nodeID := c.Param("id")
+		if _, err := registry.Get(ctx, nodeID); err != nil {
+			return c.JSON(http.StatusNotFound, nodeError(http.StatusNotFound, "node not found"))
+		}
+		var req UpdateMaxReplicasPerModelRequest
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, nodeError(http.StatusBadRequest, "invalid request body"))
+		}
+		if req.Value < 1 {
+			return c.JSON(http.StatusBadRequest, nodeError(http.StatusBadRequest, "value must be >= 1"))
+		}
+		if err := registry.UpdateMaxReplicasPerModel(ctx, nodeID, req.Value); err != nil {
+			xlog.Error("Failed to update max_replicas_per_model", "node", nodeID, "value", req.Value, "error", err)
+			return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "failed to update max replicas per model"))
+		}
+		return c.JSON(http.StatusOK, map[string]int{"max_replicas_per_model": req.Value})
+	}
+}
+
+// ResetMaxReplicasPerModelEndpoint clears the admin override on a node, so
+// the next worker re-registration is allowed to update the value from its
+// CLI flag again. The current value is left in place until the worker calls
+// register.
+//
+// @Summary Reset a node's max replicas per model to the worker default
+// @Tags Nodes
+// @Param id path string true "Node ID"
+// @Success 200 {object} map[string]bool
+// @Failure 404 {object} map[string]any "node not found"
+// @Router /api/nodes/{id}/max-replicas-per-model [delete]
+func ResetMaxReplicasPerModelEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		ctx := c.Request().Context()
+		nodeID := c.Param("id")
+		if _, err := registry.Get(ctx, nodeID); err != nil {
+			return c.JSON(http.StatusNotFound, nodeError(http.StatusNotFound, "node not found"))
+		}
+		if err := registry.ResetMaxReplicasPerModel(ctx, nodeID); err != nil {
+			xlog.Error("Failed to reset max_replicas_per_model override", "node", nodeID, "error", err)
+			return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "failed to reset override"))
+		}
+		return c.JSON(http.StatusOK, map[string]bool{"reset": true})
+	}
+}
+
+// UpdateVRAMBudgetRequest is the body for the per-node VRAM budget endpoint.
+type UpdateVRAMBudgetRequest struct {
+	// Value is the VRAM cap ("80%" or "12GB"). Empty string clears the cap.
+	Value string `json:"value"`
+}
+
+// UpdateVRAMBudgetEndpoint sets a node's VRAM allocation cap as a sticky admin
+// override. The value is validated, resolved against the node's total VRAM, and
+// applied to available_vram immediately so scheduling reflects it before the
+// next heartbeat.
+//
+// @Summary Update a node's VRAM allocation budget
+// @Tags Nodes
+// @Param id path string true "Node ID"
+// @Param request body UpdateVRAMBudgetRequest true "New value (\"80%\" or \"12GB\"; empty clears)"
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} map[string]any "invalid budget"
+// @Failure 404 {object} map[string]any "node not found"
+// @Router /api/nodes/{id}/vram-budget [put]
+func UpdateVRAMBudgetEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		ctx := c.Request().Context()
+		nodeID := c.Param("id")
+		if _, err := registry.Get(ctx, nodeID); err != nil {
+			return c.JSON(http.StatusNotFound, nodeError(http.StatusNotFound, "node not found"))
+		}
+		var req UpdateVRAMBudgetRequest
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, nodeError(http.StatusBadRequest, "invalid request body"))
+		}
+		// An empty value clears the cap; only a non-empty value must parse.
+		if req.Value != "" {
+			if _, err := vrambudget.Parse(req.Value); err != nil {
+				return c.JSON(http.StatusBadRequest, nodeError(http.StatusBadRequest, fmt.Sprintf("invalid vram budget: %v", err)))
+			}
+		}
+		if err := registry.UpdateVRAMBudget(ctx, nodeID, req.Value); err != nil {
+			xlog.Error("Failed to update vram_budget", "node", nodeID, "value", req.Value, "error", err)
+			return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "failed to update vram budget"))
+		}
+		return c.JSON(http.StatusOK, map[string]string{"vram_budget": req.Value})
+	}
+}
+
+// ResetVRAMBudgetEndpoint clears the admin override so the worker's
+// LOCALAI_VRAM_BUDGET takes over again on next registration.
+//
+// @Summary Reset a node's VRAM budget to the worker default
+// @Tags Nodes
+// @Param id path string true "Node ID"
+// @Success 200 {object} map[string]bool
+// @Failure 404 {object} map[string]any "node not found"
+// @Router /api/nodes/{id}/vram-budget [delete]
+func ResetVRAMBudgetEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		ctx := c.Request().Context()
+		nodeID := c.Param("id")
+		if _, err := registry.Get(ctx, nodeID); err != nil {
+			return c.JSON(http.StatusNotFound, nodeError(http.StatusNotFound, "node not found"))
+		}
+		if err := registry.ResetVRAMBudget(ctx, nodeID); err != nil {
+			xlog.Error("Failed to reset vram_budget override", "node", nodeID, "error", err)
+			return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "failed to reset vram budget"))
+		}
+		return c.JSON(http.StatusOK, map[string]bool{"reset": true})
 	}
 }
 
@@ -750,14 +1176,66 @@ func GetSchedulingEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
 }
 
 // SetSchedulingRequest is the request body for creating/updating a scheduling config.
+//
+// The prefix-cache fields are POINTERS so an omitted field is
+// distinguishable from an explicit zero. On update, an omitted prefix-cache
+// field preserves the model's previously-configured value instead of resetting
+// it (see SetSchedulingEndpoint's PATCH-style merge). ModelName, NodeSelector,
+// MinReplicas, MaxReplicas and SpreadAll keep their full-replace PUT semantics.
 type SetSchedulingRequest struct {
-	ModelName    string            `json:"model_name"`
-	NodeSelector map[string]string `json:"node_selector,omitempty"`
-	MinReplicas  int               `json:"min_replicas"`
-	MaxReplicas  int               `json:"max_replicas"`
+	ModelName           string              `json:"model_name"`
+	NodeSelector        map[string]string   `json:"node_selector,omitempty"`
+	MinReplicas         int                 `json:"min_replicas"`
+	MaxReplicas         int                 `json:"max_replicas"`
+	SpreadAll           bool                `json:"spread_all,omitempty"`
+	RoutePolicy         *string             `json:"route_policy,omitempty"`
+	BalanceAbsThreshold *int                `json:"balance_abs_threshold,omitempty"`
+	BalanceRelThreshold *float64            `json:"balance_rel_threshold,omitempty"`
+	MinPrefixMatch      *float64            `json:"min_prefix_match,omitempty"`
+	ScorerWeights       *map[string]float64 `json:"scorer_weights,omitempty"`
+}
+
+// validateSchedulingRequest enforces the invariants of a scheduling config.
+// The prefix-cache bounds are delegated to prefixcache.ValidateThresholds (the
+// single source of truth), and are checked against the RESOLVED values passed
+// in (provided-or-preserved), so validation only rejects bad values the caller
+// actually supplied. It returns nil when valid, or an error with a user-facing
+// message describing the first violation.
+func validateSchedulingRequest(req SetSchedulingRequest, routePolicy string, absThr int, relThr, minMatch float64) error {
+	if req.ModelName == "" {
+		return errors.New("model_name is required")
+	}
+	if req.SpreadAll && (req.MinReplicas != 0 || req.MaxReplicas != 0) {
+		return errors.New("spread_all and min_replicas/max_replicas are mutually exclusive")
+	}
+	if req.MinReplicas < 0 {
+		return errors.New("min_replicas must be >= 0")
+	}
+	if req.MaxReplicas < 0 {
+		return errors.New("max_replicas must be >= 0")
+	}
+	if req.MaxReplicas > 0 && req.MinReplicas > req.MaxReplicas {
+		return errors.New("min_replicas must be <= max_replicas")
+	}
+	if err := prefixcache.ValidateThresholds(routePolicy, absThr, relThr, minMatch); err != nil {
+		return err
+	}
+	if req.ScorerWeights != nil {
+		if err := prefixcache.ValidateScorerWeights(*req.ScorerWeights); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // SetSchedulingEndpoint creates or updates a model scheduling config.
+//
+// The registry upsert full-replaces all columns, so a request that omits the
+// prefix-cache fields would otherwise wipe a model's previously-configured
+// routing settings. To avoid that footgun the prefix-cache fields are
+// merged PATCH-style: a non-nil request pointer wins; a nil one preserves the
+// existing config's value (or the zero default when no config exists yet). The
+// non-prefix fields keep their full-replace PUT behavior.
 func SetSchedulingEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		ctx := c.Request().Context()
@@ -765,17 +1243,64 @@ func SetSchedulingEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, nodeError(http.StatusBadRequest, "invalid request body"))
 		}
-		if req.ModelName == "" {
-			return c.JSON(http.StatusBadRequest, nodeError(http.StatusBadRequest, "model_name is required"))
+
+		// Fetch the existing config (may be nil) so omitted prefix-cache fields
+		// can fall back to the stored value rather than resetting to zero.
+		var existing *nodes.ModelSchedulingConfig
+		if req.ModelName != "" {
+			var err error
+			existing, err = registry.GetModelScheduling(ctx, req.ModelName)
+			if err != nil {
+				return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "failed to load existing scheduling config"))
+			}
 		}
-		if req.MinReplicas < 0 {
-			return c.JSON(http.StatusBadRequest, nodeError(http.StatusBadRequest, "min_replicas must be >= 0"))
+
+		// Resolve each prefix-cache field: provided pointer wins, otherwise keep
+		// the existing value (zero/default when there is no existing config).
+		routePolicy := ""
+		absThr := 0
+		relThr := 0.0
+		minMatch := 0.0
+		var scorerWeights map[string]float64
+		if existing != nil {
+			routePolicy = existing.RoutePolicy
+			absThr = existing.BalanceAbsThreshold
+			relThr = existing.BalanceRelThreshold
+			minMatch = existing.MinPrefixMatch
+			scorerWeights = existing.ScorerWeights
 		}
-		if req.MaxReplicas < 0 {
-			return c.JSON(http.StatusBadRequest, nodeError(http.StatusBadRequest, "max_replicas must be >= 0"))
+		if req.RoutePolicy != nil {
+			routePolicy = *req.RoutePolicy
 		}
-		if req.MaxReplicas > 0 && req.MinReplicas > req.MaxReplicas {
-			return c.JSON(http.StatusBadRequest, nodeError(http.StatusBadRequest, "min_replicas must be <= max_replicas"))
+		if req.BalanceAbsThreshold != nil {
+			absThr = *req.BalanceAbsThreshold
+		}
+		if req.BalanceRelThreshold != nil {
+			relThr = *req.BalanceRelThreshold
+		}
+		if req.MinPrefixMatch != nil {
+			minMatch = *req.MinPrefixMatch
+		}
+		if req.ScorerWeights != nil {
+			scorerWeights = *req.ScorerWeights
+		}
+
+		if err := validateSchedulingRequest(req, routePolicy, absThr, relThr, minMatch); err != nil {
+			return c.JSON(http.StatusBadRequest, nodeError(http.StatusBadRequest, err.Error()))
+		}
+
+		// A rule may be keyed by an alias, in which case it governs whatever
+		// that alias currently points at. Reject an alias that resolves to
+		// nothing, and reject a second rule for a model some other rule already
+		// governs, so the operator hears about the clash instead of silently
+		// writing a rule that never takes effect.
+		target, err := registry.ValidateSchedulingTarget(ctx, req.ModelName)
+		if err != nil {
+			status := http.StatusBadRequest
+			if errors.Is(err, nodes.ErrSchedulingConflict) {
+				status = http.StatusConflict
+			}
+			return c.JSON(status, nodeError(status, err.Error()))
 		}
 
 		// Serialize node selector to JSON
@@ -789,10 +1314,17 @@ func SetSchedulingEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
 		}
 
 		config := &nodes.ModelSchedulingConfig{
-			ModelName:    req.ModelName,
-			NodeSelector: selectorJSON,
-			MinReplicas:  req.MinReplicas,
-			MaxReplicas:  req.MaxReplicas,
+			ModelName:           req.ModelName,
+			TargetModel:         target,
+			NodeSelector:        selectorJSON,
+			MinReplicas:         req.MinReplicas,
+			MaxReplicas:         req.MaxReplicas,
+			SpreadAll:           req.SpreadAll,
+			RoutePolicy:         routePolicy,
+			BalanceAbsThreshold: absThr,
+			BalanceRelThreshold: relThr,
+			MinPrefixMatch:      minMatch,
+			ScorerWeights:       scorerWeights,
 		}
 		if err := registry.SetModelScheduling(ctx, config); err != nil {
 			return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "failed to set scheduling config"))
@@ -814,9 +1346,14 @@ func DeleteSchedulingEndpoint(registry *nodes.NodeRegistry) echo.HandlerFunc {
 }
 
 // proxyHTTPToWorker makes a GET request to a worker's HTTP server with bearer token auth.
-func proxyHTTPToWorker(httpAddress, path, token string) (*http.Response, error) {
+// The connection goes through dialFor(nodeID) because the advertised address
+// alone does not say how this frontend reaches that worker.
+func proxyHTTPToWorker(ctx context.Context, dialFor nodes.WorkerNetDialerFor, nodeID, httpAddress, path, token string) (*http.Response, error) {
 	reqURL := fmt.Sprintf("http://%s%s", httpAddress, path)
-	req, err := http.NewRequest("GET", reqURL, nil)
+	// WithoutCancel keeps the request bounded only by the 15s client timeout,
+	// as before the dialer change; cancelling on admin disconnect would be a
+	// separate, deliberate behaviour change.
+	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), "GET", reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -824,6 +1361,8 @@ func proxyHTTPToWorker(httpAddress, path, token string) (*http.Response, error) 
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	t := httpclient.HardenedTransport()
+	t.DialContext = dialFor(nodeID)
+	client := httpclient.NewWithTimeout(15*time.Second, httpclient.WithTransport(t))
 	return client.Do(req)
 }

@@ -1,12 +1,15 @@
-import { useEffect, useMemo } from 'react'
+import { useEffect, useMemo, useCallback } from 'react'
 import { useModels } from '../hooks/useModels'
 import SearchableSelect from './SearchableSelect'
+import { useTranslation } from 'react-i18next'
+import { readLastModel, writeLastModel } from '../utils/lastModel'
 
 export default function ModelSelector({
   value, onChange, capability, className = '',
   options: externalOptions, loading: externalLoading,
-  disabled: externalDisabled, searchPlaceholder, style,
+  disabled: externalDisabled, searchPlaceholder, style, triggerClassName,
 }) {
+  const { t } = useTranslation('models')
   // Skip capability fetch when external options are provided (capability will be undefined)
   const { models: hookModels, loading: hookLoading } = useModels(externalOptions ? undefined : capability)
 
@@ -17,22 +20,34 @@ export default function ModelSelector({
   const isLoading = externalOptions ? (externalLoading || false) : hookLoading
   const isDisabled = isLoading || (externalDisabled || false)
 
+  // Persist genuine selections so the next visit can restore them.
+  const handleChange = useCallback((next) => {
+    writeLastModel(capability, next)
+    onChange(next)
+  }, [capability, onChange])
+
   useEffect(() => {
     if (modelNames.length > 0 && (!value || !modelNames.includes(value))) {
-      onChange(modelNames[0])
+      // Prefer the remembered model when it's still available; otherwise fall
+      // back to the first option. Don't re-persist here — auto-select is not a
+      // user choice, and writing back the stored value would be a harmless but
+      // pointless round-trip.
+      const remembered = readLastModel(capability)
+      onChange(remembered && modelNames.includes(remembered) ? remembered : modelNames[0])
     }
-  }, [modelNames, value, onChange])
+  }, [modelNames, value, onChange, capability])
 
   return (
     <SearchableSelect
       value={value || ''}
-      onChange={onChange}
+      onChange={handleChange}
       options={modelNames}
-      placeholder={isLoading ? 'Loading models...' : (modelNames.length === 0 ? 'No models available' : 'Select model...')}
-      searchPlaceholder={searchPlaceholder || 'Search models...'}
+      placeholder={isLoading ? t('selector.loading') : (modelNames.length === 0 ? t('selector.noModels') : t('selector.selectModel'))}
+      searchPlaceholder={searchPlaceholder || t('selector.searchPlaceholder')}
       disabled={isDisabled}
       className={className}
       style={style}
+      triggerClassName={triggerClassName}
     />
   )
 }

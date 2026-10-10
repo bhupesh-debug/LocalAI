@@ -13,6 +13,7 @@ import (
 
 	"github.com/mudler/LocalAI/core/services/messaging"
 	"github.com/mudler/LocalAI/core/services/nodes"
+	"github.com/mudler/LocalAI/core/services/workerctl"
 	"github.com/mudler/LocalAI/pkg/grpc/base"
 	pb "github.com/mudler/LocalAI/pkg/grpc/proto"
 
@@ -40,6 +41,8 @@ type testLLM struct {
 	dstOutput []byte
 	// lastSrc records the last Src/input path seen (for verifying staging rewrote it).
 	lastSrc string
+	// lastVideoAudio records the staged Audio path from GenerateVideo.
+	lastVideoAudio string
 	// lastAudioDst records the Dst field from AudioTranscription (it's an input, not output).
 	lastAudioDst string
 	// lastTTSModel records the Model field from TTS requests (for verifying path rewriting).
@@ -69,6 +72,7 @@ func (t *testLLM) GenerateImage(req *pb.GenerateImageRequest) error {
 
 func (t *testLLM) GenerateVideo(req *pb.GenerateVideoRequest) error {
 	t.lastSrc = req.StartImage
+	t.lastVideoAudio = req.Audio
 	if req.Dst != "" && len(t.dstOutput) > 0 {
 		return os.WriteFile(req.Dst, t.dstOutput, 0644)
 	}
@@ -93,7 +97,7 @@ func (t *testLLM) SoundGeneration(req *pb.SoundGenerationRequest) error {
 	return nil
 }
 
-func (t *testLLM) AudioTranscription(req *pb.TranscriptRequest) (pb.TranscriptResult, error) {
+func (t *testLLM) AudioTranscription(_ context.Context, req *pb.TranscriptRequest) (pb.TranscriptResult, error) {
 	t.lastAudioDst = req.Dst
 	return pb.TranscriptResult{Text: "transcribed text"}, nil
 }
@@ -225,7 +229,7 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 	// newTestSmartRouter creates a SmartRouter with NATS wired up and a mock
 	// backend.install handler that always replies success for all registered nodes.
 	newTestSmartRouter := func(reg *nodes.NodeRegistry, extraOpts ...nodes.SmartRouterOptions) *nodes.SmartRouter {
-		unloader := nodes.NewRemoteUnloaderAdapter(reg, infra.NC)
+		unloader := nodes.NewRemoteUnloaderAdapter(reg, infra.NC, 3*time.Minute, 15*time.Minute)
 
 		opts := nodes.SmartRouterOptions{
 			Unloader: unloader,
@@ -253,10 +257,16 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 		// by registering after each node. In practice, we rely on the test registering
 		// nodes before calling Route, so we subscribe to a catch-all pattern.
 		infra.NC.Conn().Subscribe("nodes.*.backend.install", func(msg *nats.Msg) {
-			reply := messaging.BackendInstallReply{Success: true}
+			reply := workerctl.BackendInstallReply{Success: true}
 			data, _ := json.Marshal(reply)
 			msg.Respond(data)
 		})
+		_, err := infra.NC.Conn().Subscribe("nodes.*.models.running", func(msg *nats.Msg) {
+			data, _ := json.Marshal(workerctl.ModelsRunningReply{})
+			_ = msg.Respond(data)
+		})
+		Expect(err).NotTo(HaveOccurred())
+		FlushNATS(infra.NC)
 
 		return router
 	}
@@ -281,7 +291,7 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 		router := newTestSmartRouter(registry)
 
 		// The model is not loaded yet, so Route will pick the node and call LoadModel
-		result, err := router.Route(ctx, "", "test-model", "llama-cpp", &pb.ModelOptions{
+		result, err := router.Route(ctx, "", "test-model", "llama-cpp", "", &pb.ModelOptions{
 			Model: "test-model",
 		}, false)
 		Expect(err).ToNot(HaveOccurred())
@@ -329,18 +339,18 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 		Expect(registry.Register(context.Background(), node2, true)).To(Succeed())
 
 		// Set both as having the model loaded
-		Expect(registry.SetNodeModel(context.Background(), node1.ID, "test-model", "loaded", "", 0)).To(Succeed())
-		Expect(registry.SetNodeModel(context.Background(), node2.ID, "test-model", "loaded", "", 0)).To(Succeed())
+		Expect(registry.SetNodeModel(context.Background(), node1.ID, "test-model", 0, "loaded", "", 0)).To(Succeed())
+		Expect(registry.SetNodeModel(context.Background(), node2.ID, "test-model", 0, "loaded", "", 0)).To(Succeed())
 
 		// Set node-1 with high in-flight (5), node-2 with low in-flight (1)
 		for range 5 {
-			Expect(registry.IncrementInFlight(context.Background(), node1.ID, "test-model")).To(Succeed())
+			Expect(registry.IncrementInFlight(context.Background(), node1.ID, "test-model", 0)).To(Succeed())
 		}
-		Expect(registry.IncrementInFlight(context.Background(), node2.ID, "test-model")).To(Succeed())
+		Expect(registry.IncrementInFlight(context.Background(), node2.ID, "test-model", 0)).To(Succeed())
 
 		// Route should pick node-2 (least loaded) thanks to ORDER BY in_flight ASC
 		router := newTestSmartRouter(registry)
-		result, err := router.Route(ctx, "", "test-model", "llama-cpp", nil, false)
+		result, err := router.Route(ctx, "", "test-model", "llama-cpp", "", nil, false)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(result.Node.Name).To(Equal("node-light"))
 		result.Release()
@@ -359,7 +369,7 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 
 		// Route should pick this node and call LoadModel on it
 		router := newTestSmartRouter(registry)
-		result, err := router.Route(ctx, "", "new-model", "llama-cpp", &pb.ModelOptions{
+		result, err := router.Route(ctx, "", "new-model", "llama-cpp", "", &pb.ModelOptions{
 			Model: "new-model",
 		}, false)
 		Expect(err).ToNot(HaveOccurred())
@@ -380,7 +390,7 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 		// Register a node with a loaded model
 		node := &nodes.BackendNode{Name: "gpu-unload", Address: "127.0.0.1:50099"}
 		Expect(registry.Register(context.Background(), node, true)).To(Succeed())
-		Expect(registry.SetNodeModel(context.Background(), node.ID, "old-model", "loaded", "", 0)).To(Succeed())
+		Expect(registry.SetNodeModel(context.Background(), node.ID, "old-model", 0, "loaded", "", 0)).To(Succeed())
 
 		// Subscribe to NATS backend.stop for this node
 		stopSubject := messaging.SubjectNodeBackendStop(node.ID)
@@ -395,7 +405,7 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 		Expect(err).ToNot(HaveOccurred())
 
 		// Create RemoteUnloaderAdapter and unload model
-		unloader := nodes.NewRemoteUnloaderAdapter(registry, infra.NC)
+		unloader := nodes.NewRemoteUnloaderAdapter(registry, infra.NC, 3*time.Minute, 15*time.Minute)
 		err = unloader.UnloadRemoteModel("old-model")
 		Expect(err).ToNot(HaveOccurred())
 
@@ -424,7 +434,7 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 		adapter := nodes.NewModelRouterAdapter(router)
 
 		// Call adapter.Route() (same signature ModelLoader uses)
-		m, err := adapter.Route(ctx, "llama-cpp", "test-model-id", "test-model", "",
+		m, err := adapter.Route(ctx, "llama-cpp", "test-model-id", "test-model", "", "",
 			&pb.ModelOptions{Model: "test-model"}, false)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(m).ToNot(BeNil())
@@ -480,13 +490,13 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 				return "", err
 			}
 			return n.HTTPAddress, nil
-		}, "")
+		}, "", nodes.DirectWorkerNetDialer())
 
 		// Create SmartRouter with the HTTPFileStager
 		router := newTestSmartRouter(registry, nodes.SmartRouterOptions{FileStager: stager})
 
 		// Route with ModelOptions that have file paths — SmartRouter should stage them
-		result, err := router.Route(ctx, "", "staged-model", "llama-cpp", &pb.ModelOptions{
+		result, err := router.Route(ctx, "", "staged-model", "llama-cpp", "", &pb.ModelOptions{
 			Model:     "staged-model",
 			ModelFile: modelPath,
 			MMProj:    mmprojPath,
@@ -549,7 +559,7 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 				return "", err
 			}
 			return n.HTTPAddress, nil
-		}, "")
+		}, "", nodes.DirectWorkerNetDialer())
 
 		// Create SmartRouter with FileStager
 		router := newTestSmartRouter(registry, nodes.SmartRouterOptions{FileStager: stager})
@@ -559,7 +569,7 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 		modelPath := filepath.Join(modelDir, "vision.gguf")
 		Expect(os.WriteFile(modelPath, []byte("vision model data"), 0644)).To(Succeed())
 
-		result, err := router.Route(ctx, "", "vision-model", "llama-cpp", &pb.ModelOptions{
+		result, err := router.Route(ctx, "", "vision-model", "llama-cpp", "", &pb.ModelOptions{
 			Model:     "vision-model",
 			ModelFile: modelPath,
 		}, false)
@@ -607,7 +617,7 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 				return "", err
 			}
 			return n.HTTPAddress, nil
-		}, "")
+		}, "", nodes.DirectWorkerNetDialer())
 
 		// Test AllocRemoteTemp + FetchRemote directly (the output retrieval path)
 		remoteTmpPath, err := stager.AllocRemoteTemp(ctx, node.ID)
@@ -653,11 +663,11 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 				return "", err
 			}
 			return n.HTTPAddress, nil
-		}, "")
+		}, "", nodes.DirectWorkerNetDialer())
 
 		router := newTestSmartRouter(registry, nodes.SmartRouterOptions{FileStager: stager})
 
-		result, err := router.Route(ctx, "", modelName, backendType, &pb.ModelOptions{
+		result, err := router.Route(ctx, "", modelName, backendType, "", &pb.ModelOptions{
 			Model: modelName,
 		}, false)
 		Expect(err).ToNot(HaveOccurred())
@@ -710,7 +720,7 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 		Expect(retrievedData).To(Equal(outputData))
 	})
 
-	It("should round-trip output via FileStagingClient.GenerateVideo (StartImage + Dst)", func() {
+	It("should round-trip output via FileStagingClient.GenerateVideo (StartImage + Audio + Dst)", func() {
 		outputData := []byte("MP4 video generated by the backend")
 
 		llm := &testLLM{dstOutput: outputData}
@@ -723,6 +733,9 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 		startImageContent := []byte("start frame image data")
 		startImagePath := filepath.Join(imgDir, "start.png")
 		Expect(os.WriteFile(startImagePath, startImageContent, 0644)).To(Succeed())
+		audioContent := []byte("audio conditioning data")
+		audioPath := filepath.Join(imgDir, "speech.wav")
+		Expect(os.WriteFile(audioPath, audioContent, 0644)).To(Succeed())
 
 		localOutputDir := GinkgoT().TempDir()
 		frontendDst := filepath.Join(localOutputDir, "generated.mp4")
@@ -730,6 +743,7 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 		genResult, err := result.Client.GenerateVideo(ctx, &pb.GenerateVideoRequest{
 			Prompt:     "a flying cat",
 			StartImage: startImagePath,
+			Audio:      audioPath,
 			Dst:        frontendDst,
 			NumFrames:  16,
 		})
@@ -741,6 +755,10 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 		stagedStartData, err := os.ReadFile(llm.lastSrc)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(stagedStartData).To(Equal(startImageContent))
+		Expect(llm.lastVideoAudio).To(ContainSubstring(stagingDir))
+		stagedAudioData, err := os.ReadFile(llm.lastVideoAudio)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(stagedAudioData).To(Equal(audioContent))
 
 		// Verify output: video was pulled back
 		retrievedData, err := os.ReadFile(frontendDst)
@@ -864,7 +882,7 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 				return "", err
 			}
 			return n.HTTPAddress, nil
-		}, "")
+		}, "", nodes.DirectWorkerNetDialer())
 
 		// Create model files on the "frontend"
 		frontendModelsDir := GinkgoT().TempDir()
@@ -878,7 +896,7 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 		router := newTestSmartRouter(registry, nodes.SmartRouterOptions{FileStager: stager})
 
 		// Route with ModelFile pointing to the .onnx file (triggers model staging)
-		result, err := router.Route(ctx, "voice-it-paola-medium", "it-paola-medium.onnx", "piper", &pb.ModelOptions{
+		result, err := router.Route(ctx, "voice-it-paola-medium", "it-paola-medium.onnx", "piper", "", &pb.ModelOptions{
 			Model:     "it-paola-medium.onnx",
 			ModelFile: modelFile,
 		}, false)
@@ -948,7 +966,7 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 				return "", err
 			}
 			return n.HTTPAddress, nil
-		}, "")
+		}, "", nodes.DirectWorkerNetDialer())
 
 		// Create model files: .onnx and .onnx.json in a temp "models" dir
 		frontendModelsDir := GinkgoT().TempDir()
@@ -962,7 +980,7 @@ var _ = Describe("Full Distributed Inference Flow", Label("Distributed"), func()
 		router := newTestSmartRouter(registry, nodes.SmartRouterOptions{FileStager: stager})
 
 		// Route with ModelFile pointing to the .onnx file
-		result, err := router.Route(ctx, "piper-companion-test", "my-model.onnx", "piper", &pb.ModelOptions{
+		result, err := router.Route(ctx, "piper-companion-test", "my-model.onnx", "piper", "", &pb.ModelOptions{
 			Model:     "my-model.onnx",
 			ModelFile: modelFile,
 		}, false)

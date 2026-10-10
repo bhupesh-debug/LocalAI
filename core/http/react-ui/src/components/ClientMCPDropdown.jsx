@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { loadClientMCPServers, addClientMCPServer, removeClientMCPServer } from '../utils/mcpClientStorage'
+import Icon from './Icon'
 
 export default function ClientMCPDropdown({
   activeServerIds = [],
@@ -59,7 +60,7 @@ export default function ClientMCPDropdown({
         title="Client-side MCP servers (browser connects directly)"
         onClick={() => setOpen(!open)}
       >
-        <i className="fas fa-globe" /> Client MCP
+        <Icon name="globe" /> Client MCP
         {activeCount > 0 && (
           <span className="chat-mcp-badge">{activeCount}</span>
         )}
@@ -69,40 +70,37 @@ export default function ClientMCPDropdown({
           <div className="chat-mcp-dropdown-header">
             <span>Client MCP Servers</span>
             <button type="button" className="chat-mcp-select-all" onClick={() => setAddDialog(!addDialog)}>
-              <i className="fas fa-plus" /> Add
+              <Icon name="plus" /> Add
             </button>
           </div>
           {addDialog && (
             <div style={{ padding: '8px 10px', borderBottom: '1px solid var(--color-border)' }}>
               <input
                 type="text"
-                className="input input-sm"
+                className="input input-sm w-full mb-xs"
                 placeholder="Server URL (e.g. https://mcp.example.com/sse)"
                 value={url}
                 onChange={e => setUrl(e.target.value)}
-                style={{ width: '100%', marginBottom: '4px' }}
               />
               <input
                 type="text"
-                className="input input-sm"
+                className="input input-sm w-full mb-xs"
                 placeholder="Name (optional)"
                 value={name}
                 onChange={e => setName(e.target.value)}
-                style={{ width: '100%', marginBottom: '4px' }}
               />
               <input
                 type="password"
-                className="input input-sm"
+                className="input input-sm w-full mb-xs"
                 placeholder="Auth token (optional)"
                 value={authToken}
                 onChange={e => setAuthToken(e.target.value)}
-                style={{ width: '100%', marginBottom: '4px' }}
               />
               <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.8rem', marginBottom: '6px' }}>
                 <input type="checkbox" checked={useProxy} onChange={e => setUseProxy(e.target.checked)} />
                 Use CORS proxy
               </label>
-              <div style={{ display: 'flex', gap: '4px', justifyContent: 'flex-end' }}>
+              <div className="hstack hstack--xs hstack--end">
                 <button type="button" className="btn btn-sm btn-secondary" onClick={() => setAddDialog(false)}>Cancel</button>
                 <button type="button" className="btn btn-sm btn-primary" onClick={handleAdd} disabled={!url.trim()}>Add</button>
               </div>
@@ -122,11 +120,11 @@ export default function ClientMCPDropdown({
                     checked={isActive}
                     onChange={() => onToggleServer(server.id)}
                   />
-                  <div className="chat-mcp-server-info" style={{ flex: 1 }}>
+                  <div className="chat-mcp-server-info flex-1">
                     <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                       <span className={`chat-client-mcp-status chat-client-mcp-status-${status}`} />
                       <span className="chat-mcp-server-name">{server.name}</span>
-                      {server.headers?.Authorization && <i className="fas fa-lock" style={{ fontSize: '0.65rem', opacity: 0.5 }} title="Authenticated" />}
+                      {server.headers?.Authorization && <Icon name="lock" style={{ fontSize: '0.65rem', opacity: 0.5 }} title="Authenticated" />}
                     </div>
                     <span className="chat-mcp-server-tools">
                       {status === 'connecting' ? 'Connecting...' :
@@ -141,7 +139,7 @@ export default function ClientMCPDropdown({
                     onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleRemove(server.id) }}
                     title="Remove server"
                   >
-                    <i className="fas fa-trash" />
+                    <Icon name="trash" />
                   </button>
                 </label>
               )

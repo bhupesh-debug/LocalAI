@@ -1,13 +1,13 @@
 +++
 title = "API Discovery & Instructions"
-weight = 27
+weight = 15
 toc = true
 description = "Programmatic API discovery for agents, tools, and automation"
 tags = ["API", "Agents", "Instructions", "Configuration", "Advanced"]
 categories = ["Features"]
 +++
 
-LocalAI exposes a set of discovery endpoints that let external agents, coding assistants, and automation tools programmatically learn what the instance can do and how to control it — without reading documentation ahead of time.
+LocalAI exposes a set of discovery endpoints that let external agents, coding assistants, and automation tools programmatically learn what the instance can do and how to control it - without reading documentation ahead of time.
 
 ## Quick start
 
@@ -21,6 +21,17 @@ curl http://localhost:8080/api/instructions
 # 3. Get an API guide for a specific instruction
 curl http://localhost:8080/api/instructions/config-management
 ```
+
+## Authentication and discovery
+
+You can read these discovery surfaces without authentication. This remains true when LocalAI uses database authentication or legacy API keys:
+
+- `GET /.well-known/localai.json`
+- `GET /api/instructions`
+- `GET /api/instructions/{name}`
+- Swagger `GET` requests at `/swagger` and under `/swagger/`
+
+Discovery does not grant access to the endpoints it advertises. Those endpoints require credentials unless the [authentication guide]({{%relref "features/authentication" %}}) lists them as a public discovery or bootstrap route. For example, `GET /version` requires credentials even though the well-known response includes the instance version.
 
 ## Well-Known Discovery Endpoint
 
@@ -36,6 +47,7 @@ Returns the instance version, all available endpoint URLs (flat and categorized)
   "endpoints": {
     "chat_completions": "/v1/chat/completions",
     "models": "/v1/models",
+    "models_capabilities": "/v1/models/capabilities",
     "config_metadata": "/api/models/config-metadata",
     "instructions": "/api/instructions",
     "swagger": "/swagger/index.html"
@@ -50,6 +62,7 @@ Returns the instance version, all available endpoint URLs (flat and categorized)
     "config_metadata": true,
     "config_patch": true,
     "vram_estimate": true,
+    "model_storage": true,
     "mcp": true,
     "agents": false,
     "p2p": false
@@ -57,7 +70,7 @@ Returns the instance version, all available endpoint URLs (flat and categorized)
 }
 ```
 
-The `capabilities` object reflects the current runtime configuration — for example, `mcp` is only `true` if MCP is enabled, and `agents` is `true` only if the agent pool is running.
+The `capabilities` object reflects the current runtime configuration - for example, `mcp` is only `true` if MCP is enabled, and `agents` is `true` only if the agent pool is running.
 
 ## Instructions API
 
@@ -103,7 +116,7 @@ Returns a compact list of instruction areas:
 | `model-management` | Browse gallery, install, delete, manage models and backends |
 | `config-management` | Discover, read, and modify model config fields with VRAM estimation |
 | `monitoring` | System metrics, backend status, system information |
-| `mcp` | Model Context Protocol — tool-augmented chat with MCP servers |
+| `mcp` | Model Context Protocol - tool-augmented chat with MCP servers |
 | `agents` | Agent task and job management |
 | `video` | Video generation from text prompts |
 
@@ -122,6 +135,50 @@ Add `?format=json` to get a raw **OpenAPI fragment** (filtered Swagger spec with
 ```bash
 curl http://localhost:8080/api/instructions/config-management?format=json
 ```
+
+## Model Capabilities
+
+`GET /v1/models/capabilities`
+
+An additive, LocalAI-specific superset of `/v1/models`. It returns the same set of models but enriches each entry with the **capabilities** the model supports and the **input/output modalities** it accepts and produces. Use it to decide, before sending a request, whether a given model can take an image, audio, or video attachment directly - or whether the input needs converting/transcribing first.
+
+The reported `context_size` uses a positive model-level value first.
+If the model does not set `context_size`, it uses **Settings → Performance → Default Context Size** when positive.
+Otherwise, it uses the backend fallback of 4096 tokens.
+For llama.cpp with separate KV caches, the reported value accounts for the number of parallel slots.
+
+Because it is purely additive, clients that only understand `/v1/models` keep working unchanged; they simply never call this route.
+
+```bash
+curl http://localhost:8080/v1/models/capabilities
+```
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "qwen2.5-omni",
+      "object": "model",
+      "capabilities": ["chat", "vision", "tools"],
+      "input_modalities": ["text", "image", "audio"],
+      "output_modalities": ["text"]
+    },
+    {
+      "id": "parakeet",
+      "object": "model",
+      "capabilities": ["transcript"],
+      "input_modalities": ["audio"],
+      "output_modalities": ["text"]
+    }
+  ]
+}
+```
+
+- **`capabilities`** - canonical usecase strings (e.g. `chat`, `vision`, `transcript`, `tts`, `embeddings`, `image`, `video`) plus the modifiers `tools` and `thinking`.
+- **`input_modalities` / `output_modalities`** - the subsets of `{text, image, audio, video}` the model accepts and produces. LocalAI combines usecase-based inference, backend settings such as vLLM `limit_mm_per_prompt`, and explicit model-level `known_input_modalities` / `known_output_modalities`. The explicit fields cover distinctions a usecase cannot express, such as a video model that also accepts speech.
+
+The same query parameters as `/v1/models` are honored (`filter`, `excludeConfigured`), and the same per-user model allowlist is applied when authentication is enabled.
 
 ## Configuration Management APIs
 
@@ -180,8 +237,21 @@ curl -X PATCH http://localhost:8080/api/models/config-json/my-model \
 The endpoint validates the merged config and writes it to disk as YAML.
 
 {{% notice context="warning" %}}
-Config management endpoints require **admin authentication** when API keys are configured. The discovery and instructions endpoints are unauthenticated.
+Config management endpoints require **admin authentication** when authentication is configured. The well-known endpoint, instructions API, and Swagger `GET` routes remain available without authentication.
 {{% /notice %}}
+
+### Model storage report
+
+`GET /api/models/storage` (admin)
+
+Reports the on-disk footprint of the installed model configurations:
+per-model sizes with the portion shared with other models split out,
+every referenced file with the models referencing it, and references
+whose files are missing from disk.
+
+```bash
+curl http://localhost:8080/api/models/storage
+```
 
 ### VRAM estimation
 
@@ -212,12 +282,13 @@ Optional parameters: `gpu_layers` (number of layers to offload, 0 = all), `kv_qu
 
 A recommended workflow for agent/tool builders:
 
-1. **Discover**: Fetch `/.well-known/localai.json` to learn available endpoints and capabilities
-2. **Browse instructions**: Fetch `/api/instructions` for an overview of instruction areas
-3. **Deep dive**: Fetch `/api/instructions/:name` for a markdown API guide on a specific area
-4. **Explore config**: Use `/api/models/config-metadata` to understand configuration fields
-5. **Interact**: Use the standard OpenAI-compatible endpoints for inference, and the config management endpoints for runtime tuning
+1. **Discover**: Fetch `/.well-known/localai.json` to learn available endpoints and capabilities.
+2. **Browse instructions**: Fetch `/api/instructions` for an overview of instruction areas.
+3. **Deep dive**: Fetch `/api/instructions/{name}` for a markdown API guide on a specific area.
+4. **Authenticate**: Obtain credentials before you call an advertised protected endpoint.
+5. **Explore config**: Use admin credentials with `/api/models/config-metadata` to understand configuration fields.
+6. **Interact**: Use credentials with inference endpoints and configuration APIs.
 
 ## Swagger UI
 
-The full interactive API documentation is available at `/swagger/index.html`. All annotated endpoints can be explored and tested directly from the browser.
+The full interactive API documentation is available without authentication at `/swagger/index.html`. Requests sent to protected endpoints from Swagger still require credentials.

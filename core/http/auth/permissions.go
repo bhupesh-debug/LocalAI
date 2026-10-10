@@ -27,34 +27,47 @@ func GetCachedUserPermissions(c echo.Context, db *gorm.DB, userID string) (*User
 // Feature name constants — all code must use these, never bare strings.
 const (
 	// Agent features (default OFF for new users)
-	FeatureAgents      = "agents"
-	FeatureSkills      = "skills"
-	FeatureCollections = "collections"
-	FeatureMCPJobs     = "mcp_jobs"
+	FeatureAgents           = "agents"
+	FeatureSkills           = "skills"
+	FeatureCollections      = "collections"
+	FeatureMCPJobs          = "mcp_jobs"
+	FeatureLocalAIAssistant = "localai_assistant"
 
 	// General features (default OFF for new users)
 	FeatureFineTuning   = "fine_tuning"
 	FeatureQuantization = "quantization"
 
 	// API features (default ON for new users)
-	FeatureChat               = "chat"
-	FeatureImages             = "images"
-	FeatureAudioSpeech        = "audio_speech"
-	FeatureAudioTranscription = "audio_transcription"
-	FeatureVAD                = "vad"
-	FeatureDetection          = "detection"
-	FeatureVideo              = "video"
-	FeatureEmbeddings         = "embeddings"
-	FeatureSound              = "sound"
-	FeatureRealtime           = "realtime"
-	FeatureRerank             = "rerank"
-	FeatureTokenize           = "tokenize"
-	FeatureMCP                = "mcp"
-	FeatureStores             = "stores"
+	FeatureChat                = "chat"
+	FeatureImages              = "images"
+	FeatureAudioSpeech         = "audio_speech"
+	FeatureAudioTranscription  = "audio_transcription"
+	FeatureAudioDiarization    = "audio_diarization"
+	FeatureAudioClassification = "audio_classification"
+	FeatureVAD                 = "vad"
+	FeatureDetection           = "detection"
+	FeatureVideo               = "video"
+	Feature3D                  = "3d"
+	FeatureEmbeddings          = "embeddings"
+	FeatureSound               = "sound"
+	FeatureRealtime            = "realtime"
+	FeatureModeration          = "moderation"
+	FeatureRerank              = "rerank"
+	FeatureTokenize            = "tokenize"
+	FeatureMCP                 = "mcp"
+	FeatureStores              = "stores"
+	FeatureFaceRecognition     = "face_recognition"
+	FeatureVoiceRecognition    = "voice_recognition"
+	FeatureAudioTransform      = "audio_transform"
+	FeatureDecisions           = "decisions"
+	// FeaturePIIFilter gates the synchronous PII analyze/redact service
+	// (POST /api/pii/{analyze,redact}). Default ON like the other API
+	// features; the admin-only events log is gated separately in-handler.
+	FeaturePIIFilter = "pii_filter"
 )
 
 // AgentFeatures lists agent-related features (default OFF).
-var AgentFeatures = []string{FeatureAgents, FeatureSkills, FeatureCollections, FeatureMCPJobs}
+var AgentFeatures = []string{FeatureAgents, FeatureSkills, FeatureCollections, FeatureMCPJobs, FeatureLocalAIAssistant}
 
 // GeneralFeatures lists general features (default OFF).
 var GeneralFeatures = []string{FeatureFineTuning, FeatureQuantization}
@@ -62,8 +75,11 @@ var GeneralFeatures = []string{FeatureFineTuning, FeatureQuantization}
 // APIFeatures lists API endpoint features (default ON).
 var APIFeatures = []string{
 	FeatureChat, FeatureImages, FeatureAudioSpeech, FeatureAudioTranscription,
-	FeatureVAD, FeatureDetection, FeatureVideo, FeatureEmbeddings, FeatureSound,
-	FeatureRealtime, FeatureRerank, FeatureTokenize, FeatureMCP, FeatureStores,
+	FeatureAudioDiarization, FeatureAudioClassification,
+	FeatureVAD, FeatureDetection, FeatureVideo, Feature3D, FeatureEmbeddings, FeatureSound,
+	FeatureRealtime, FeatureModeration, FeatureRerank, FeatureTokenize, FeatureMCP, FeatureStores,
+	FeatureFaceRecognition, FeatureVoiceRecognition, FeatureAudioTransform,
+	FeaturePIIFilter, FeatureDecisions,
 }
 
 // AllFeatures lists all known features (used by UI and validation).

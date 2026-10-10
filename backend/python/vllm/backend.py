@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
+import dataclasses
+import difflib
 from concurrent import futures
 import argparse
 import signal
@@ -17,13 +19,20 @@ import backend_pb2_grpc
 import grpc
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'common'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'common'))
+from python_utils import attach_media_parts
 from grpc_auth import get_auth_interceptors
+from model_utils import resolve_model_reference
+from temp_utils import materialize_base64
+from vllm_utils import apply_options_to_engine_args, normalize_option_key
 
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.sampling_params import SamplingParams
 from vllm.utils import random_uuid
-from vllm.transformers_utils.tokenizer import get_tokenizer
+try:
+    from vllm.tokenizers import get_tokenizer  # vLLM >= 0.22
+except ImportError:
+    from vllm.transformers_utils.tokenizer import get_tokenizer  # vLLM < 0.22
 from vllm.multimodal.utils import fetch_image
 from vllm.assets.video import VideoAsset
 import base64
@@ -42,13 +51,21 @@ try:
 except ImportError:
     HAS_REASONING_PARSERS = False
 
+# vLLM >= 0.23 renamed GuidedDecodingParams -> StructuredOutputsParams and the
+# SamplingParams field guided_decoding -> structured_outputs.
 try:
-    from vllm.sampling_params import GuidedDecodingParams
+    from vllm.sampling_params import StructuredOutputsParams
     HAS_GUIDED_DECODING = True
 except ImportError:
     HAS_GUIDED_DECODING = False
 
 _ONE_DAY_IN_SECONDS = 60 * 60 * 24
+
+# proto3 has no field presence, so an explicit 0 is indistinguishable from
+# "unset". These two fields have a meaningful zero a caller can intend:
+# temperature 0 is greedy decoding, and 0 is a valid seed.
+_EXPLICIT_ZERO_FIELDS = ("Temperature", "Seed")
+
 
 # If MAX_WORKERS are specified in the environment use it, otherwise default to 1
 MAX_WORKERS = int(os.environ.get('PYTHON_GRPC_MAX_WORKERS', '1'))
@@ -92,14 +109,49 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         return decoded_text
 
     def _parse_options(self, options_list):
-        """Parse Options[] key:value string list into a dict."""
+        """Parse Options[] key:value string list into a dict.
+
+        Keys are normalized to their field spelling so the CLI form users copy
+        from vLLM's docs (``--reasoning-parser:qwen3``) selects the same parser
+        as LocalAI's own (``reasoning_parser:qwen3``).
+        """
         opts = {}
         for opt in options_list:
             if ":" not in opt:
                 continue
             key, value = opt.split(":", 1)
-            opts[key.strip()] = value.strip()
+            opts[normalize_option_key(key)] = value.strip()
         return opts
+
+    def _apply_engine_args(self, engine_args, engine_args_json):
+        """Apply user-supplied engine_args (JSON object) onto an AsyncEngineArgs.
+
+        Returns a new AsyncEngineArgs with the typed fields preserved and the
+        user's overrides layered on top. Uses ``dataclasses.replace`` so vLLM's
+        ``__post_init__`` re-runs and auto-converts dict-valued fields like
+        ``compilation_config`` / ``attention_config`` into their dataclass form.
+        ``speculative_config`` and ``kv_transfer_config`` are accepted as dicts
+        directly (vLLM converts them at engine init).
+
+        Unknown keys raise ValueError with the closest valid field as a hint.
+        """
+        if not engine_args_json:
+            return engine_args
+        try:
+            extra = json.loads(engine_args_json)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"engine_args is not valid JSON: {e}") from e
+        if not isinstance(extra, dict):
+            raise ValueError(
+                f"engine_args must be a JSON object, got {type(extra).__name__}"
+            )
+        valid = {f.name for f in dataclasses.fields(type(engine_args))}
+        for key in extra:
+            if key not in valid:
+                suggestion = difflib.get_close_matches(key, valid, n=1)
+                hint = f" did you mean {suggestion[0]!r}?" if suggestion else ""
+                raise ValueError(f"unknown engine_args key {key!r}.{hint}")
+        return dataclasses.replace(engine_args, **extra)
 
     def _messages_to_dicts(self, messages):
         """Convert proto Messages to list of dicts suitable for apply_chat_template()."""
@@ -114,9 +166,24 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 d["reasoning_content"] = msg.reasoning_content
             if msg.tool_calls:
                 try:
-                    d["tool_calls"] = json.loads(msg.tool_calls)
+                    tool_calls = json.loads(msg.tool_calls)
                 except json.JSONDecodeError:
                     pass
+                else:
+                    # OpenAI wire format carries function.arguments as a
+                    # JSON-encoded string, but chat templates (e.g. Qwen3)
+                    # iterate over it as a mapping. vLLM's own OpenAI server
+                    # parses arguments before applying the template, so do
+                    # the same here.
+                    if isinstance(tool_calls, list):
+                        for tc in tool_calls:
+                            func = tc.get("function") if isinstance(tc, dict) else None
+                            if isinstance(func, dict) and isinstance(func.get("arguments"), str):
+                                try:
+                                    func["arguments"] = json.loads(func["arguments"])
+                                except json.JSONDecodeError:
+                                    pass
+                    d["tool_calls"] = tool_calls
             result.append(d)
         return result
 
@@ -144,9 +211,8 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         Returns:
             backend_pb2.Result: The load model result.
         """
-        engine_args = AsyncEngineArgs(
-            model=request.Model,
-        )
+        model_ref, _local_only = resolve_model_reference(request)
+        engine_args = AsyncEngineArgs(model=model_ref)
 
         if request.Quantization != "":
             engine_args.quantization = request.Quantization
@@ -176,6 +242,21 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 "audio": max(request.LimitAudioPerPrompt, 1)
             }
 
+        # CLI-style flags in options: (--quantization:gptq_marlin,
+        # --enable-prefix-caching, ...) land on the engine args too - they must
+        # be applied *before* the engine is created or they do nothing.
+        # engine_args: is applied after this, so it stays the last word.
+        engine_args = apply_options_to_engine_args(engine_args, request.Options)
+
+        # engine_args from YAML overrides typed fields above so operators can
+        # tune anything the AsyncEngineArgs dataclass exposes without waiting
+        # on protobuf changes.
+        try:
+            engine_args = self._apply_engine_args(engine_args, request.EngineArgs)
+        except ValueError as err:
+            print(f"engine_args error: {err}", file=sys.stderr)
+            return backend_pb2.Result(success=False, message=str(err))
+
         try:
             self.llm = AsyncLLMEngine.from_engine_args(engine_args)
         except Exception as err:
@@ -198,7 +279,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 tokenizer = self.llm.tokenizer
             if tokenizer is None:
                 tokenizer = get_tokenizer(
-                    request.Model,
+                    model_ref,
                     trust_remote_code=bool(request.TrustRemoteCode),
                     truncation_side="left",
                 )
@@ -262,7 +343,10 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
             context.set_details("No embeddings were calculated.")
             return backend_pb2.EmbeddingResult()
-        return backend_pb2.EmbeddingResult(embeddings=outputs[0].outputs.embedding)
+        return backend_pb2.EmbeddingResult(
+            embeddings=outputs[0].outputs.embedding,
+            layout=backend_pb2.EMBEDDING_LAYOUT_FINAL,
+        )
 
     async def PredictStream(self, request, context):
         """
@@ -314,9 +398,139 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         except Exception as e:
             return backend_pb2.Result(success=False, message=str(e))
 
-    async def _predict(self, request, context, streaming=False):
-        # Build the sampling parameters
-        # NOTE: this must stay in sync with the vllm backend
+    async def Score(self, request, context):
+        """
+        Joint log-probability of each candidate continuation given the
+        shared prompt. Used by routing-policy multi-label classification
+        (read the distribution rather than asking the model to emit a
+        single argmax label), reranking, and reward-model scoring.
+
+        Implementation uses vLLM's `prompt_logprobs` to recover the
+        per-token log P(token_i | tokens_<i) for the full concatenated
+        sequence; the candidate's tokens are the suffix whose logprobs
+        get summed. max_tokens=1 because vLLM requires at least one
+        generated token; the generated token is discarded.
+        """
+        if not hasattr(self, 'llm') or self.llm is None:
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            context.set_details("Model not loaded")
+            return backend_pb2.ScoreResponse()
+        if not hasattr(self, 'tokenizer') or self.tokenizer is None:
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            context.set_details("Tokenizer not available")
+            return backend_pb2.ScoreResponse()
+        if len(request.candidates) == 0:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("candidates must be non-empty")
+            return backend_pb2.ScoreResponse()
+
+        try:
+            prompt = request.prompt or ""
+            prompt_token_ids = self.tokenizer.encode(prompt)
+            prompt_len = len(prompt_token_ids)
+            results = []
+
+            for candidate in request.candidates:
+                # Tokenise the concatenated sequence. We can't naively
+                # use len(prompt_tokens) + len(tokenizer.encode(candidate))
+                # because BPE merges at the boundary may produce a
+                # different tokenisation. Encoding the joined text and
+                # walking the divergence point is the correct primitive.
+                full_text = prompt + candidate
+                full_token_ids = self.tokenizer.encode(full_text)
+
+                divergence = prompt_len
+                min_len = min(prompt_len, len(full_token_ids))
+                for i in range(min_len):
+                    if prompt_token_ids[i] != full_token_ids[i]:
+                        divergence = i
+                        break
+
+                candidate_token_ids = full_token_ids[divergence:]
+                num_candidate_tokens = len(candidate_token_ids)
+                if num_candidate_tokens == 0:
+                    results.append(backend_pb2.CandidateScore(
+                        log_prob=0.0,
+                        length_normalized_log_prob=0.0,
+                        num_tokens=0,
+                    ))
+                    continue
+
+                sampling = SamplingParams(
+                    max_tokens=1,
+                    temperature=0.0,
+                    prompt_logprobs=1,
+                    detokenize=False,
+                )
+
+                request_id = random_uuid()
+                last_output = None
+                outputs_iter = self.llm.generate(
+                    {"prompt": full_text},
+                    sampling_params=sampling,
+                    request_id=request_id,
+                )
+                try:
+                    async for out in outputs_iter:
+                        last_output = out
+                finally:
+                    try:
+                        await outputs_iter.aclose()
+                    except Exception:
+                        pass
+
+                _pl = getattr(last_output, "prompt_logprobs", None) if last_output is not None else None
+                # Some engines accept the prompt_logprobs request but return a
+                # list of all-None entries instead of computing them (observed
+                # with vllm-metal's MLX backend on macOS). Treat that as
+                # unsupported rather than silently scoring every candidate as 0.
+                if not _pl or all(e is None for e in _pl):
+                    context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+                    context.set_details("This backend did not return prompt_logprobs; scoring is unsupported on this engine (e.g. vllm-metal / MLX on macOS).")
+                    return backend_pb2.ScoreResponse()
+
+                prompt_logprobs = last_output.prompt_logprobs
+                total = 0.0
+                tokens_proto = []
+                for offset, tok_id in enumerate(candidate_token_ids):
+                    position = divergence + offset
+                    if position >= len(prompt_logprobs) or prompt_logprobs[position] is None:
+                        continue
+                    entry = prompt_logprobs[position]
+                    lp_obj = entry.get(tok_id)
+                    if lp_obj is not None:
+                        lp = lp_obj.logprob
+                    else:
+                        # Token not in top-K; vLLM's top-1 may miss it.
+                        # Fall back to the lowest available logprob in the
+                        # entry — a conservative lower-bound on the true
+                        # log P, biased against this candidate.
+                        lp = min(v.logprob for v in entry.values())
+                    total += lp
+                    if request.include_token_logprobs:
+                        tokens_proto.append(backend_pb2.TokenLogProb(
+                            token=self.tokenizer.decode([tok_id]),
+                            log_prob=lp,
+                        ))
+
+                cs = backend_pb2.CandidateScore(
+                    log_prob=total,
+                    num_tokens=num_candidate_tokens,
+                )
+                if request.length_normalize and num_candidate_tokens > 0:
+                    cs.length_normalized_log_prob = total / num_candidate_tokens
+                if tokens_proto:
+                    cs.tokens.extend(tokens_proto)
+                results.append(cs)
+
+            return backend_pb2.ScoreResponse(candidates=results)
+        except Exception as e:
+            print(f"Score error: {e}", file=sys.stderr)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return backend_pb2.ScoreResponse()
+
+    def _build_sampling_params(self, request):
         request_to_sampling_params = {
             "N": "n",
             "PresencePenalty": "presence_penalty",
@@ -346,19 +560,97 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         for request_field, param_field in request_to_sampling_params.items():
             if hasattr(request, request_field):
                 value = getattr(request, request_field)
-                if value not in (None, 0, [], False):
+                # See _EXPLICIT_ZERO_FIELDS: temperature 0 is greedy decoding
+                # and 0 is a valid seed, so neither may be filtered out.
+                if request_field in _EXPLICIT_ZERO_FIELDS or value not in (None, 0, [], False):
                     setattr(sampling_params, param_field, value)
 
-        # Guided decoding: use Grammar field to pass JSON schema or BNF
+        return sampling_params
+
+    def _new_reasoning_parser(self, chat_template_kwargs):
+        """Build the reasoning parser, telling it whether thinking is on.
+
+        vLLM's newer parser engines decide their *initial state* from
+        ``chat_template_kwargs``: ``Qwen3Parser`` reads
+        ``chat_template_kwargs["enable_thinking"]`` and defaults to ``True``,
+        starting in the REASONING state. Constructed without it, a completion
+        produced with thinking disabled is classified as reasoning end to end,
+        and the answer is reported in both ``reasoning_content`` and
+        ``content``.
+
+        vLLM's own OpenAI server forwards the request's chat template kwargs
+        here; this backend renders the template itself, so it forwards the
+        same dict. Older parsers do not accept the argument — fall back to the
+        plain constructor for those.
+        """
+        try:
+            return self.reasoning_parser_cls(
+                self.tokenizer, chat_template_kwargs=chat_template_kwargs or {},
+            )
+        except TypeError:
+            return self.reasoning_parser_cls(self.tokenizer)
+
+    @staticmethod
+    def _split_reasoning(rp, generated_text, prompt, reasoning, content):
+        """Decide what the reasoning parser's output actually means.
+
+        Covers the *older* parser shape, which has no initial state to set:
+        ``BaseThinkingReasoningParser.extract_reasoning`` documents its own
+        fallback — "For models that may not generate start token, assume the
+        reasoning content is always at the start." When no end token is
+        present it returns *everything* as reasoning and ``None`` as content,
+        which is right for a truncated reasoning run and wrong for a
+        completion that never contained reasoning at all.
+
+        Taking ``None`` content to mean "keep the raw text" then duplicates
+        the answer into both fields.
+
+        The prompt says which case it is. A template with thinking on leaves
+        the reasoning block open (the prompt ends with the start token); with
+        thinking off it closes the block in the prompt, so the completion is
+        plain content. Parsers that expose no token pair (the engine-based
+        adapters, which take the ``chat_template_kwargs`` route above) keep
+        the parser's verdict unchanged.
+        """
+        start = getattr(rp, "start_token", None)
+        end = getattr(rp, "end_token", None)
+
+        if end and end in generated_text:
+            # The parser split on the end token. Empty content here means the
+            # model stopped right after it, not that parsing failed.
+            return reasoning or "", content or ""
+
+        if not start:
+            # Unknown token layout — keep the previous behaviour rather than
+            # guess.
+            return reasoning or "", content if content is not None else generated_text
+
+        if not (start in generated_text or (prompt or "").rstrip().endswith(start)):
+            # No end token and the block was never open: the "reasoning starts
+            # at the beginning" fallback does not apply to this completion.
+            return "", generated_text
+
+        # Block was open and the end token never arrived — reasoning ran out of
+        # budget. It is all reasoning, and there is no answer to report.
+        return reasoning or "", content or ""
+
+    async def _predict(self, request, context, streaming=False):
+        # Build the sampling parameters
+        sampling_params = self._build_sampling_params(request)
+
+        # Structured-output decoding: use Grammar field to pass JSON schema or BNF
         if HAS_GUIDED_DECODING and request.Grammar:
             try:
                 json.loads(request.Grammar)  # valid JSON = JSON schema
-                sampling_params.guided_decoding = GuidedDecodingParams(json=request.Grammar)
+                sampling_params.structured_outputs = StructuredOutputsParams(json=request.Grammar)
             except json.JSONDecodeError:
-                sampling_params.guided_decoding = GuidedDecodingParams(grammar=request.Grammar)
+                sampling_params.structured_outputs = StructuredOutputsParams(grammar=request.Grammar)
 
         # Extract image paths and process images
         prompt = request.Prompt
+        # Kept in scope: the reasoning parser needs to know which chat
+        # template kwargs produced this prompt.
+        template_kwargs = {}
 
         image_paths = request.Images
         image_data = [self.load_image(img_path) for img_path in image_paths]
@@ -369,7 +661,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         # If tokenizer template is enabled and messages are provided instead of prompt, apply the tokenizer template
         if not request.Prompt and request.UseTokenizerTemplate and request.Messages:
             messages_dicts = self._messages_to_dicts(request.Messages)
-            template_kwargs = {"tokenize": False, "add_generation_prompt": True}
+            template_kwargs.update({"tokenize": False, "add_generation_prompt": True})
 
             # Pass tools for tool calling
             if request.Tools:
@@ -378,17 +670,37 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 except json.JSONDecodeError:
                     pass
 
-            # Enable thinking mode if requested
-            if request.Metadata.get("enable_thinking", "").lower() == "true":
-                template_kwargs["enable_thinking"] = True
+            _thinking = request.Metadata.get("enable_thinking", "").lower()
+            if _thinking in ("true", "false"):
+                template_kwargs["enable_thinking"] = (_thinking == "true")
 
-            try:
-                prompt = self.tokenizer.apply_chat_template(messages_dicts, **template_kwargs)
-            except TypeError:
-                # Some tokenizers don't support tools/enable_thinking kwargs — retry without them
-                prompt = self.tokenizer.apply_chat_template(
-                    messages_dicts, tokenize=False, add_generation_prompt=True
-                )
+            # vLLM substitutes multi_modal_data into the model's own media
+            # token, so the template has to be given content *parts* - string
+            # content renders a prompt with no placeholder and the media are
+            # dropped without a word (#11621).
+            prompt = None
+            media_dicts = attach_media_parts(
+                messages_dicts, len(image_data), len(video_data)
+            )
+            if media_dicts is not None:
+                try:
+                    prompt = self.tokenizer.apply_chat_template(media_dicts, **template_kwargs)
+                except Exception as e:
+                    # A text-only template cannot iterate content parts; fall
+                    # through to the text-only prompt instead of failing.
+                    print(
+                        f"chat template rejected multimodal content parts: {e!r}",
+                        file=sys.stderr,
+                    )
+
+            if prompt is None:
+                try:
+                    prompt = self.tokenizer.apply_chat_template(messages_dicts, **template_kwargs)
+                except TypeError:
+                    # Some tokenizers don't support tools/enable_thinking kwargs — retry without them
+                    prompt = self.tokenizer.apply_chat_template(
+                        messages_dicts, tokenize=False, add_generation_prompt=True
+                    )
 
         # Generate text using the LLM engine
         request_id = random_uuid()
@@ -409,23 +721,124 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
 
         # Stream the results
         generated_text = ""
+        generated_token_ids: list[int] = []
         last_output = None
+
+        # Tool-parsing strategy decision (made once, before the loop):
+        #
+        # When a tool parser is active, the model's raw tool-call markup
+        # (e.g. <tool_call>...) must not be streamed verbatim as delta.content
+        # — clients would see the unparsed syntax. Two paths:
+        #
+        # (A) native streaming via parser.extract_tool_calls_streaming. All
+        #     concrete tool parsers shipped with vLLM 0.23+ implement this
+        #     (Granite4, Qwen3Coder, DeepSeekV31, Jamba, Ernie45, Hermes,
+        #     llama3_json, mistral, …). The parser decides per-delta whether
+        #     to emit content or suppress tool-call markup, and emits a
+        #     structured DeltaMessage(tool_calls=[...]) when a call is ready.
+        # (B) buffer fallback — used only when the parser surprisingly lacks
+        #     the streaming method or it raises mid-stream. The post-loop
+        #     extract_tool_calls assembles the final chat_delta. Same correctness
+        #     guarantee as a non-streaming response, at the cost of a delayed
+        #     final chunk.
+        has_tool_parser = bool(self.tool_parser_cls and request.Tools)
+        tp_instance = None
+        tp_request = None
+        native_streaming = False
+        native_streaming_error = False
+        if has_tool_parser:
+            try:
+                tools_for_parser = json.loads(request.Tools)
+            except json.JSONDecodeError:
+                tools_for_parser = []
+            try:
+                tp_instance = self.tool_parser_cls(self.tokenizer, tools=tools_for_parser)
+            except TypeError:
+                tp_instance = self.tool_parser_cls(self.tokenizer)
+            # Build a minimal ChatCompletionRequest so the streaming method
+            # sees the tools list. We do not need any other request fields —
+            # parsers only read .tools (and sometimes .tool_choice, which we
+            # leave at default).
+            try:
+                from vllm.entrypoints.openai.chat_completion.protocol import (
+                    ChatCompletionRequest as _CCR,
+                )
+                tp_request = _CCR(
+                    model="local",
+                    messages=[{"role": "user", "content": ""}],
+                    tools=tools_for_parser or None,
+                )
+            except Exception as e:
+                print(f"Could not build ChatCompletionRequest for streaming parser: {e}",
+                      file=sys.stderr)
+                tp_request = None
+            native_streaming = (
+                tp_request is not None
+                and hasattr(tp_instance, "extract_tool_calls_streaming")
+            )
+
         try:
             async for request_output in outputs:
                 iteration_text = request_output.outputs[0].text
                 last_output = request_output
 
                 if streaming:
-                    # Remove text already sent as vllm concatenates the text from previous yields
                     delta_iteration_text = iteration_text.removeprefix(generated_text)
-                    # Send the partial result
-                    yield backend_pb2.Reply(
-                        message=bytes(delta_iteration_text, encoding='utf-8'),
-                        chat_deltas=[backend_pb2.ChatDelta(content=delta_iteration_text)],
-                    )
+                    new_token_ids = list(request_output.outputs[0].token_ids)
+                    delta_token_ids = new_token_ids[len(generated_token_ids):]
 
-                # Keep track of text generated
+                    if not has_tool_parser:
+                        # Plain streaming — unchanged from pre-tool-parser path.
+                        yield backend_pb2.Reply(
+                            message=bytes(delta_iteration_text, encoding='utf-8'),
+                            chat_deltas=[backend_pb2.ChatDelta(content=delta_iteration_text)],
+                        )
+                    elif native_streaming and not native_streaming_error:
+                        # (A) Native vLLM extract_tool_calls_streaming.
+                        try:
+                            msg = tp_instance.extract_tool_calls_streaming(
+                                previous_text=generated_text,
+                                current_text=iteration_text,
+                                delta_text=delta_iteration_text,
+                                previous_token_ids=generated_token_ids,
+                                current_token_ids=new_token_ids,
+                                delta_token_ids=delta_token_ids,
+                                request=tp_request,
+                            )
+                        except Exception as e:
+                            print(f"Streaming tool parser error (falling back to "
+                                  f"buffer for the rest of the stream): {e}",
+                                  file=sys.stderr)
+                            native_streaming_error = True
+                            msg = None
+                        if msg is not None:
+                            tc_protos = []
+                            for tc in (msg.tool_calls or []):
+                                fn = tc.function or None
+                                tc_protos.append(backend_pb2.ToolCallDelta(
+                                    index=tc.index,
+                                    id=tc.id or "",
+                                    name=(fn.name if fn and fn.name else "") or "",
+                                    arguments=(fn.arguments if fn and fn.arguments else "") or "",
+                                ))
+                            cd_kwargs = {}
+                            if msg.content:
+                                cd_kwargs["content"] = msg.content
+                            if msg.reasoning:
+                                cd_kwargs["reasoning_content"] = msg.reasoning
+                            if tc_protos:
+                                cd_kwargs["tool_calls"] = tc_protos
+                            if cd_kwargs:
+                                yield backend_pb2.Reply(
+                                    message=bytes(msg.content or "", encoding='utf-8'),
+                                    chat_deltas=[backend_pb2.ChatDelta(**cd_kwargs)],
+                                )
+                    # (B) buffer fallback — emit nothing during the stream.
+                    # The post-loop extract_tool_calls block builds the final chunk.
+
+                # Keep track of text + token_ids generated
                 generated_text = iteration_text
+                generated_token_ids = list(request_output.outputs[0].token_ids)
         finally:
             await outputs.aclose()
 
@@ -443,23 +856,32 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
 
         if self.reasoning_parser_cls:
             try:
-                rp = self.reasoning_parser_cls(self.tokenizer)
+                rp = self._new_reasoning_parser(template_kwargs)
                 r, c = rp.extract_reasoning(generated_text, request=None)
-                reasoning_content = r or ""
-                content = c if c is not None else generated_text
+                reasoning_content, content = self._split_reasoning(
+                    rp, generated_text, prompt, r, c,
+                )
             except Exception as e:
                 print(f"Reasoning parser error: {e}", file=sys.stderr)
 
-        if self.tool_parser_cls and request.Tools:
+        # When (A) native streaming ran cleanly, per-delta yields above already
+        # delivered everything — do NOT extract again on the full text or we'd
+        # duplicate content/tool_calls into the final chunk.
+        # NOTE: `native_streaming` is a capability flag ("streaming parser is
+        # available"), not a state flag ("streaming actually ran"). For
+        # non-streaming requests it is still True but the per-delta loop was
+        # never entered, so we MUST still run extract_tool_calls here. Hence
+        # the explicit `streaming and …` guard on both branches.
+        if has_tool_parser and not (streaming and native_streaming and not native_streaming_error):
             try:
-                tools = json.loads(request.Tools)
-                # Some concrete parsers only accept the tokenizer; only the
-                # abstract base declares the tools kwarg. Try with tools first,
-                # fall back to tokenizer-only.
-                try:
-                    tp = self.tool_parser_cls(self.tokenizer, tools=tools)
-                except TypeError:
-                    tp = self.tool_parser_cls(self.tokenizer)
+                tp = tp_instance
+                if tp is None:
+                    # Defensive: tp_instance build failed earlier; reconstruct.
+                    tools = json.loads(request.Tools)
+                    try:
+                        tp = self.tool_parser_cls(self.tokenizer, tools=tools)
+                    except TypeError:
+                        tp = self.tool_parser_cls(self.tokenizer)
                 info = tp.extract_tool_calls(content, request=None)
                 if info.tools_called:
                     content = info.content or ""
@@ -472,6 +894,10 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                         ))
             except Exception as e:
                 print(f"Tool parser error: {e}", file=sys.stderr)
+        elif streaming and native_streaming and not native_streaming_error:
+            # Per-delta path already emitted content + tool_calls; the final
+            # chat_delta should carry only metadata (token counts, logprobs).
+            content = ""
 
         # Extract token counts
         prompt_tokens = 0
@@ -511,7 +937,26 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         )
 
         if streaming:
-            # Final chunk with structured data
+            # Final chunk with structured data.
+            #
+            # If we used the buffer fallback (has_tool_parser=True AND native
+            # streaming did NOT run cleanly) and the parser found no tool call,
+            # flush the buffered content as ONE content delta — and clear the
+            # final chat_delta's content so the metadata chunk does not repeat
+            # what we just sent. This is the plain-text-with-tool-parser path.
+            buffered_fallback = (
+                has_tool_parser
+                and not (native_streaming and not native_streaming_error)
+            )
+            if buffered_fallback and not tool_calls_proto and content:
+                yield backend_pb2.Reply(
+                    message=bytes(content, encoding='utf-8'),
+                    chat_deltas=[backend_pb2.ChatDelta(content=content)],
+                )
+                chat_delta = backend_pb2.ChatDelta(
+                    reasoning_content=reasoning_content,
+                    tool_calls=tool_calls_proto,
+                )
             yield backend_pb2.Reply(
                 message=b"",
                 prompt_tokens=prompt_tokens,
@@ -560,13 +1005,8 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             Video: The loaded video.
         """
         try:
-            timestamp = str(int(time.time() * 1000))  # Generate timestamp
-            p = f"/tmp/vl-{timestamp}.data"  # Use timestamp in filename
-            with open(p, "wb") as f:
-                f.write(base64.b64decode(video_path))
-            video = VideoAsset(name=p).np_ndarrays
-            os.remove(p)
-            return video
+            with materialize_base64(video_path, suffix=".data") as path:
+                return VideoAsset(name=path).np_ndarrays
         except Exception as e:
             print(f"Error loading video {video_path}: {e}", file=sys.stderr)
             return None

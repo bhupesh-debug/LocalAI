@@ -22,6 +22,7 @@ import grpc
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'common'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'common'))
 from grpc_auth import get_auth_interceptors
+from model_utils import resolve_model_reference
 
 
 
@@ -169,22 +170,17 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 else None
             )
 
-            # Get model path from request
-            model_path = request.Model
-            if not model_path:
-                model_path = "fishaudio/s2-pro"
-
-            # If model_path looks like a HuggingFace repo ID (e.g. "fishaudio/fish-speech-1.5"),
-            # download it locally first since fish-speech expects a local directory
-            if "/" in model_path and not os.path.exists(model_path):
+            model_path, local_only = resolve_model_reference(
+                request, "fishaudio/s2-pro"
+            )
+            if not local_only and "/" in model_path:
                 from huggingface_hub import snapshot_download
 
                 print(
-                    f"Downloading model from HuggingFace: {model_path}",
+                    f"Downloading legacy unmanaged model from HuggingFace: {model_path}",
                     file=sys.stderr,
                 )
                 model_path = snapshot_download(repo_id=model_path)
-                print(f"Model downloaded to: {model_path}", file=sys.stderr)
 
             # Determine precision
             if device in ("mps", "cpu"):
@@ -267,6 +263,8 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
 
     def _get_ref_audio_path(self, voice_name=None):
         """Get reference audio path from voices dict or stored AudioPath."""
+        if voice_name and os.path.isfile(voice_name):
+            return voice_name
         if voice_name and voice_name in self.voices:
             audio_path = self.voices[voice_name]["audio"]
 
@@ -328,11 +326,41 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             max_new_tokens = self.options.get("max_new_tokens", 1024)
             chunk_length = self.options.get("chunk_length", 200)
 
-            # Build references list for voice cloning
+            # Build references list for voice cloning. Saved LocalAI
+            # personalities use the same ordered JSON shape as audio.cpp.
             references = []
             voice_name = request.voice if request.voice else None
 
-            if voice_name and voice_name in self.voices:
+            multi_reference_cond = request.params.get("multi_reference_cond", "") if hasattr(request, "params") else ""
+            if multi_reference_cond:
+                reference_entries = json.loads(multi_reference_cond)
+                if not isinstance(reference_entries, list) or not reference_entries:
+                    raise ValueError("multi_reference_cond must be a non-empty JSON array")
+                for entry in reference_entries:
+                    if not isinstance(entry, dict) or not entry.get("audio") or not entry.get("text"):
+                        raise ValueError("multi_reference_cond entries require audio and text")
+                    ref_audio_path = self._get_ref_audio_path(entry["audio"])
+                    with open(ref_audio_path, "rb") as f:
+                        audio_bytes = f.read()
+                    references.append(ServeReferenceAudio(audio=audio_bytes, text=entry["text"]))
+                print(
+                    f"[INFO] Using {len(references)} per-request reference audios",
+                    file=sys.stderr,
+                )
+
+            elif voice_name and os.path.isfile(voice_name):
+                ref_audio_path = self._get_ref_audio_path(voice_name)
+                with open(ref_audio_path, "rb") as f:
+                    audio_bytes = f.read()
+                ref_text = request.params.get("ref_text", "") if hasattr(request, "params") else ""
+                references.append(
+                    ServeReferenceAudio(audio=audio_bytes, text=ref_text)
+                )
+                print(
+                    f"[INFO] Using per-request reference audio: {ref_audio_path}",
+                    file=sys.stderr,
+                )
+            elif voice_name and voice_name in self.voices:
                 ref_audio_path = self._get_ref_audio_path(voice_name)
                 if ref_audio_path and os.path.exists(ref_audio_path):
                     with open(ref_audio_path, "rb") as f:
@@ -350,7 +378,9 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 if ref_audio_path and os.path.exists(ref_audio_path):
                     with open(ref_audio_path, "rb") as f:
                         audio_bytes = f.read()
-                    ref_text = self.options.get("ref_text", "")
+                    ref_text = request.params.get("ref_text", "") if hasattr(request, "params") else ""
+                    if not ref_text:
+                        ref_text = self.options.get("ref_text", "")
                     references.append(
                         ServeReferenceAudio(audio=audio_bytes, text=ref_text)
                     )

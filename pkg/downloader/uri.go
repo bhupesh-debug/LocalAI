@@ -13,14 +13,20 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"github.com/mudler/xlog"
+
+	"github.com/mudler/LocalAI/internal"
+	"github.com/mudler/LocalAI/pkg/credentials"
+	"github.com/mudler/LocalAI/pkg/httpclient"
 	"github.com/mudler/LocalAI/pkg/oci"
 	"github.com/mudler/LocalAI/pkg/utils"
 	"github.com/mudler/LocalAI/pkg/xio"
-	"github.com/mudler/xlog"
 )
 
 const (
@@ -38,6 +44,92 @@ const (
 )
 
 type URI string
+
+// ImageVerifier verifies the integrity of an OCI image — typically a
+// cosign signature check against a sigstore policy. The downloader runs
+// VerifyImage between fetching the image manifest and extracting its
+// layers, so verification failure prevents any tampered bytes reaching
+// disk.
+//
+// pkg/oci/cosignverify.Verifier satisfies this interface.
+type ImageVerifier interface {
+	VerifyImage(ctx context.Context, imageRef string) error
+}
+
+// TransferProgress reports the raw byte counts for an HTTP download.
+// Total is negative when the server does not advertise a response length.
+type TransferProgress struct {
+	FileName string
+	Written  int64
+	Total    int64
+}
+
+// TransferProgressSink receives raw byte progress updates for an HTTP download.
+type TransferProgressSink func(TransferProgress)
+
+type downloadOptions struct {
+	verifier         ImageVerifier
+	bearerToken      string
+	transferProgress TransferProgressSink
+	stagingDir       string
+}
+
+// DownloadOption configures DownloadFileWithContext / DownloadFile.
+//
+// Variadic at the end of the signature keeps the public API backward
+// compatible: existing callers that don't care about verification keep
+// compiling untouched.
+type DownloadOption func(*downloadOptions)
+
+// WithImageVerifier attaches an ImageVerifier that runs against OCI
+// downloads only. No-op for tarball / HTTP / Ollama / local downloads —
+// those paths use SHA256 integrity instead.
+func WithImageVerifier(v ImageVerifier) DownloadOption {
+	return func(o *downloadOptions) { o.verifier = v }
+}
+
+// WithBearerToken authenticates HTTP download requests with a bearer token.
+// The token is stripped if a request redirects to a different origin.
+func WithBearerToken(token string) DownloadOption {
+	return func(o *downloadOptions) { o.bearerToken = token }
+}
+
+func WithStagingDir(dir string) DownloadOption {
+	return func(o *downloadOptions) { o.stagingDir = dir }
+}
+
+// WithTransferProgress attaches a sink for raw HTTP download byte progress.
+func WithTransferProgress(sink TransferProgressSink) DownloadOption {
+	return func(o *downloadOptions) { o.transferProgress = sink }
+}
+
+func applyDownloadOptions(opts []DownloadOption) downloadOptions {
+	var o downloadOptions
+	for _, fn := range opts {
+		fn(&o)
+	}
+	return o
+}
+
+// pinnedImageRef rewrites `repo:tag` (or `repo[@digest]`) into `repo@<digest>`
+// so callers can pass the explicit digest the downloader just resolved to
+// any tag-following client, eliminating TOCTOU between fetches.
+func pinnedImageRef(ref, digest string) string {
+	// Strip an existing @digest if present so we always emit a clean ref.
+	if at := strings.LastIndex(ref, "@"); at != -1 {
+		// Only treat as a digest separator when not preceded by a slash
+		// (avoids breaking unusual hostnames). Conservative: just keep
+		// the registry+repo portion.
+		ref = ref[:at]
+	}
+	// Strip an existing :tag — find the rightmost colon after the last
+	// slash so we don't touch the registry port (e.g. localhost:5000/foo:latest).
+	slash := strings.LastIndex(ref, "/")
+	if colon := strings.LastIndex(ref, ":"); colon > slash {
+		ref = ref[:colon]
+	}
+	return ref + "@" + digest
+}
 
 // HF_ENDPOINT is the HuggingFace endpoint, can be overridden by setting the HF_ENDPOINT environment variable.
 var HF_ENDPOINT string = loadConfig()
@@ -110,15 +202,38 @@ func (uri URI) ReadWithAuthorizationAndCallback(ctx context.Context, basePath st
 	if err != nil {
 		return err
 	}
+	// pkg/oci has always identified itself; gallery and file fetches went out
+	// anonymously, indistinguishable from any other Go program. One identity
+	// across every transport is politer to the hosts serving us and makes our
+	// traffic attributable when a gallery operator asks who is hammering them.
+	req.Header.Set("User-Agent", internal.UserAgent())
 	if authorization != "" {
 		req.Header.Add("Authorization", authorization)
 	}
 
-	response, err := http.DefaultClient.Do(req)
+	response, err := downloadHTTPClient().Do(req)
 	if err != nil {
 		return err
 	}
 	defer response.Body.Close()
+
+	// An error page is not content. Without this check a 404 or a 502 from a
+	// CDN is handed to the callback as if it were a gallery index or a model
+	// config: it parses to nothing, gets cached, and no caller can tell the
+	// source was down. DownloadFile has always checked the status; this path
+	// never did.
+	if response.StatusCode >= 400 {
+		err := fmt.Errorf("failed to read url %q, invalid status code %d", url, response.StatusCode)
+		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+			// The credentials transport leaves a caller-set Authorization
+			// alone, so a rejection here is about that header, not the store.
+			if authorization != "" {
+				return credentials.HTTPProvidedCredentialError(response.Request.URL, response.StatusCode, err)
+			}
+			return credentials.HTTPAuthError(response.Request.URL, response.StatusCode, err)
+		}
+		return err
+	}
 
 	// Read the response body
 	body, err := io.ReadAll(response.Body)
@@ -172,6 +287,20 @@ func (u URI) LooksLikeURL() bool {
 		strings.HasPrefix(string(u), GithubURI2)
 }
 
+// hasLocalSource reports whether the URI names a local file to copy from
+// rather than a URL to fetch. DownloadFileWithContext both decides whether the
+// destination is reachable and picks its source with this, so that the two
+// cannot drift apart: they did, and every "file://" install failed because the
+// reachability check admitted http(s) only, leaving the local-source branch
+// unreachable for any destination that did not already exist.
+func (u URI) hasLocalSource() bool {
+	if strings.HasPrefix(string(u), LocalPrefix) {
+		return true
+	}
+	_, err := os.Stat(u.ResolveURL())
+	return err == nil
+}
+
 func (u URI) LooksLikeHTTPURL() bool {
 	return strings.HasPrefix(string(u), HTTPPrefix) ||
 		strings.HasPrefix(string(u), HTTPSPrefix)
@@ -189,6 +318,30 @@ func (s URI) LooksLikeOCI() bool {
 		strings.HasPrefix(string(s), OCIFilePrefix) ||
 		strings.HasPrefix(string(s), "ghcr.io") ||
 		strings.HasPrefix(string(s), "docker.io")
+}
+
+// LooksLikeRegistryOCI reports whether the URI names an image in a registry.
+//
+// LooksLikeOCI also accepts ollama:// and ocifile://, which the downloader
+// pulls through its OCI path but which name no registry image: a caller about
+// to ask a registry about the URI must check this instead, or it sends
+// "ollama://..." or "ocifile:///path" to a registry client that can only fail.
+func (s URI) LooksLikeRegistryOCI() bool {
+	return s.LooksLikeOCI() &&
+		!strings.HasPrefix(string(s), OllamaPrefix) &&
+		!strings.HasPrefix(string(s), OCIFilePrefix)
+}
+
+// OCIReference returns the registry reference an OCI URI names, without the
+// oci:// scheme. The scheme is LocalAI's own marker for "this is an image":
+// registry clients do not know it and read "oci" as the registry host, so
+// every consumer that hands a URI to a registry client goes through here.
+//
+// It is only meaningful for a URI that LooksLikeRegistryOCI: ollama:// and
+// ocifile:// URIs come back unchanged, and no registry client can resolve
+// them.
+func (s URI) OCIReference() string {
+	return strings.TrimPrefix(string(s), OCIPrefix)
 }
 
 func (s URI) LooksLikeOCIFile() bool {
@@ -271,16 +424,24 @@ func (s URI) ResolveURL() string {
 	return string(s)
 }
 
+// ErrUserCancelled distinguishes a deliberate user abort from an incidental
+// context cancellation (process shutdown, pod restart). Pass it as the cause
+// when cancelling the download context:
+//
+//	ctx, cancel := context.WithCancelCause(parent)
+//	cancel(downloader.ErrUserCancelled) // discards the .partial
+//
+// On a deliberate cancel the downloader removes the .partial (the user does not
+// want a half-download lingering). On a plain cancellation it keeps the .partial
+// so the next run resumes via Range instead of restarting from zero.
+var ErrUserCancelled = errors.New("download cancelled by user")
+
 func removePartialFile(tmpFilePath string) error {
-	_, err := os.Stat(tmpFilePath)
-	if err == nil {
-		xlog.Debug("Removing temporary file", "file", tmpFilePath)
-		err = os.Remove(tmpFilePath)
-		if err != nil {
-			err1 := fmt.Errorf("failed to remove temporary download file %s: %v", tmpFilePath, err)
-			xlog.Warn("failed to remove temporary download file", "error", err1)
-			return err1
-		}
+	xlog.Debug("Removing temporary file", "file", tmpFilePath)
+	if err := os.Remove(tmpFilePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		err1 := fmt.Errorf("failed to remove temporary download file %s: %v", tmpFilePath, err)
+		xlog.Warn("failed to remove temporary download file", "error", err1)
+		return err1
 	}
 	return nil
 }
@@ -294,9 +455,64 @@ func calculateHashForPartialFile(file *os.File) (hash.Hash, error) {
 	return hash, nil
 }
 
-func (uri URI) checkSeverSupportsRangeHeader() (bool, error) {
-	url := uri.ResolveURL()
-	resp, err := http.Head(url)
+// downloadClient is the shared client for HTTP(S) downloads and size
+// probes. It follows redirects (model hosts and CDNs rely on them) but
+// strips credential headers on any cross-host hop, and sets no body
+// deadline so large downloads are not truncated. It does bound the wait for
+// response *headers*, which is a different window entirely and the one an
+// unresponsive origin wedges on.
+//
+// The client is cached rather than rebuilt per request so connection pooling
+// survives; it is rebuilt only when DownloadResponseHeaderTimeout changes, so
+// the knob stays live the way DownloadStallTimeout is.
+var (
+	downloadClientMu      sync.Mutex
+	downloadClientCached  *http.Client
+	downloadClientTimeout time.Duration
+)
+
+func downloadHTTPClient() *http.Client {
+	downloadClientMu.Lock()
+	defer downloadClientMu.Unlock()
+	if downloadClientCached == nil || downloadClientTimeout != DownloadResponseHeaderTimeout {
+		downloadClientTimeout = DownloadResponseHeaderTimeout
+		base := httpclient.HardenedTransport()
+		// httpclient only applies the header timeout to a bare *http.Transport,
+		// and the credential wrapper hides it, so set it on the base directly.
+		if downloadClientTimeout > 0 {
+			base.ResponseHeaderTimeout = downloadClientTimeout
+		}
+		downloadClientCached = httpclient.New(
+			httpclient.WithFollowRedirects(),
+			httpclient.WithTransport(credentials.Transport(base)),
+		)
+	}
+	return downloadClientCached
+}
+
+func newDownloadRequest(
+	ctx context.Context,
+	method string,
+	rawURL string,
+	bearerToken string,
+) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", internal.UserAgent())
+	if bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+bearerToken)
+	}
+	return req, nil
+}
+
+func (uri URI) checkServerSupportsRangeHeader(ctx context.Context, bearerToken string) (bool, error) {
+	req, err := newDownloadRequest(ctx, http.MethodHead, uri.ResolveURL(), bearerToken)
+	if err != nil {
+		return false, err
+	}
+	resp, err := downloadHTTPClient().Do(req)
 	if err != nil {
 		return false, err
 	}
@@ -323,7 +539,8 @@ func (u URI) ContentLength(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	req.Header.Set("User-Agent", internal.UserAgent())
+	resp, err := downloadHTTPClient().Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -341,8 +558,9 @@ func (u URI) ContentLength(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	req2.Header.Set("User-Agent", internal.UserAgent())
 	req2.Header.Set("Range", "bytes=0-0")
-	resp2, err := http.DefaultClient.Do(req2)
+	resp2, err := downloadHTTPClient().Do(req2)
 	if err != nil {
 		return 0, err
 	}
@@ -366,18 +584,30 @@ func (u URI) ContentLength(ctx context.Context) (int64, error) {
 	return size, nil
 }
 
-func (uri URI) DownloadFile(filePath, sha string, fileN, total int, downloadStatus func(string, string, string, float64)) error {
-	return uri.DownloadFileWithContext(context.Background(), filePath, sha, fileN, total, downloadStatus)
+func (uri URI) DownloadFile(filePath, sha string, fileN, total int, downloadStatus func(string, string, string, float64), opts ...DownloadOption) error {
+	return uri.DownloadFileWithContext(context.Background(), filePath, sha, fileN, total, downloadStatus, opts...)
 }
 
-func (uri URI) DownloadFileWithContext(ctx context.Context, filePath, sha string, fileN, total int, downloadStatus func(string, string, string, float64)) error {
+func (uri URI) DownloadFileWithContext(ctx context.Context, filePath, sha string, fileN, total int, downloadStatus func(string, string, string, float64), opts ...DownloadOption) error {
+	dopts := applyDownloadOptions(opts)
 	url := uri.ResolveURL()
 	if uri.LooksLikeOCI() {
 
 		// Only Ollama wants to download to the file, for the rest, we want to download to the directory
-		// so we check if filepath has any extension, otherwise we assume it's a directory
-		if filepath.Ext(filePath) != "" && !strings.HasPrefix(url, OllamaPrefix) {
-			filePath = filepath.Dir(filePath)
+		// so we check if filepath has any extension, otherwise we assume it's a directory.
+		// Caveat: `filepath.Ext` treats any dot-suffix as an extension, so paths like
+		// `backends/local-store.upgrade-tmp` (the tmp dir created by gallery.UpgradeBackend)
+		// look like a "file" to this heuristic and get rewritten to their parent — which
+		// then unpacks the image at `backends/` top level and clobbers the real install
+		// with a flat-layout file. Guard against that by short-circuiting when the caller
+		// has already created the target as a directory: OCI destinations are always dirs
+		// in that case, regardless of what their suffix looks like.
+		if !strings.HasPrefix(url, OllamaPrefix) {
+			if fi, statErr := os.Stat(filePath); statErr == nil && fi.IsDir() {
+				// Existing directory — use as-is.
+			} else if filepath.Ext(filePath) != "" {
+				filePath = filepath.Dir(filePath)
+			}
 		}
 
 		progressStatus := func(desc ocispec.Descriptor) io.Writer {
@@ -402,16 +632,33 @@ func (uri URI) DownloadFileWithContext(ctx context.Context, filePath, sha string
 				return fmt.Errorf("failed to open tarball: %s", err.Error())
 			}
 
-			return oci.ExtractOCIImage(ctx, img, url, filePath, downloadStatus)
+			return oci.ExtractOCIImage(ctx, img, url, filePath, dopts.stagingDir, downloadStatus)
 		}
 
-		url = strings.TrimPrefix(url, OCIPrefix)
+		url = URI(url).OCIReference()
 		img, err := oci.GetImage(url, "", nil, nil)
 		if err != nil {
 			return fmt.Errorf("failed to get image %q: %v", url, err)
 		}
 
-		return oci.ExtractOCIImage(ctx, img, url, filePath, downloadStatus)
+		// Verify before extract so tampered bytes never reach disk. We
+		// re-pin the ref to the manifest digest we just fetched: the
+		// verifier would otherwise resolve the tag again, opening a tiny
+		// TOCTOU window in which a registry could swap the underlying
+		// manifest between the two HEADs.
+		if dopts.verifier != nil {
+			digest, derr := img.Digest()
+			if derr != nil {
+				return fmt.Errorf("resolving digest for verification of %q: %v", url, derr)
+			}
+			pinned := pinnedImageRef(url, digest.String())
+			if verr := dopts.verifier.VerifyImage(ctx, pinned); verr != nil {
+				return fmt.Errorf("image verification failed for %q: %w", url, verr)
+			}
+			xlog.Info("Image signature verified", "ref", pinned)
+		}
+
+		return oci.ExtractOCIImage(ctx, img, url, filePath, dopts.stagingDir, downloadStatus)
 	}
 
 	// Check for cancellation before starting
@@ -454,42 +701,87 @@ func (uri URI) DownloadFileWithContext(ctx context.Context, filePath, sha string
 				return nil
 			}
 		}
-	} else if !os.IsNotExist(err) || !URI(url).LooksLikeHTTPURL() {
+	} else if !os.IsNotExist(err) || !(URI(url).LooksLikeHTTPURL() || uri.hasLocalSource()) {
 		// Error occurred while checking file existence
-		return fmt.Errorf("file %s does not exist (%v) and %s does not look like an HTTP URL", filePath, err, url)
+		return fmt.Errorf("could not fetch %q: local file does not exist (%v) and %q is not a recognized downloadable URL (supported schemes: %s)", filePath, err, url, strings.Join([]string{HTTPPrefix, HTTPSPrefix, LocalPrefix, HuggingFacePrefix, HuggingFacePrefix1, OllamaPrefix, OCIPrefix, OCIFilePrefix, GithubURI2}, ", "))
 	}
 
 	xlog.Info("Downloading", "url", url)
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := newDownloadRequest(ctx, http.MethodGet, url, dopts.bearerToken)
 	if err != nil {
 		return fmt.Errorf("failed to create request for %q: %v", filePath, err)
 	}
 
 	// save partial download to dedicated file
 	tmpFilePath := filePath + ".partial"
-	tmpFileInfo, err := os.Stat(tmpFilePath)
-	if err == nil && uri.LooksLikeHTTPURL() {
-		support, err := uri.checkSeverSupportsRangeHeader()
-		if err != nil {
-			return fmt.Errorf("failed to check if uri server supports range header: %v", err)
-		}
-		if support {
-			startPos := tmpFileInfo.Size()
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", startPos))
-		} else {
-			err := removePartialFile(tmpFilePath)
-			if err != nil {
-				return err
+	var startPos int64
+	tmpFileInfo, statErr := os.Stat(tmpFilePath)
+	switch {
+	case statErr == nil:
+		// A leftover partial is only usable when we can ask the server to
+		// continue from where it stopped. Resume is probed only for raw
+		// http(s) URIs; every other transport (local files, and schemes we do
+		// not probe) has to restart, because the writer opens the partial with
+		// O_APPEND and would otherwise concatenate a fresh full body onto the
+		// stale bytes. Discarding here is what makes a retry after an
+		// interrupted download recover on its own instead of failing forever.
+		resumable := false
+		if uri.LooksLikeHTTPURL() {
+			support, err := uri.checkServerSupportsRangeHeader(ctx, dopts.bearerToken)
+			if errors.Is(err, credentials.ErrUnresolvedSecret) {
+				return fmt.Errorf("failed to check if uri server supports range header: %w", err)
 			}
+			if err != nil {
+				// The probe only ever fails on transport trouble (the status is
+				// not consulted), so it says nothing permanent about the URL. It
+				// must stay retryable, or a momentarily wedged origin turns a
+				// resumable download into a hard install failure.
+				return asTransient(fmt.Errorf("failed to check if uri server supports range header: %w", err))
+			}
+			resumable = support
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("failed to check file %q existence: %v", filePath, err)
+		if resumable {
+			startPos = tmpFileInfo.Size()
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", startPos))
+		} else if err := removePartialFile(tmpFilePath); err != nil {
+			return err
+		}
+	case errors.Is(statErr, os.ErrNotExist):
+		// Nothing to resume or discard: this is a fresh download.
+	default:
+		return fmt.Errorf("failed to check partial download file %q: %w", tmpFilePath, statErr)
+	}
+
+	// Create parent directory
+	err = os.MkdirAll(filepath.Dir(filePath), 0750)
+	if err != nil {
+		return fmt.Errorf("failed to create parent directory for file %q: %v", filePath, err)
+	}
+
+	// Open the partial and hash its existing bytes BEFORE issuing the request.
+	// The stall watchdog arms the moment the response body exists, and nothing
+	// reads that body while the partial is hashed; on slow storage a multi-GB
+	// partial takes longer to hash than the stall window, so hashing after the
+	// request aborts every resume, and each retry re-pays the same hash and
+	// fails identically, wedging the install permanently. Hashing first also
+	// keeps the origin from idling out the connection during the hash.
+	outFile, err := os.OpenFile(tmpFilePath, os.O_APPEND|os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to create / open file %q: %v", tmpFilePath, err)
+	}
+	defer func() { _ = outFile.Close() }()
+	if err := outFile.Chmod(0600); err != nil {
+		return fmt.Errorf("failed to restrict partial file %q permissions: %v", tmpFilePath, err)
+	}
+	hash, err := calculateHashForPartialFile(outFile)
+	if err != nil {
+		return fmt.Errorf("failed to calculate hash for partial file")
 	}
 
 	var source io.ReadCloser
 	var contentLength int64
-	if _, e := os.Stat(uri.ResolveURL()); strings.HasPrefix(string(uri), LocalPrefix) || e == nil {
+	if uri.hasLocalSource() {
 		file, err := os.Open(uri.ResolveURL())
 		if err != nil {
 			return fmt.Errorf("failed to open file %q: %v", uri.ResolveURL(), err)
@@ -502,85 +794,151 @@ func (uri URI) DownloadFileWithContext(ctx context.Context, filePath, sha string
 		contentLength = l.Size()
 	} else {
 		// Start the request
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := downloadHTTPClient().Do(req)
 		if err != nil {
-			// Check if error is due to context cancellation
-			if errors.Is(err, context.Canceled) {
-				// Clean up partial file on cancellation
-				removePartialFile(tmpFilePath)
-				return err
+			// Detect cancellation via the context, not the returned error: a
+			// request cancelled *with a cause* surfaces the cause error (not
+			// context.Canceled) from the HTTP client. Keep the .partial for
+			// resume on an incidental cancel (shutdown, restart) — large GGUFs
+			// take long enough that deleting progress means they never finish —
+			// but discard it on a deliberate user abort (ErrUserCancelled).
+			if ctx.Err() != nil {
+				if errors.Is(context.Cause(ctx), ErrUserCancelled) {
+					_ = removePartialFile(tmpFilePath)
+				}
+				return ctx.Err()
 			}
-			return fmt.Errorf("failed to download file %q: %v", filePath, err)
+			// An unreadable secret is a configuration problem that a retry
+			// cannot fix.
+			if errors.Is(err, credentials.ErrUnresolvedSecret) {
+				return fmt.Errorf("failed to download file %q: %w", filePath, err)
+			}
+			// The transport failed before the response was established (reset
+			// connection, refused dial, TLS hiccup). Nothing about it is
+			// specific to this URL, so another attempt may well succeed.
+			return asTransient(fmt.Errorf("failed to download file %q: %v", filePath, err))
 		}
 		//defer resp.Body.Close()
 
+		if startPos > 0 && resp.StatusCode != http.StatusPartialContent {
+			_ = resp.Body.Close()
+			_ = removePartialFile(tmpFilePath)
+			// The partial has just been discarded, so a further attempt starts
+			// clean and no longer needs the server to honour the range.
+			return asTransient(fmt.Errorf(
+				"resume request for %q returned status %d instead of 206",
+				filePath,
+				resp.StatusCode,
+			))
+		}
 		if resp.StatusCode >= 400 {
-			return fmt.Errorf("failed to download url %q, invalid status code %d", url, resp.StatusCode)
+			err := fmt.Errorf("failed to download url %q, invalid status code %d", url, resp.StatusCode)
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				_ = resp.Body.Close()
+				// The credentials transport leaves a WithBearerToken header
+				// alone, so a rejection here is about that token, not the store.
+				if dopts.bearerToken != "" {
+					return credentials.HTTPProvidedCredentialError(resp.Request.URL, resp.StatusCode, err)
+				}
+				return credentials.HTTPAuthError(resp.Request.URL, resp.StatusCode, err)
+			}
+			// 5xx and 429 describe the server's current state, not the request;
+			// every other 4xx (missing file, bad auth) is settled and retrying
+			// it only delays the real error.
+			if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
+				return asTransient(err)
+			}
+			return err
 		}
 		source = resp.Body
-		contentLength = resp.ContentLength
+		// Guard against a silently-stalled stream: a dropped TCP connection
+		// that never sends FIN/RST would otherwise block the body Read (and
+		// thus the whole install) forever. The watchdog aborts after a window
+		// of zero progress; the .partial is kept for a later resume.
+		if DownloadStallTimeout > 0 {
+			source = newIdleTimeoutReader(resp.Body, DownloadStallTimeout)
+		}
+		contentLength = resp.ContentLength + startPos
 	}
 	defer source.Close()
 
-	// Create parent directory
-	err = os.MkdirAll(filepath.Dir(filePath), 0750)
-	if err != nil {
-		return fmt.Errorf("failed to create parent directory for file %q: %v", filePath, err)
-	}
-
-	// Create and write file
-	outFile, err := os.OpenFile(tmpFilePath, os.O_APPEND|os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to create / open file %q: %v", tmpFilePath, err)
-	}
-	defer outFile.Close()
-	hash, err := calculateHashForPartialFile(outFile)
-	if err != nil {
-		return fmt.Errorf("failed to calculate hash for partial file")
-	}
 	progress := &progressWriter{
 		fileName:       tmpFilePath,
 		total:          contentLength,
 		hash:           hash,
 		fileNo:         fileN,
 		totalFiles:     total,
+		written:        startPos,
 		downloadStatus: downloadStatus,
+		transferSink:   dopts.transferProgress,
 		ctx:            ctx,
 	}
 
-	_, err = xio.Copy(ctx, io.MultiWriter(outFile, progress), source)
+	// io.Copy reports read and write failures indistinguishably, so the source
+	// is wrapped to record which side actually broke. Labelling a peer-cancelled
+	// HTTP/2 stream "failed to write file" once sent an incident investigation
+	// after filesystem permissions while the disk was perfectly healthy.
+	tracked := &readErrorRecorder{r: source}
+	_, err = xio.Copy(ctx, io.MultiWriter(outFile, progress), tracked)
 	if err != nil {
-		// Check if error is due to context cancellation
-		if errors.Is(err, context.Canceled) {
-			// Clean up partial file on cancellation
-			removePartialFile(tmpFilePath)
-			return err
+		// Detect cancellation via the context (a cause-cancelled read surfaces
+		// the cause, not context.Canceled). Keep the .partial for resume,
+		// except on a deliberate user abort (ErrUserCancelled), which discards
+		// it. A stall-guard abort leaves ctx uncancelled, so it falls through
+		// to the error path below and likewise preserves the partial.
+		if ctx.Err() != nil {
+			if errors.Is(context.Cause(ctx), ErrUserCancelled) {
+				_ = removePartialFile(tmpFilePath)
+			}
+			return ctx.Err()
 		}
-		return fmt.Errorf("failed to write file %q: %v", filePath, err)
+		if readErr := tracked.err; readErr != nil && errors.Is(err, readErr) {
+			// The source died mid-transfer (peer cancelled the stream, the
+			// connection dropped, the stall guard fired). The bytes already on
+			// disk are valid, so the .partial is kept and the failure is
+			// retryable from where it stopped.
+			return asTransient(fmt.Errorf("failed to read %q while downloading to %q: %v", url, tmpFilePath, readErr))
+		}
+		// A genuine local write failure: no space, bad permissions, a broken
+		// mount. Retrying writes the same bytes to the same broken target, so
+		// this stays permanent. Name the partial, which is the file actually
+		// being written, rather than the final blob path.
+		return fmt.Errorf("failed to write file %q: %v", tmpFilePath, err)
 	}
 
-	// Check for cancellation before finalizing
+	// Check for cancellation before finalizing. Keep the .partial for resume
+	// unless the user deliberately aborted.
 	select {
 	case <-ctx.Done():
-		removePartialFile(tmpFilePath)
+		if errors.Is(context.Cause(ctx), ErrUserCancelled) {
+			_ = removePartialFile(tmpFilePath)
+		}
 		return ctx.Err()
 	default:
+	}
+
+	// Invariant: verify the streamed hash before promoting the temp file to
+	// the final path. Renaming first would leave tampered content reachable
+	// to subsequent readers even though we return an error.
+	if sha != "" {
+		calculatedSHA := fmt.Sprintf("%x", progress.hash.Sum(nil))
+		if calculatedSHA != sha {
+			xlog.Debug("SHA mismatch for file", "file", filePath, "calculated", calculatedSHA, "metadata", sha)
+			_ = removePartialFile(tmpFilePath)
+			return asTransient(fmt.Errorf("SHA mismatch for file %q ( calculated: %s != metadata: %s )", filePath, calculatedSHA, sha))
+		}
+	} else {
+		// Visible at the default log level so missing-digest configs are
+		// noticed; silent acceptance was the historical bug.
+		xlog.Warn("downloading without integrity check — supplied SHA is empty",
+			"file", filePath,
+			"url", url,
+		)
 	}
 
 	err = os.Rename(tmpFilePath, filePath)
 	if err != nil {
 		return fmt.Errorf("failed to rename temporary file %s -> %s: %v", tmpFilePath, filePath, err)
-	}
-
-	if sha != "" {
-		// Verify SHA
-		calculatedSHA := fmt.Sprintf("%x", progress.hash.Sum(nil))
-		if calculatedSHA != sha {
-			xlog.Debug("SHA mismatch for file", "file", filePath, "calculated", calculatedSHA, "metadata", sha)
-			return fmt.Errorf("SHA mismatch for file %q ( calculated: %s != metadata: %s )", filePath, calculatedSHA, sha)
-		}
-	} else {
-		xlog.Debug("SHA missing. Skipping validation", "file", filePath)
 	}
 
 	xlog.Info("File downloaded and verified", "file", filePath)

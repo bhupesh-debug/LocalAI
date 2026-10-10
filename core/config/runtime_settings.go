@@ -18,8 +18,8 @@ type RuntimeSettings struct {
 	WatchdogInterval    *string `json:"watchdog_interval,omitempty"` // Interval between watchdog checks (e.g., 2s, 30s)
 
 	// Backend management
-	SingleBackend           *bool `json:"single_backend,omitempty"`      // Deprecated: use MaxActiveBackends = 1 instead
-	MaxActiveBackends       *int  `json:"max_active_backends,omitempty"` // Maximum number of active backends (0 = unlimited, 1 = single backend mode)
+	SingleBackend             *bool `json:"single_backend,omitempty"`              // Deprecated: use MaxActiveBackends = 1 instead
+	MaxActiveBackends         *int  `json:"max_active_backends,omitempty"`         // Maximum number of active backends (0 = unlimited, 1 = single backend mode)
 	AutoUpgradeBackends       *bool `json:"auto_upgrade_backends,omitempty"`       // Automatically upgrade backends when new versions are detected
 	PreferDevelopmentBackends *bool `json:"prefer_development_backends,omitempty"` // Prefer development backend versions by default in UI
 	// Memory Reclaimer settings (works with GPU if available, otherwise RAM)
@@ -28,17 +28,21 @@ type RuntimeSettings struct {
 
 	// Eviction settings
 	ForceEvictionWhenBusy    *bool   `json:"force_eviction_when_busy,omitempty"`    // Force eviction even when models have active API calls (default: false for safety)
+	SizeAwareEviction        *bool   `json:"size_aware_eviction,omitempty"`         // Evict largest models first rather than least-recently-used (default: false)
 	LRUEvictionMaxRetries    *int    `json:"lru_eviction_max_retries,omitempty"`    // Maximum number of retries when waiting for busy models to become idle (default: 30)
 	LRUEvictionRetryInterval *string `json:"lru_eviction_retry_interval,omitempty"` // Interval between retries when waiting for busy models (e.g., 1s, 2s) (default: 1s)
 
 	// Performance settings
-	Threads              *int  `json:"threads,omitempty"`
-	ContextSize          *int  `json:"context_size,omitempty"`
-	F16                  *bool `json:"f16,omitempty"`
-	Debug                *bool `json:"debug,omitempty"`
-	EnableTracing        *bool `json:"enable_tracing,omitempty"`
-	TracingMaxItems      *int  `json:"tracing_max_items,omitempty"`
-	EnableBackendLogging *bool `json:"enable_backend_logging,omitempty"`
+	Threads                     *int    `json:"threads,omitempty"`
+	ContextSize                 *int    `json:"context_size,omitempty"`
+	ArtifactDownloadConcurrency *int    `json:"artifact_download_concurrency,omitempty"`
+	VRAMBudget                  *string `json:"vram_budget,omitempty"` // Cap VRAM for allocation ("80%" or "12GB"; "" = no cap)
+	F16                         *bool   `json:"f16,omitempty"`
+	Debug                       *bool   `json:"debug,omitempty"`
+	EnableTracing               *bool   `json:"enable_tracing,omitempty"`
+	TracingMaxItems             *int    `json:"tracing_max_items,omitempty"`
+	TracingMaxBodyBytes         *int    `json:"tracing_max_body_bytes,omitempty"` // Per-body cap in bytes; 0 disables the cap
+	EnableBackendLogging        *bool   `json:"enable_backend_logging,omitempty"`
 
 	// Security/CORS settings
 	CORS             *bool   `json:"cors,omitempty"`
@@ -55,6 +59,7 @@ type RuntimeSettings struct {
 	BackendGalleries         *[]Gallery `json:"backend_galleries,omitempty"`
 	AutoloadGalleries        *bool      `json:"autoload_galleries,omitempty"`
 	AutoloadBackendGalleries *bool      `json:"autoload_backend_galleries,omitempty"`
+	VRAMPersistentCache      *bool      `json:"vram_persistent_cache,omitempty"`
 
 	// API keys - No omitempty as we need to save empty arrays to clear keys
 	ApiKeys *[]string `json:"api_keys"`
@@ -73,4 +78,38 @@ type RuntimeSettings struct {
 	AgentPoolChunkOverlap     *int    `json:"agent_pool_chunk_overlap,omitempty"`
 	AgentPoolEnableLogs       *bool   `json:"agent_pool_enable_logs,omitempty"`
 	AgentPoolCollectionDBPath *string `json:"agent_pool_collection_db_path,omitempty"`
+	AgentPoolVectorEngine     *string `json:"agent_pool_vector_engine,omitempty"` // chromem | postgres
+	AgentPoolDatabaseURL      *string `json:"agent_pool_database_url,omitempty"`  // PostgreSQL DSN when vector engine is postgres
+	AgentPoolAgentHubURL      *string `json:"agent_pool_agent_hub_url,omitempty"` // override the agenthub.localai.io endpoint
+
+	// Distributed-mode settings. Read LIVE by the SmartRouter on each
+	// scheduling decision, so toggling takes effect on the next placement
+	// without a restart. Stored as the negation of
+	// DistributedConfig.DiskHeadroomDisabled for UI clarity.
+	DistributedDiskHeadroomCheck *bool `json:"distributed_disk_headroom_check,omitempty"` // Reject nodes without room to store the model (default: true)
+
+	// LocalAI Assistant settings — read live by the chat handler at request
+	// entry, so flipping the toggle takes effect on the next request.
+	LocalAIAssistantEnabled *bool `json:"localai_assistant_enabled,omitempty"` // negation of DisableLocalAIAssistant for UI clarity
+
+	// Branding / whitelabeling. Text fields are user-facing; *File fields hold
+	// just the basename of an uploaded asset under {DynamicConfigsDir}/branding/.
+	// All optional — empty values fall back to bundled LocalAI defaults.
+	InstanceName       *string `json:"instance_name,omitempty"`
+	InstanceTagline    *string `json:"instance_tagline,omitempty"`
+	LogoFile           *string `json:"logo_file,omitempty"`
+	LogoHorizontalFile *string `json:"logo_horizontal_file,omitempty"`
+	FaviconFile        *string `json:"favicon_file,omitempty"`
+
+	// Cloud-proxy MITM listener. MITMCADir is intentionally NOT
+	// exposed at runtime — the CA dir is a startup-only path and
+	// changing it after the CA has been generated would orphan
+	// trusted clients.
+	MITMListen *string `json:"mitm_listen,omitempty"`
+
+	// PIIDefaultDetectors are the token-classification detector models applied
+	// to any PII-enabled model that names no detectors of its own (so
+	// cloud-proxy/MITM redaction works without per-model config). No omitempty:
+	// an empty array must round-trip so the operator can clear it from the UI.
+	PIIDefaultDetectors *[]string `json:"pii_default_detectors"`
 }

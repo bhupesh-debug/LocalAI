@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -13,24 +14,38 @@ import (
 )
 
 // fileJobPersister persists tasks and jobs to JSON files.
-// It holds references to the service's syncmaps and serializes the entire
-// map contents on each save (bulk write). Reads at runtime return nil
-// (the in-memory map is the authoritative source); LoadTasks/LoadJobs
-// are used only at startup to bootstrap the syncmaps.
+//
+// Jobs serialize the service's in-memory jobs syncmap on each save (bulk write).
+// Tasks are kept in this persister's own taskSet map instead: the tasks SyncedMap
+// calls SaveTask/DeleteTask while holding its internal lock (write-through), so
+// reading back the SyncedMap here would re-enter that lock and deadlock. The
+// self-contained taskSet, seeded by LoadTasks, lets a per-task write rewrite the
+// whole bulk file without touching the SyncedMap.
+//
+// Runtime reads (GetJob/ListJobs) return nil (the in-memory state is the
+// authoritative source); LoadTasks/LoadJobs bootstrap state at startup.
 type fileJobPersister struct {
-	tasks     *xsync.SyncedMap[string, schema.Task]
 	jobs      *xsync.SyncedMap[string, schema.Job]
 	tasksFile string
 	jobsFile  string
 	mu        sync.Mutex
+	// taskSet is the persister's own view of all tasks, seeded by LoadTasks and
+	// updated by SaveTask/DeleteTask. The bulk JSON file is rewritten from it.
+	taskSet map[string]schema.Task
 }
 
-func (p *fileJobPersister) SaveTask(_ string, _ schema.Task) error {
-	return p.saveTasksToFile()
+func (p *fileJobPersister) SaveTask(_ string, task schema.Task) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.taskSet[task.ID] = task
+	return p.writeTasksLocked()
 }
 
-func (p *fileJobPersister) DeleteTask(_ string) error {
-	return p.saveTasksToFile()
+func (p *fileJobPersister) DeleteTask(taskID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.taskSet, taskID)
+	return p.writeTasksLocked()
 }
 
 func (p *fileJobPersister) SaveJob(_ string, _ schema.Job) error {
@@ -38,6 +53,16 @@ func (p *fileJobPersister) SaveJob(_ string, _ schema.Job) error {
 }
 
 func (p *fileJobPersister) DeleteJob(_ string) error {
+	return p.saveJobsToFile()
+}
+
+func (p *fileJobPersister) FlushTasks() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.writeTasksLocked()
+}
+
+func (p *fileJobPersister) FlushJobs() error {
 	return p.saveJobsToFile()
 }
 
@@ -72,6 +97,12 @@ func (p *fileJobPersister) LoadTasks(_ string) ([]schema.Task, error) {
 	var tf schema.TasksFile
 	if err := json.Unmarshal(data, &tf); err != nil {
 		return nil, fmt.Errorf("failed to parse tasks file: %w", err)
+	}
+
+	// Seed the in-memory set so subsequent per-task SaveTask/DeleteTask merge into
+	// (rather than overwrite) the persisted tasks when the bulk file is rewritten.
+	for _, t := range tf.Tasks {
+		p.taskSet[t.ID] = t
 	}
 
 	xlog.Info("Loaded tasks from file", "count", len(tf.Tasks))
@@ -109,25 +140,26 @@ func (p *fileJobPersister) CleanupOldJobs(_ time.Duration) (int64, error) {
 	return 0, nil // cleanup handled via in-memory filtering
 }
 
-// saveTasksToFile serializes the entire tasks map to the JSON file.
-func (p *fileJobPersister) saveTasksToFile() error {
+// writeTasksLocked serializes the persister's task set to the JSON file. Callers
+// must hold p.mu.
+func (p *fileJobPersister) writeTasksLocked() error {
 	if p.tasksFile == "" {
 		return nil
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	tf := schema.TasksFile{
-		Tasks: p.tasks.Values(),
+	tasks := make([]schema.Task, 0, len(p.taskSet))
+	for _, t := range p.taskSet {
+		tasks = append(tasks, t)
 	}
+
+	tf := schema.TasksFile{Tasks: tasks}
 
 	data, err := json.MarshalIndent(tf, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal tasks: %w", err)
 	}
 
-	return os.WriteFile(p.tasksFile, data, 0600)
+	return writeFileAtomic(p.tasksFile, data, 0600)
 }
 
 // saveJobsToFile serializes the entire jobs map to the JSON file.
@@ -149,5 +181,45 @@ func (p *fileJobPersister) saveJobsToFile() error {
 		return fmt.Errorf("failed to marshal jobs: %w", err)
 	}
 
-	return os.WriteFile(p.jobsFile, data, 0600)
+	return writeFileAtomic(p.jobsFile, data, 0600)
+}
+
+// writeFileAtomic writes data to path via a same-directory temp file + rename.
+// os.WriteFile opens with O_TRUNC, so a concurrent reader can land between the
+// truncate and the write and see an empty file ("unexpected end of JSON input").
+// rename(2) is atomic on POSIX, so readers see either the prior contents or the
+// new contents and never a zero-byte window.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	removeTmp := func() { _ = os.Remove(tmpPath) }
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		removeTmp()
+		return fmt.Errorf("failed to write temp file: %w", err)
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		removeTmp()
+		return fmt.Errorf("failed to chmod temp file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		removeTmp()
+		return fmt.Errorf("failed to sync temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		removeTmp()
+		return fmt.Errorf("failed to close temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		removeTmp()
+		return fmt.Errorf("failed to rename temp file: %w", err)
+	}
+	return nil
 }

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
-import { useParams, useNavigate, useOutletContext, useSearchParams } from 'react-router-dom'
+import { useParams, useNavigate, useOutletContext, useSearchParams, useLocation } from 'react-router-dom'
 import YAML from 'yaml'
 import { modelsApi } from '../utils/api'
 import { apiUrl } from '../utils/basePath'
@@ -9,31 +9,41 @@ import LoadingSpinner from '../components/LoadingSpinner'
 import CodeEditor from '../components/CodeEditor'
 import FieldBrowser from '../components/FieldBrowser'
 import ConfigFieldRenderer from '../components/ConfigFieldRenderer'
+import { FormContextProvider } from '../contexts/FormContext'
 import TemplateSelector from '../components/TemplateSelector'
+import { ModelFailoverStatus } from '../components/FailoverChainStatus'
+// eslint-disable-next-line no-unused-vars
+import PlacementSection from '../components/models/placement/PlacementSection'
 import MODEL_TEMPLATES from '../utils/modelTemplates'
+import { useTranslation } from 'react-i18next'
+import Icon from '../components/Icon'
 
 const SECTION_ICONS = {
-  general: 'fa-cog', llm: 'fa-microchip', parameters: 'fa-sliders',
-  templates: 'fa-file-code', functions: 'fa-wrench', reasoning: 'fa-brain',
-  diffusers: 'fa-image', tts: 'fa-volume-up', pipeline: 'fa-code-branch',
-  grpc: 'fa-server', agent: 'fa-robot', mcp: 'fa-plug', other: 'fa-ellipsis-h',
+  general: 'settings', llm: 'cpu', parameters: 'sliders',
+  templates: 'file-code', functions: 'wrench', reasoning: 'brain',
+  diffusers: 'image', tts: 'volume', pipeline: 'git-branch',
+  grpc: 'server', agent: 'robot', mcp: 'plug', router: 'route', proxy: 'cloud',
+  mitm: 'user-secret', pii: 'user-shield', failover: 'shuffle', other: 'more',
 }
 
-const SECTION_COLORS = {
-  general: 'var(--color-primary)', llm: 'var(--color-accent)', parameters: 'var(--color-success)',
-  templates: 'var(--color-warning)', functions: 'var(--color-info, var(--color-primary))',
-  reasoning: 'var(--color-accent)', diffusers: 'var(--color-warning)', tts: 'var(--color-success)',
-  pipeline: 'var(--color-accent)', grpc: 'var(--color-text-muted)', agent: 'var(--color-primary)',
-  mcp: 'var(--color-accent)', other: 'var(--color-text-muted)',
-}
 
-function flattenConfig(obj, prefix = '') {
+// flattenConfig turns a parsed YAML config into a flat { 'a.b.c': value }
+// map keyed by the same dotted paths the field registry uses. leafPaths is
+// the set of registered schema leaf paths: recursion STOPS at any of them so
+// a map-typed field (e.g. pii_detection.entity_actions, a {GROUP: action}
+// object) is stored whole at its own path. Without this guard a map's value
+// was scattered into `pii_detection.entity_actions.SSN` etc. — paths that
+// match no registered field — so the editor rendered neither the field nor
+// its values, hiding per-entity policy like SSN→block from the operator.
+function flattenConfig(obj, leafPaths, prefix = '') {
   const result = {}
   if (!obj || typeof obj !== 'object') return result
   for (const [key, val] of Object.entries(obj)) {
     const path = prefix ? `${prefix}.${key}` : key
-    if (val !== null && typeof val === 'object' && !Array.isArray(val)) {
-      Object.assign(result, flattenConfig(val, path))
+    if (leafPaths && leafPaths.has(path)) {
+      result[path] = val
+    } else if (val !== null && typeof val === 'object' && !Array.isArray(val)) {
+      Object.assign(result, flattenConfig(val, leafPaths, path))
     } else {
       result[path] = val
     }
@@ -67,11 +77,27 @@ function defaultForType(uiType) {
 }
 
 export default function ModelEditor() {
+  const { t } = useTranslation('modelEditor')
+  const { t: tModels } = useTranslation('models')
   const { name } = useParams()
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
+  const location = useLocation()
+  // Where the Back button returns to. Set by whichever page linked here (see
+  // utils/editorNav); falls back to the historical defaults for direct visits.
+  const backState = location.state && location.state.from ? location.state : null
   const { addToast } = useOutletContext()
   const { sections, fields, loading: metaLoading, error: metaError } = useConfigMetadata()
+
+  // Registered schema leaf paths. flattenConfig stops recursing at these so
+  // map-typed fields (e.g. pii_detection.entity_actions) bind as a whole
+  // object to their registered editor instead of vanishing into sub-paths.
+  const leafPaths = useMemo(() => new Set(fields.map(f => f.path)), [fields])
+
+  // The parsed (not-yet-flattened) config loaded from the server. Flattening
+  // is deferred to a separate effect keyed on leafPaths so the schema metadata
+  // can arrive after the config without a fetch race re-clobbering values.
+  const [loadedConfig, setLoadedConfig] = useState(null)
 
   const isCreateMode = !name
   const [selectedTemplate, setSelectedTemplate] = useState(null)
@@ -87,8 +113,10 @@ export default function ModelEditor() {
   const [saving, setSaving] = useState(false)
   const [activeSection, setActiveSection] = useState(null)
   const [tabSwitchWarning, setTabSwitchWarning] = useState(false)
+  // Keys the Placement section unset. A patch only merges what it is given, so
+  // an unset key has to be sent as null for the file to lose it.
+  const [clearedPaths, setClearedPaths] = useState(new Set())
 
-  const contentRef = useRef(null)
   const sectionRefs = useRef({})
 
   const vramEstimate = useVramEstimate({
@@ -115,7 +143,9 @@ export default function ModelEditor() {
     }
   }, [isCreateMode, searchParams, handleSelectTemplate])
 
-  // Load raw YAML config (edit mode only)
+  // Load raw YAML config (edit mode only). This only fetches + parses; the
+  // flatten-into-form-values step is the separate effect below so it can
+  // re-run when the schema metadata (leafPaths) resolves without re-fetching.
   useEffect(() => {
     if (!name) return
     modelsApi.getEditConfig(name)
@@ -123,25 +153,33 @@ export default function ModelEditor() {
         const raw = data?.config || ''
         setYamlText(raw)
         setSavedYamlText(raw)
-
-        // Parse YAML to get only the fields actually present in the file
         try {
-          const parsed = YAML.parse(raw)
-          const flat = flattenConfig(parsed || {})
-          const active = new Set(Object.keys(flat))
-          setValues(flat)
-          setInitialValues(structuredClone(flat))
-          setActiveFieldPaths(active)
+          setLoadedConfig(YAML.parse(raw) || {})
         } catch {
-          // If YAML parsing fails, start with empty state
-          setValues({})
-          setInitialValues({})
-          setActiveFieldPaths(new Set())
+          setLoadedConfig({})
         }
       })
       .catch(err => addToast(`Failed to load config: ${err.message}`, 'error'))
       .finally(() => setConfigLoading(false))
   }, [name, addToast])
+
+  // Flatten the loaded config into form values. Keyed on leafPaths so a late
+  // schema-metadata resolution re-flattens (keeping map fields whole) WITHOUT
+  // re-fetching — avoiding a two-fetch race that could clobber values. Only
+  // fires on (re)load: loadedConfig changes per model, leafPaths is stable
+  // once metadata is in, so this never stomps in-progress edits.
+  useEffect(() => {
+    if (loadedConfig === null) return
+    const flat = flattenConfig(loadedConfig, leafPaths)
+    // A key the Placement section set back to Auto is stored as null, which
+    // means unset. It must not come back as a field with a value.
+    for (const key of ['gpu_layers', 'tensor_split', 'main_gpu']) {
+      if (flat[key] === null) delete flat[key]
+    }
+    setValues(flat)
+    setInitialValues(structuredClone(flat))
+    setActiveFieldPaths(new Set(Object.keys(flat)))
+  }, [loadedConfig, leafPaths])
 
   // Build field lookup
   const fieldsByPath = useMemo(() => {
@@ -186,25 +224,29 @@ export default function ModelEditor() {
     }
   }, [activeSection, activeSections])
 
-  // Scroll tracking
+  // Scroll tracking — the editor used to have its own overflow:auto pane
+  // and listened to that container's scroll; the pane has been removed so
+  // small screens don't have the global footer always clipping into the
+  // form. Scrolling now happens at the window level, and the anchor for
+  // "which section is at the top" is a fixed viewport offset (the sticky
+  // sidebar sits roughly at the top of the editor area).
   useEffect(() => {
-    const container = contentRef.current
-    if (!container || tab !== 'interactive') return
+    if (tab !== 'interactive') return
     const onScroll = () => {
-      const containerTop = container.getBoundingClientRect().top
+      const anchorY = 80 // viewport px below which a section is "active"
       let closest = activeSections[0]?.id
       let closestDist = Infinity
       for (const s of activeSections) {
         const el = sectionRefs.current[s.id]
         if (el) {
-          const dist = Math.abs(el.getBoundingClientRect().top - containerTop - 8)
+          const dist = Math.abs(el.getBoundingClientRect().top - anchorY)
           if (dist < closestDist) { closestDist = dist; closest = s.id }
         }
       }
       if (closest) setActiveSection(closest)
     }
-    container.addEventListener('scroll', onScroll, { passive: true })
-    return () => container.removeEventListener('scroll', onScroll)
+    window.addEventListener('scroll', onScroll, { passive: true })
+    return () => window.removeEventListener('scroll', onScroll)
   }, [activeSections, configLoading, metaLoading, tab])
 
   const scrollTo = (id) => {
@@ -229,16 +271,16 @@ export default function ModelEditor() {
     if (isCreateMode) return null
     if (vramEstimate.loading) {
       return (
-        <div style={{ fontSize: '0.6875rem', color: 'var(--color-text-muted)', marginTop: 4 }}>
-          <i className="fas fa-spinner fa-spin" style={{ marginRight: 4 }} />
+        <div className="text-meta mt-xs">
+          <Icon name="spinner" spin className="icon-before" />
           Estimating VRAM...
         </div>
       )
     }
     if (vramEstimate.vramDisplay) {
       return (
-        <div style={{ fontSize: '0.6875rem', color: 'var(--color-warning)', marginTop: 4, fontWeight: 500 }}>
-          <i className="fas fa-memory" style={{ marginRight: 4 }} />
+        <div className="text-xs text-warning fw-medium mt-xs">
+          <Icon name="memory" className="icon-before" />
           ~{vramEstimate.vramDisplay} VRAM
         </div>
       )
@@ -254,6 +296,16 @@ export default function ModelEditor() {
       for (const path of activeFieldPaths) {
         if (path in values) patchFlat[path] = values[path]
       }
+      if (!isCreateMode) {
+        // Only a key the file had needs removing; one that was never there does not.
+        for (const path of clearedPaths) if (path in initialValues && !(path in patchFlat)) patchFlat[path] = null
+      }
+      if (patchFlat['router.classifier'] === 'decisions') {
+        const available = await modelsApi.listNativeCapabilities()
+        if (!available?.data?.some(m => m.id === patchFlat['router.classifier_model'] && m.capabilities?.includes('decisions'))) {
+          throw new Error('Select an eligible native Decisions classifier model')
+        }
+      }
       const config = unflattenConfig(patchFlat)
 
       if (isCreateMode) {
@@ -262,10 +314,13 @@ export default function ModelEditor() {
         if (!/^[a-zA-Z0-9_.-]+$/.test(modelName.trim())) { addToast('Invalid model name — use only letters, numbers, hyphens, underscores, and dots', 'error'); setSaving(false); return }
         await modelsApi.importConfig(JSON.stringify(config), 'application/json')
         addToast('Model created successfully', 'success')
-        navigate(`/app/model-editor/${encodeURIComponent(modelName.trim())}`)
+        // replace: the transient create URL shouldn't sit in history, so
+        // Back (browser or in-page) skips it and returns to the linking page.
+        navigate(`/app/model-editor/${encodeURIComponent(modelName.trim())}`, { replace: true, state: backState })
       } else {
         await modelsApi.patchConfig(name, config)
         setInitialValues(structuredClone(values))
+        setClearedPaths(new Set())
         try {
           const data = await modelsApi.getEditConfig(name)
           const refreshedYaml = data?.config || ''
@@ -292,9 +347,9 @@ export default function ModelEditor() {
         addToast('Model created successfully', 'success')
         try {
           const parsed = YAML.parse(yamlText)
-          if (parsed?.name) navigate(`/app/model-editor/${encodeURIComponent(parsed.name)}`)
-          else navigate('/app/manage')
-        } catch { navigate('/app/manage') }
+          if (parsed?.name) navigate(`/app/model-editor/${encodeURIComponent(parsed.name)}`, { replace: true, state: backState })
+          else navigate(backState ? backState.from : '/app/models?view=installed')
+        } catch { navigate(backState ? backState.from : '/app/models?view=installed') }
       } else {
         const response = await fetch(apiUrl(`/models/edit/${encodeURIComponent(name)}`), {
           method: 'POST',
@@ -311,7 +366,7 @@ export default function ModelEditor() {
         try {
           const parsed = YAML.parse(yamlText)
           parsedName = parsed?.name ?? null
-          const flat = flattenConfig(parsed || {})
+          const flat = flattenConfig(parsed || {}, leafPaths)
           setValues(flat)
           setInitialValues(structuredClone(flat))
           setActiveFieldPaths(new Set(Object.keys(flat)))
@@ -322,7 +377,7 @@ export default function ModelEditor() {
         // editor URL points at a name that no longer exists on the backend.
         // Redirect so refreshes and subsequent saves hit the new name.
         if (parsedName && parsedName !== name) {
-          navigate(`/app/model-editor/${encodeURIComponent(parsedName)}`, { replace: true })
+          navigate(`/app/model-editor/${encodeURIComponent(parsedName)}`, { replace: true, state: backState })
         }
       }
     } catch (err) {
@@ -367,7 +422,29 @@ export default function ModelEditor() {
   }
 
   const handleFieldChange = (path, val) => {
-    setValues(prev => ({ ...prev, [path]: val }))
+    setValues(prev => {
+      const next = { ...prev, [path]: val }
+      // A classifier change invalidates its dependent model, not a tuned threshold.
+      if (prev[path] !== val) {
+        for (const field of fields) {
+          if (field.autocomplete_by?.field === path) next[field.path] = ''
+        }
+      }
+      return next
+    })
+  }
+
+  // The Placement section sets a key or, with undefined, unsets it.
+  const handlePlacementChange = (path, val) => {
+    if (val === undefined) {
+      setActiveFieldPaths(prev => { const next = new Set(prev); next.delete(path); return next })
+      setValues(prev => { const next = { ...prev }; delete next[path]; return next })
+      setClearedPaths(prev => new Set(prev).add(path))
+      return
+    }
+    setActiveFieldPaths(prev => new Set(prev).add(path))
+    setClearedPaths(prev => { if (!prev.has(path)) return prev; const next = new Set(prev); next.delete(path); return next })
+    handleFieldChange(path, val)
   }
 
   const toggleSection = (id) => {
@@ -382,43 +459,49 @@ export default function ModelEditor() {
   const loading = metaLoading || configLoading
   const showTemplateSelector = isCreateMode && !selectedTemplate
 
-  if (loading) return <div className="page" style={{ display: 'flex', justifyContent: 'center', padding: 'var(--spacing-xl)' }}><LoadingSpinner size="lg" /></div>
-  if (metaError) return <div className="page"><div className="empty-state"><p className="empty-state-text">Failed to load config metadata: {metaError}</p></div></div>
+  if (loading) return <div className="page page--medium loading-center"><LoadingSpinner size="lg" /></div>
+  if (metaError) return <div className="page page--medium"><div className="empty-state"><p className="empty-state-text">Failed to load config metadata: {metaError}</p></div></div>
+
+  const backPage = isCreateMode && selectedTemplate ? t('actions.templates')
+    : backState ? backState.fromLabel
+    : t('actions.models')
 
   return (
-    <div className="page" style={{ maxWidth: 1000, padding: 0 }}>
+    <FormContextProvider formData={values}>
+    <div className="page page--medium p-0">
       {/* Header */}
-      <div style={{
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        padding: 'var(--spacing-lg) var(--spacing-lg) var(--spacing-md)',
-      }}>
+      <div className="me-head">
         <div>
-          <h1 className="page-title">{isCreateMode ? 'Add Model' : 'Model Editor'}</h1>
+          <h1 className="page-title">{isCreateMode ? t('title.add') : t('title.edit')}</h1>
           <p className="page-subtitle">
             {isCreateMode
-              ? (showTemplateSelector ? 'Choose a model type to get started' : `New model${selectedTemplate ? ` — ${selectedTemplate.label}` : ''}`)
-              : decodeURIComponent(name)}
+              ? (showTemplateSelector ? t('subtitle.chooseModelType') : `${t('subtitle.newModel')}${selectedTemplate ? ` — ${selectedTemplate.label}` : ''}`)
+              : name}
           </p>
         </div>
-        <div style={{ display: 'flex', gap: 'var(--spacing-sm)' }}>
+        <div className="hstack">
           <button className="btn btn-secondary" onClick={() => {
             if (isCreateMode && selectedTemplate) { setSelectedTemplate(null); setValues({}); setActiveFieldPaths(new Set()) }
-            else navigate(isCreateMode ? '/app/models' : '/app/manage')
+            else if (backState) navigate(backState.from)
+            else navigate(isCreateMode ? '/app/models' : '/app/models?view=installed')
           }}>
-            <i className="fas fa-arrow-left" /> Back
+            <Icon name="arrow-left" /> {t('actions.backTo', {page: backPage})}
           </button>
           {!showTemplateSelector && tab === 'interactive' && (
             <button className={`btn ${isDirty ? 'btn-primary' : 'btn-secondary'}`} onClick={handleInteractiveSave} disabled={saving || !isDirty}>
-              {saving ? <><LoadingSpinner size="sm" /> Saving...</> : <><i className="fas fa-save" /> {isCreateMode ? 'Create Model' : (isDirty ? 'Save Changes' : 'Saved')}</>}
+              {saving ? <><LoadingSpinner size="sm" /> {t('actions.saving')}</> : <><Icon name="save" /> {isCreateMode ? t('actions.createModel') : (isDirty ? t('actions.saveChanges') : t('actions.saved'))}</>}
             </button>
           )}
           {!showTemplateSelector && tab === 'yaml' && (
             <button className={`btn ${isDirty ? 'btn-primary' : 'btn-secondary'}`} onClick={handleYamlSave} disabled={saving || !isDirty}>
-              {saving ? <><LoadingSpinner size="sm" /> Saving...</> : <><i className="fas fa-save" /> {isCreateMode ? 'Create Model' : (isDirty ? 'Save Changes' : 'Saved')}</>}
+              {saving ? <><LoadingSpinner size="sm" /> {t('actions.saving')}</> : <><Icon name="save" /> {isCreateMode ? t('actions.createModel') : (isDirty ? t('actions.saveChanges') : t('actions.saved'))}</>}
             </button>
           )}
         </div>
       </div>
+
+      {/* Live failover health; renders only when this model is a chain */}
+      {!isCreateMode && <ModelFailoverStatus name={name} addToast={addToast} />}
 
       {/* Template selector (create mode, step 1) */}
       {showTemplateSelector && <TemplateSelector onSelect={handleSelectTemplate} />}
@@ -426,63 +509,46 @@ export default function ModelEditor() {
       {/* Tabs (hidden during template selection) */}
       {!showTemplateSelector && (
         <div>
-          <div style={{
-            display: 'flex', gap: 0, padding: '0 var(--spacing-lg)',
-            borderBottom: '1px solid var(--color-border)',
-          }}>
-            {['interactive', 'yaml'].map(t => {
-              const active = tab === t
+          <div className="me-tabs">
+            {['interactive', 'yaml'].map(tb => {
+              const active = tab === tb
               const blocked = !active && isDirty
               return (
                 <button
-                  key={t}
+                  key={tb}
                   onClick={() => {
                     if (active) return
                     if (blocked) { setTabSwitchWarning(true); return }
                     setTabSwitchWarning(false)
-                    setTab(t)
+                    setTab(tb)
                   }}
-                  style={{
-                    padding: '8px 16px', border: 'none',
-                    cursor: blocked ? 'not-allowed' : 'pointer',
-                    background: 'transparent', fontSize: '0.875rem',
-                    fontWeight: active ? 600 : 400,
-                    opacity: blocked ? 0.5 : 1,
-                    color: active ? 'var(--color-primary)' : 'var(--color-text-secondary)',
-                    borderBottom: active ? '2px solid var(--color-primary)' : '2px solid transparent',
-                    transition: 'all 150ms',
-                  }}
+                  className={`me-tab${active ? ' me-tab--on' : ''}${blocked ? ' me-tab--blocked' : ''}`}
                 >
-                  <i className={`fas ${t === 'interactive' ? 'fa-sliders' : 'fa-code'}`} style={{ marginRight: 6 }} />
-                  {t === 'interactive' ? 'Interactive' : 'YAML'}
+                  <Icon name={tb === 'interactive' ? 'sliders' : 'code'} className="icon-before" />
+                  {tb === 'interactive' ? t('tabs.interactive') : t('tabs.yaml')}
                 </button>
               )
             })}
           </div>
           {tabSwitchWarning && isDirty && (
-            <div style={{
-              display: 'flex', alignItems: 'center', gap: 'var(--spacing-sm)',
-              padding: 'var(--spacing-sm) var(--spacing-lg)',
-              fontSize: '0.8125rem', color: 'var(--color-warning, #f59e0b)',
-              background: 'var(--color-warning-light, rgba(245, 158, 11, 0.08))',
-            }}>
-              <i className="fas fa-exclamation-triangle" />
-              <span>Save or discard changes before switching tabs.</span>
+            <div className="me-warn">
+              <Icon name="warning" />
+              <span>{t('actions.switchWarning')}</span>
               <button
-                className="btn btn-secondary"
-                style={{ marginLeft: 'auto', padding: '2px 10px', fontSize: '0.75rem' }}
+                className="btn btn-secondary ml-auto pill-tiny"
                 onClick={() => {
                   if (tab === 'yaml') {
                     setYamlText(savedYamlText)
                   } else {
                     setValues(structuredClone(initialValues))
                     setActiveFieldPaths(new Set(Object.keys(initialValues)))
+                    setClearedPaths(new Set())
                   }
                   setTabSwitchWarning(false)
                   setTab(tab === 'yaml' ? 'interactive' : 'yaml')
                 }}
               >
-                Discard &amp; Switch
+                {t('actions.discardAndSwitch')}
               </button>
             </div>
           )}
@@ -491,10 +557,10 @@ export default function ModelEditor() {
 
       {/* YAML Tab */}
       {!showTemplateSelector && tab === 'yaml' && (
-        <div style={{ padding: '0 var(--spacing-lg) var(--spacing-lg)' }}>
+        <div className="me-pad--bottom">
           {isCreateMode && (
-            <p style={{ fontSize: '0.8125rem', color: 'var(--color-text-secondary)', marginBottom: 'var(--spacing-sm)' }}>
-              Edit the YAML directly. The model name must be set in the YAML for create to work.
+            <p className="text-sub mb-sm">
+              {t('tabs.yamlDescription')}
             </p>
           )}
           <CodeEditor
@@ -511,29 +577,28 @@ export default function ModelEditor() {
         <>
           {/* Model name input (create mode) */}
           {isCreateMode && (
-            <div style={{ padding: '0 var(--spacing-lg)', marginBottom: 'var(--spacing-md)' }}>
-              <div className="card" style={{ padding: 'var(--spacing-md)' }}>
-                <label className="form-label" style={{ fontWeight: 600 }}>
-                  <i className="fas fa-tag" style={{ marginRight: '6px', color: 'var(--color-primary)' }} />
-                  Model Name
+            <div className="me-pad mb-md">
+              <div className="card pad-md">
+                <label className="form-label fw-semibold">
+                  <Icon name="tag" className="icon-before text-primary" />
+                  {t('forms.modelName.label')}
                 </label>
                 <input
-                  className="input"
+                  className="input max-w-400"
                   type="text"
                   value={values['name'] || ''}
                   onChange={e => handleFieldChange('name', e.target.value)}
-                  placeholder="my-model-name"
-                  style={{ maxWidth: 400 }}
+                  placeholder={t('forms.modelName.placeholder')}
                 />
-                <p style={{ marginTop: '4px', fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
-                  Use letters, numbers, hyphens, underscores, and dots only.
+                <p className="text-meta mt-xs">
+                  {t('forms.modelName.hint')}
                 </p>
               </div>
             </div>
           )}
 
           {/* Field browser */}
-          <div style={{ padding: '0 var(--spacing-lg)' }}>
+          <div className="me-pad">
             <FieldBrowser
               fields={fields}
               activeFieldPaths={activeFieldPaths}
@@ -541,60 +606,71 @@ export default function ModelEditor() {
             />
           </div>
 
-          {/* Two-column layout */}
-          <div style={{ display: 'flex', gap: 0, minHeight: 'calc(100vh - 340px)' }}>
-            {/* Sidebar */}
-            <nav style={{
-              width: 180, flexShrink: 0, padding: '0 var(--spacing-sm)',
-              position: 'sticky', top: 0, alignSelf: 'flex-start',
-            }}>
+          {/* Two-column layout. Both columns flow at body-scroll height —
+              no inner overflow:auto here, so the global footer ends up
+              below the content (like every other page) instead of pinned
+              to the viewport bottom, eating editing space on short screens. */}
+          <div className="set-layout">
+            {/* Sidebar — sticks to the top of the viewport as the body scrolls. */}
+            <nav className="set-rail">
+              {!isCreateMode && (
+                <button
+                  onClick={() => scrollTo('placement')}
+                  className={`set-rail__item${activeSection === 'placement' ? ' set-rail__item--on' : ''}`}
+                  data-testid="rail-placement"
+                >
+                  <Icon name="cpu" className="set-rail__icon" />
+                  {tModels('placement.title')}
+                </button>
+              )}
               {activeSections.map(s => (
                 <button
                   key={s.id}
                   onClick={() => scrollTo(s.id)}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: 'var(--spacing-sm)',
-                    width: '100%', padding: '8px 12px',
-                    background: activeSection === s.id ? 'var(--color-primary-light)' : 'transparent',
-                    border: 'none', borderRadius: 'var(--radius-md)', cursor: 'pointer',
-                    color: activeSection === s.id ? 'var(--color-primary)' : 'var(--color-text-secondary)',
-                    fontSize: '0.8125rem', fontWeight: activeSection === s.id ? 600 : 400,
-                    textAlign: 'left', transition: 'all 150ms', marginBottom: 2,
-                    borderLeft: activeSection === s.id ? '2px solid var(--color-primary)' : '2px solid transparent',
-                  }}
+                  className={`set-rail__item${activeSection === s.id ? ' set-rail__item--on' : ''}`}
                 >
-                  <i className={`fas ${SECTION_ICONS[s.id] || 'fa-cog'}`} style={{
-                    width: 16, textAlign: 'center', fontSize: '0.75rem',
-                    color: activeSection === s.id ? (SECTION_COLORS[s.id] || 'var(--color-primary)') : 'var(--color-text-muted)',
-                  }} />
+                  <Icon name={SECTION_ICONS[s.id] || 'settings'} className="set-rail__icon" />
                   {s.label}
-                  <span style={{ marginLeft: 'auto', fontSize: '0.6875rem', color: 'var(--color-text-muted)' }}>
+                  <span className="ml-auto text-meta">
                     {fieldsBySection[s.id]?.length || 0}
                   </span>
                 </button>
               ))}
               {activeSections.length === 0 && (
-                <div style={{ padding: '12px', fontSize: '0.8125rem', color: 'var(--color-text-muted)' }}>
-                  Use the search bar above to add fields
+                <div className="text-note pad-sm">
+                  {t('forms.empty.nav')}
                 </div>
               )}
             </nav>
 
             {/* Content */}
             <div
-              ref={contentRef}
-              style={{
-                flex: 1, overflow: 'auto', padding: '0 var(--spacing-lg) var(--spacing-xl) var(--spacing-md)',
-                maxHeight: 'calc(100vh - 340px)',
-              }}
+              className="me-body"
             >
+              {!isCreateMode && (
+                <div ref={el => { sectionRefs.current.placement = el }} className="mb-xl">
+                  <div className="card pad-md" data-testid="editor-placement">
+                    <PlacementSection
+                      model={name}
+                      values={{
+                        gpu_layers: values['gpu_layers'],
+                        tensor_split: values['tensor_split'],
+                        main_gpu: values['main_gpu'],
+                        context_size: values['context_size'],
+                      }}
+                      onChange={handlePlacementChange}
+                    />
+                  </div>
+                </div>
+              )}
+
               {activeSections.length === 0 && (
-                <div className="card" style={{ padding: 'var(--spacing-xl)', textAlign: 'center' }}>
-                  <i className="fas fa-sliders" style={{ fontSize: '2rem', color: 'var(--color-text-muted)', marginBottom: 'var(--spacing-md)' }} />
-                  <h3 style={{ marginBottom: 'var(--spacing-sm)' }}>No fields configured</h3>
-                  <p style={{ color: 'var(--color-text-secondary)', fontSize: '0.875rem' }}>
-                    Use the search bar above to find and add configuration fields.
-                  </p>
+                // .loading-center is a flex row, which set the icon, the title and
+                // the text side by side with no gap; this is a stacked empty state.
+                <div className="dk-empty" data-testid="editor-no-fields">
+                  <div className="dk-empty-icon"><Icon name="sliders" /></div>
+                  <h3 className="dk-empty-title">{t('forms.empty.title')}</h3>
+                  <p className="dk-empty-text">{t('forms.empty.text')}</p>
                 </div>
               )}
 
@@ -602,21 +678,15 @@ export default function ModelEditor() {
                 const sectionFields = fieldsBySection[s.id] || []
                 const isCollapsed = collapsedSections.has(s.id)
                 return (
-                  <div key={s.id} ref={el => sectionRefs.current[s.id] = el} style={{ marginBottom: 'var(--spacing-xl)' }}>
+                  <div key={s.id} ref={el => sectionRefs.current[s.id] = el} className="mb-xl">
                     <h3
                       onClick={() => toggleSection(s.id)}
-                      style={{
-                        fontSize: '1rem', fontWeight: 700, cursor: 'pointer', userSelect: 'none',
-                        display: 'flex', alignItems: 'center', gap: 'var(--spacing-sm)',
-                        marginBottom: isCollapsed ? 0 : 'var(--spacing-md)',
-                      }}
+                      className={`me-section-head${isCollapsed ? ' me-section-head--collapsed' : ''}`}
                     >
-                      <i className={`fas ${isCollapsed ? 'fa-chevron-right' : 'fa-chevron-down'}`}
-                        style={{ fontSize: '0.625rem', width: 12, color: 'var(--color-text-muted)' }} />
-                      <i className={`fas ${SECTION_ICONS[s.id] || 'fa-cog'}`}
-                        style={{ color: SECTION_COLORS[s.id] || 'var(--color-primary)' }} />
+                      <Icon name={isCollapsed ? 'chevron-right' : 'chevron-down'} className="me-chevron" />
+                      <Icon name={SECTION_ICONS[s.id] || 'settings'} className="me-section-icon" />
                       {s.label}
-                      <span style={{ fontSize: '0.75rem', fontWeight: 400, color: 'var(--color-text-muted)' }}>
+                      <span className="text-xs fw-normal text-muted">
                         ({sectionFields.length})
                       </span>
                     </h3>
@@ -642,5 +712,6 @@ export default function ModelEditor() {
         </>
       )}
     </div>
+    </FormContextProvider>
   )
 }

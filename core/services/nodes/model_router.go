@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/mudler/LocalAI/pkg/distributedhdr"
 	pb "github.com/mudler/LocalAI/pkg/grpc/proto"
 	"github.com/mudler/LocalAI/pkg/model"
 	"github.com/mudler/xlog"
@@ -37,7 +38,7 @@ func NewModelRouterAdapter(router *SmartRouter) *ModelRouterAdapter {
 // It delegates to SmartRouter.Route() and returns a Model that wraps the
 // remote gRPC client with file staging if configured.
 func (a *ModelRouterAdapter) Route(ctx context.Context, backend, modelID, modelName, modelFile string,
-	opts *pb.ModelOptions, parallel bool) (*model.Model, error) {
+	configRevision string, opts *pb.ModelOptions, parallel bool) (*model.Model, error) {
 
 	backendType := backend
 
@@ -50,7 +51,7 @@ func (a *ModelRouterAdapter) Route(ctx context.Context, backend, modelID, modelN
 
 	// Route to a remote node (SmartRouter handles model pre-staging via FileStager)
 	// Pass modelID so the DB tracks models by their logical ID, not the file path
-	result, err := a.router.Route(ctx, modelID, modelName, backendType, opts, parallel)
+	result, err := a.router.Route(ctx, modelID, modelName, backendType, configRevision, opts, parallel)
 	if err != nil {
 		return nil, fmt.Errorf("routing model %s: %w", modelName, err)
 	}
@@ -68,6 +69,16 @@ func (a *ModelRouterAdapter) Route(ctx context.Context, backend, modelID, modelN
 	// by SmartRouter. Use NewModelWithClient so the wrapper is preserved when
 	// the ModelLoader returns this model on subsequent requests.
 	m := model.NewModelWithClient(modelID, result.Node.Address, result.Client)
+
+	// Publish the picked node ID into the per-request holder attached to
+	// ctx (by middleware.ExposeNodeHeader). No-op when the holder is
+	// absent - e.g. health-check probes, watchdog reloads or any path that
+	// did not flow through the HTTP middleware. The response writer
+	// wrapper reads this on the first byte to set X-LocalAI-Node, so
+	// attribution is exact for the request that triggered THIS Route call,
+	// even when several requests for the same modelID are being routed
+	// concurrently to different replicas.
+	distributedhdr.Stamp(ctx, result.Node.ID)
 
 	xlog.Info("Model routed to remote node", "model", modelName, "node", result.Node.Name, "address", result.Node.Address)
 	return m, nil

@@ -1,9 +1,13 @@
 package utils
 
 import (
+	"archive/tar"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
+	"github.com/klauspost/compress/zip"
 	"github.com/mholt/archiver/v3"
 )
 
@@ -32,7 +36,7 @@ func ExtractArchive(archive, dst string) error {
 		OverwriteExisting:      true,
 		MkdirAll:               true,
 		ImplicitTopLevelFolder: false,
-		ContinueOnError:        true,
+		ContinueOnError:        false,
 	}
 
 	switch v := uaIface.(type) {
@@ -54,9 +58,22 @@ func ExtractArchive(archive, dst string) error {
 		v.Tar = mytar
 	}
 
+	extractRoot, err := filepath.Abs(dst)
+	if err != nil {
+		return err
+	}
+
 	err = archiver.Walk(archive, func(f archiver.File) error {
+		if err := validateArchiveMemberPath(extractRoot, archiveMemberName(f)); err != nil {
+			return err
+		}
 		if f.FileInfo.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("archive contains a symlink")
+		}
+		if linkname, ok := archiveMemberLinkname(f); ok {
+			if err := validateArchiveMemberPath(extractRoot, linkname); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -66,4 +83,54 @@ func ExtractArchive(archive, dst string) error {
 	}
 
 	return un.Unarchive(archive, dst)
+}
+
+func archiveMemberName(f archiver.File) string {
+	switch h := f.Header.(type) {
+	case tar.Header:
+		return h.Name
+	case *tar.Header:
+		return h.Name
+	case zip.FileHeader:
+		return h.Name
+	case *zip.FileHeader:
+		return h.Name
+	default:
+		return f.Name()
+	}
+}
+
+// archiveMemberLinkname reports the target of a tar hardlink member, which carries a regular file mode and so is not caught by the symlink check.
+func archiveMemberLinkname(f archiver.File) (string, bool) {
+	switch h := f.Header.(type) {
+	case tar.Header:
+		return h.Linkname, h.Typeflag == tar.TypeLink
+	case *tar.Header:
+		return h.Linkname, h.Typeflag == tar.TypeLink
+	default:
+		return "", false
+	}
+}
+
+func validateArchiveMemberPath(root, name string) error {
+	if name == "" {
+		return fmt.Errorf("archive contains an empty path")
+	}
+
+	normalizedName := filepath.FromSlash(strings.ReplaceAll(name, "\\", "/"))
+	cleanedName := filepath.Clean(normalizedName)
+	if filepath.IsAbs(cleanedName) || cleanedName == ".." || strings.HasPrefix(cleanedName, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("archive contains an unsafe path: %s", name)
+	}
+
+	targetPath := filepath.Join(root, cleanedName)
+	relativePath, err := filepath.Rel(root, targetPath)
+	if err != nil {
+		return err
+	}
+	if relativePath == ".." || strings.HasPrefix(relativePath, ".."+string(os.PathSeparator)) || filepath.IsAbs(relativePath) {
+		return fmt.Errorf("archive contains an unsafe path: %s", name)
+	}
+
+	return nil
 }

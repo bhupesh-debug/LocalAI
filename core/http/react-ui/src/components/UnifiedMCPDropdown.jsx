@@ -1,11 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { loadClientMCPServers, addClientMCPServer, removeClientMCPServer } from '../utils/mcpClientStorage'
+import Icon from './Icon'
 
 export default function UnifiedMCPDropdown({
   // Server MCP props
   serverMCPAvailable = false,
   mcpServerList = [],
   mcpServersLoading = false,
+  serverListError = '',
   selectedServers = [],
   onToggleServer,
   onSelectAllServers,
@@ -103,6 +105,7 @@ export default function UnifiedMCPDropdown({
   }, [onClientRemoved])
 
   const totalBadge = (selectedServers?.length || 0) + (clientMCPActiveIds?.length || 0) + (selectedResources?.length || 0)
+  const selectableServers = mcpServerList.filter(server => !server.error)
 
   const tabs = []
   if (serverMCPAvailable) tabs.push({ key: 'servers', label: 'Servers' })
@@ -118,7 +121,7 @@ export default function UnifiedMCPDropdown({
         title="MCP servers, prompts, and resources"
         onClick={handleOpen}
       >
-        <i className="fas fa-plug" /> MCP
+        <Icon name="plug" /> MCP
         {totalBadge > 0 && (
           <span className="chat-mcp-badge">{totalBadge}</span>
         )}
@@ -142,27 +145,39 @@ export default function UnifiedMCPDropdown({
           {/* Servers tab */}
           {activeTab === 'servers' && serverMCPAvailable && (
             mcpServersLoading ? (
-              <div className="chat-mcp-dropdown-loading"><i className="fas fa-spinner fa-spin" /> Loading servers...</div>
+              <div className="chat-mcp-dropdown-loading"><Icon name="spinner" spin /> Loading servers...</div>
+            ) : serverListError ? (
+              <div className="chat-mcp-dropdown-error" role="alert">Failed to discover MCP servers: {serverListError}</div>
             ) : mcpServerList.length === 0 ? (
               <div className="chat-mcp-dropdown-empty">No MCP servers configured</div>
             ) : (
               <>
                 <div className="chat-mcp-dropdown-header">
                   <span>MCP Servers</span>
-                  <button type="button" className="chat-mcp-select-all" onClick={onSelectAllServers}>
-                    {mcpServerList.every(s => selectedServers.includes(s.name)) ? 'Deselect all' : 'Select all'}
-                  </button>
+                  {selectableServers.length > 0 && (
+                    <button type="button" className="chat-mcp-select-all" onClick={onSelectAllServers}>
+                      {selectableServers.every(s => selectedServers.includes(s.name)) ? 'Deselect all' : 'Select all'}
+                    </button>
+                  )}
                 </div>
                 {mcpServerList.map(server => (
-                  <label key={server.name} className="chat-mcp-server-item">
+                  <label key={server.name} className={`chat-mcp-server-item${server.error ? ' chat-mcp-server-item--error' : ''}`}>
                     <input
                       type="checkbox"
                       checked={selectedServers.includes(server.name)}
                       onChange={() => onToggleServer(server.name)}
+                      disabled={!!server.error}
                     />
                     <div className="chat-mcp-server-info">
-                      <span className="chat-mcp-server-name">{server.name}</span>
-                      <span className="chat-mcp-server-tools">{server.tools?.length || 0} tools</span>
+                      <span className="chat-mcp-server-name-row">
+                        <span className={`chat-mcp-server-status chat-mcp-server-status--${server.error ? 'error' : 'connected'}`} />
+                        <span className="chat-mcp-server-name">{server.name}</span>
+                      </span>
+                      {server.error ? (
+                        <span className="chat-mcp-server-error" title={server.error}>{server.error}</span>
+                      ) : (
+                        <span className="chat-mcp-server-tools">{server.tools?.length || 0} tools</span>
+                      )}
                     </div>
                   </label>
                 ))}
@@ -176,40 +191,37 @@ export default function UnifiedMCPDropdown({
               <div className="chat-mcp-dropdown-header">
                 <span>Client MCP Servers</span>
                 <button type="button" className="chat-mcp-select-all" onClick={() => setAddDialog(!addDialog)}>
-                  <i className="fas fa-plus" /> Add
+                  <Icon name="plus" /> Add
                 </button>
               </div>
               {addDialog && (
                 <div style={{ padding: '8px 10px', borderBottom: '1px solid var(--color-border)' }}>
                   <input
                     type="text"
-                    className="input input-sm"
+                    className="input input-sm w-full mb-xs"
                     placeholder="Server URL (e.g. https://mcp.example.com/sse)"
                     value={url}
                     onChange={e => setUrl(e.target.value)}
-                    style={{ width: '100%', marginBottom: '4px' }}
                   />
                   <input
                     type="text"
-                    className="input input-sm"
+                    className="input input-sm w-full mb-xs"
                     placeholder="Name (optional)"
                     value={name}
                     onChange={e => setName(e.target.value)}
-                    style={{ width: '100%', marginBottom: '4px' }}
                   />
                   <input
                     type="password"
-                    className="input input-sm"
+                    className="input input-sm w-full mb-xs"
                     placeholder="Auth token (optional)"
                     value={authToken}
                     onChange={e => setAuthToken(e.target.value)}
-                    style={{ width: '100%', marginBottom: '4px' }}
                   />
                   <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.8rem', marginBottom: '6px' }}>
                     <input type="checkbox" checked={useProxy} onChange={e => setUseProxy(e.target.checked)} />
                     Use CORS proxy
                   </label>
-                  <div style={{ display: 'flex', gap: '4px', justifyContent: 'flex-end' }}>
+                  <div className="hstack hstack--xs hstack--end">
                     <button type="button" className="btn btn-sm btn-secondary" onClick={() => setAddDialog(false)}>Cancel</button>
                     <button type="button" className="btn btn-sm btn-primary" onClick={handleAddClient} disabled={!url.trim()}>Add</button>
                   </div>
@@ -229,11 +241,11 @@ export default function UnifiedMCPDropdown({
                         checked={isActive}
                         onChange={() => onClientToggle(server.id)}
                       />
-                      <div className="chat-mcp-server-info" style={{ flex: 1 }}>
+                      <div className="chat-mcp-server-info flex-1">
                         <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                           <span className={`chat-client-mcp-status chat-client-mcp-status-${status}`} />
                           <span className="chat-mcp-server-name">{server.name}</span>
-                          {server.headers?.Authorization && <i className="fas fa-lock" style={{ fontSize: '0.65rem', opacity: 0.5 }} title="Authenticated" />}
+                          {server.headers?.Authorization && <Icon name="lock" style={{ fontSize: '0.65rem', opacity: 0.5 }} title="Authenticated" />}
                         </div>
                         <span className="chat-mcp-server-tools">
                           {status === 'connecting' ? 'Connecting...' :
@@ -248,7 +260,7 @@ export default function UnifiedMCPDropdown({
                         onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleRemoveClient(server.id) }}
                         title="Remove server"
                       >
-                        <i className="fas fa-trash" />
+                        <Icon name="trash" />
                       </button>
                     </label>
                   )
@@ -272,8 +284,7 @@ export default function UnifiedMCPDropdown({
                       </label>
                       <input
                         type="text"
-                        className="input input-sm"
-                        style={{ width: '100%' }}
+                        className="input input-sm w-full"
                         placeholder={arg.description || arg.name}
                         value={promptArgsValues[arg.name] || ''}
                         onChange={e => onPromptArgsChange(arg.name, e.target.value)}
@@ -286,7 +297,7 @@ export default function UnifiedMCPDropdown({
                   </div>
                 </>
               ) : mcpPromptsLoading ? (
-                <div className="chat-mcp-dropdown-loading"><i className="fas fa-spinner fa-spin" /> Loading prompts...</div>
+                <div className="chat-mcp-dropdown-loading"><Icon name="spinner" spin /> Loading prompts...</div>
               ) : mcpPromptList.length === 0 ? (
                 <div className="chat-mcp-dropdown-empty">No MCP prompts available</div>
               ) : (
@@ -315,7 +326,7 @@ export default function UnifiedMCPDropdown({
           {/* Resources tab */}
           {activeTab === 'resources' && resourcesAvailable && (
             mcpResourcesLoading ? (
-              <div className="chat-mcp-dropdown-loading"><i className="fas fa-spinner fa-spin" /> Loading resources...</div>
+              <div className="chat-mcp-dropdown-loading"><Icon name="spinner" spin /> Loading resources...</div>
             ) : mcpResourceList.length === 0 ? (
               <div className="chat-mcp-dropdown-empty">No MCP resources available</div>
             ) : (

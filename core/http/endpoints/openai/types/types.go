@@ -933,6 +933,13 @@ type RealtimeSession struct {
 	// The set of modalities the model can respond with. It defaults to ["audio"], indicating that the model will respond with audio plus a transcript. ["text"] can be used to make the model respond with text only. It is not possible to request both text and audio at the same time.
 	OutputModalities []Modality `json:"output_modalities,omitempty"`
 
+	// Modalities is the legacy OpenAI Realtime *beta* field name for
+	// OutputModalities. Many beta clients and community sample code still send
+	// `modalities`; standard JSON decoding would otherwise drop the unknown key
+	// silently and the session would fall back to audio. Accepted only as an
+	// alias: OutputModalities (the GA field) wins when both are present.
+	Modalities []Modality `json:"modalities,omitempty"`
+
 	// Reference to a prompt template and its variables.
 	Prompt *PromptReference `json:"prompt,omitempty"`
 
@@ -949,6 +956,11 @@ type RealtimeSession struct {
 
 	// Controls how the realtime conversation is truncated prior to model inference. The default is auto.
 	Truncation *TruncationUnion `json:"truncation,omitempty"`
+
+	// LocalAIClassifier is a LocalAI extension: prefill-scored option
+	// selection instead of autoregressive generation. Replaced wholesale
+	// on update, like tools. OpenAI clients simply never set it.
+	LocalAIClassifier *ClassifierConfig `json:"localai_classifier,omitempty"`
 }
 
 func (r RealtimeSession) Type() SessionType {
@@ -1170,6 +1182,10 @@ type ResponseCreateParams struct {
 	// The set of modalities the model used to respond, currently the only possible values are [\"audio\"], [\"text\"]. Audio output always include a text transcript. Setting the output to mode text will disable audio output from the model.
 	OutputModalities []Modality `json:"output_modalities,omitempty"`
 
+	// Modalities is the legacy beta alias for OutputModalities on
+	// response.create; see RealtimeSession.Modalities.
+	Modalities []Modality `json:"modalities,omitempty"`
+
 	// Reference to a prompt template and its variables.
 	//
 	// See https://platform.openai.com/docs/guides/text?api-mode=responses#reusable-prompts.
@@ -1180,6 +1196,11 @@ type ResponseCreateParams struct {
 
 	// Tools available to the model.
 	Tools []ToolUnion `json:"tools,omitempty"`
+
+	// LocalAIClassifier is a LocalAI extension: when non-nil it replaces
+	// the session's classifier config for this response only —
+	// {"enabled": false} runs normal generation once.
+	LocalAIClassifier *ClassifierConfig `json:"localai_classifier,omitempty"`
 }
 
 type Response struct {

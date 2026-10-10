@@ -11,12 +11,16 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/mudler/LocalAI/core/config"
+	mcpTools "github.com/mudler/LocalAI/core/http/endpoints/mcp"
 	"github.com/mudler/LocalAI/core/services/agents"
 	"github.com/mudler/LocalAI/core/services/distributed"
 	"github.com/mudler/LocalAI/core/services/jobs"
 	"github.com/mudler/LocalAI/core/services/messaging"
+	"github.com/mudler/LocalAI/core/services/monitoring"
 	"github.com/mudler/LocalAI/core/services/nodes"
+	"github.com/mudler/LocalAI/core/services/nodes/prefixcache"
 	"github.com/mudler/LocalAI/core/services/storage"
+	"github.com/mudler/LocalAI/pkg/distributedhdr"
 	"github.com/mudler/LocalAI/pkg/sanitize"
 	"github.com/mudler/xlog"
 	"gorm.io/gorm"
@@ -25,6 +29,8 @@ import (
 // DistributedServices holds all services initialized for distributed mode.
 type DistributedServices struct {
 	Nats         *messaging.Client
+	WorkQueue    messaging.WorkQueue
+	AgentControl mcpTools.AgentControl
 	Store        storage.ObjectStore
 	Registry     *nodes.NodeRegistry
 	Router       *nodes.SmartRouter
@@ -39,6 +45,11 @@ type DistributedServices struct {
 	FileStager   nodes.FileStager
 	ModelAdapter *nodes.ModelRouterAdapter
 	Unloader     *nodes.RemoteUnloaderAdapter
+	ModelCleanup *nodes.ModelCleanupService
+
+	// WorkerHTTPDial reaches a worker's own HTTP server for the admin
+	// backend-logs proxy, the same way the HTTP file stager does.
+	WorkerHTTPDial nodes.WorkerNetDialerFor
 
 	shutdownOnce sync.Once
 }
@@ -71,7 +82,11 @@ func (ds *DistributedServices) Shutdown() {
 // initDistributed validates distributed mode prerequisites and initializes
 // NATS, object storage, node registry, and instance identity.
 // Returns nil if distributed mode is not enabled.
-func initDistributed(cfg *config.ApplicationConfig, authDB *gorm.DB) (*DistributedServices, error) {
+// configLoader is used by the SmartRouter to compute concurrency-group
+// anti-affinity at placement time (#9659); it may be nil in tests.
+// pinned, when set, replaces configLoader as the source of models the router
+// and reconciler must keep loaded (it adds warm failover targets).
+func initDistributed(cfg *config.ApplicationConfig, authDB *gorm.DB, configLoader *config.ModelConfigLoader, pinned nodes.PinnedModelResolver) (*DistributedServices, error) {
 	if !cfg.Distributed.Enabled {
 		return nil, nil
 	}
@@ -98,7 +113,12 @@ func initDistributed(cfg *config.ApplicationConfig, authDB *gorm.DB) (*Distribut
 	xlog.Info("Distributed instance", "id", cfg.Distributed.InstanceID)
 
 	// Connect to NATS
-	natsClient, err := messaging.New(cfg.Distributed.NatsURL)
+	natsAuth := cfg.Distributed.NatsAuthConfig()
+	if natsAuth.RequireAuth && (natsAuth.ServiceUserJWT == "" || natsAuth.ServiceUserSeed == "") {
+		return nil, fmt.Errorf("LOCALAI_NATS_REQUIRE_AUTH requires LOCALAI_NATS_SERVICE_JWT and LOCALAI_NATS_SERVICE_SEED")
+	}
+	natsOpts := cfg.Distributed.NatsMessagingOptions("", "")
+	natsClient, err := messaging.New(cfg.Distributed.NatsURL, natsOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to NATS: %w", err)
 	}
@@ -152,6 +172,41 @@ func initDistributed(cfg *config.ApplicationConfig, authDB *gorm.DB) (*Distribut
 	}
 	xlog.Info("Node registry initialized")
 
+	// Bound durable heartbeat writes: a beat that only carries a fresher
+	// timestamp is what turned backend_nodes into a 460 MB six-row table.
+	registry.SetHeartbeatCheckpoint(cfg.Distributed.NodeHeartbeatCheckpointOrDefault())
+
+	// Measure the vacuum horizon. The 42 days it stayed open went unnoticed
+	// because no gauge reported it until models started failing to load.
+	if err := monitoring.RegisterControlPlaneDBMetrics(authDB, 30*time.Second); err != nil {
+		// Metrics are diagnostic; a failure here must not stop the frontend.
+		xlog.Warn("Control-plane database metrics unavailable", "error", err)
+	}
+
+	// Let scheduling rules be keyed by a model alias. The registry resolves a
+	// rule's name through the config loader to find the model it governs, so an
+	// operator can pin placement to a stable name like "production" and have it
+	// follow the alias when the alias is repointed. Wired before the seed below
+	// and before the reconciler starts, so the first tick already resolves.
+	if configLoader != nil {
+		registry.SetAliasResolver(configLoader)
+	}
+
+	// Seed declarative per-model scheduling config (LOCALAI_MODEL_SCHEDULING /
+	// LOCALAI_MODEL_SCHEDULING_CONFIG). Authoritative: overwrites matching models
+	// on every boot. Runs before the reconciler starts so the first tick already
+	// sees the desired state. Models not listed are left untouched.
+	if cfg.Distributed.ModelSchedulingJSON != "" || cfg.Distributed.ModelSchedulingConfigPath != "" {
+		schedConfigs, err := nodes.ParseSchedulingSeed(cfg.Distributed.ModelSchedulingJSON, cfg.Distributed.ModelSchedulingConfigPath)
+		if err != nil {
+			return nil, fmt.Errorf("parsing declarative model scheduling config: %w", err)
+		}
+		if err := registry.SeedModelScheduling(context.Background(), schedConfigs); err != nil {
+			return nil, fmt.Errorf("seeding declarative model scheduling config: %w", err)
+		}
+		xlog.Info("Applied declarative model scheduling config", "models", len(schedConfigs))
+	}
+
 	// Collect SmartRouter option values; the router itself is created after all
 	// dependencies (including FileStager and Unloader) are ready.
 	var routerAuthToken string
@@ -167,7 +222,7 @@ func initDistributed(cfg *config.ApplicationConfig, authDB *gorm.DB) (*Distribut
 		cfg.Distributed.HealthCheckIntervalOrDefault(),
 		cfg.Distributed.StaleNodeThresholdOrDefault(),
 		routerAuthToken,
-		cfg.Distributed.PerModelHealthCheck,
+		!cfg.Distributed.DisablePerModelHealthCheck,
 	)
 
 	// Initialize job store
@@ -177,8 +232,10 @@ func initDistributed(cfg *config.ApplicationConfig, authDB *gorm.DB) (*Distribut
 	}
 	xlog.Info("Distributed job store initialized")
 
+	workQueue := messaging.NewNATSWorkQueue(natsClient)
+
 	// Initialize job dispatcher
-	dispatcher := jobs.NewDispatcher(jobStore, natsClient, authDB, cfg.Distributed.InstanceID, cfg.Distributed.JobWorkerConcurrency)
+	dispatcher := jobs.NewDispatcher(jobStore, workQueue, natsClient, authDB, cfg.Distributed.InstanceID)
 
 	// Initialize agent store
 	agentStore, err := agents.NewAgentStore(authDB)
@@ -213,6 +270,7 @@ func initDistributed(cfg *config.ApplicationConfig, authDB *gorm.DB) (*Distribut
 	xlog.Info("File manager initialized", "cacheDir", cacheDir)
 
 	// Create FileStager for distributed file transfer
+	workerHTTPDial := nodes.DirectWorkerNetDialer()
 	var fileStager nodes.FileStager
 	if cfg.Distributed.StorageURL != "" {
 		fileStager = nodes.NewS3NATSFileStager(fileMgr, natsClient)
@@ -227,29 +285,197 @@ func initDistributed(cfg *config.ApplicationConfig, authDB *gorm.DB) (*Distribut
 				return "", fmt.Errorf("node %s has no HTTP address for file transfer", nodeID)
 			}
 			return node.HTTPAddress, nil
-		}, cfg.Distributed.RegistrationToken)
+		}, cfg.Distributed.RegistrationToken, workerHTTPDial)
 		xlog.Info("File stager initialized (HTTP direct transfer)")
 	}
 	// Create RemoteUnloaderAdapter — needed by SmartRouter and startup.go
-	remoteUnloader := nodes.NewRemoteUnloaderAdapter(registry, natsClient)
+	remoteUnloader := nodes.NewRemoteUnloaderAdapter(
+		registry,
+		natsClient,
+		cfg.Distributed.BackendInstallTimeoutOrDefault(),
+		cfg.Distributed.BackendUpgradeTimeoutOrDefault(),
+	)
+
+	// Prefix-cache-aware routing. Enabled by default; an operator can opt out
+	// with --distributed-prefix-cache=false, which leaves prefixProvider and
+	// pressure nil so the SmartRouter and reconciler behave exactly as the
+	// round-robin floor (true no-op). When enabled we build the local index,
+	// wrap it in a NATS-backed Sync (publishes our observations, applies peers'
+	// via the subscriptions below), install the extraction hook used by
+	// core/backend/llm.go, and run a background eviction ticker on the app ctx.
+	var prefixProvider prefixcache.Provider
+	var pressure *prefixcache.Pressure
+	var prefixCfg prefixcache.Config
+	if !cfg.Distributed.PrefixCacheDisabled {
+		prefixCfg = prefixcache.DefaultConfig()
+		if cfg.Distributed.PrefixCacheTTL > 0 {
+			prefixCfg.TTL = cfg.Distributed.PrefixCacheTTL
+		}
+		if err := prefixCfg.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid prefix-cache configuration: %w", err)
+		}
+		idx := prefixcache.NewIndex(prefixCfg)
+		prefixSync := prefixcache.NewSync(idx, natsClient)
+		pressure = prefixcache.NewSyncedPressure(prefixCfg.PressureWindow, natsClient)
+		prefixProvider = prefixSync
+
+		// Invalidate the prefix-cache index whenever a replica row is removed.
+		// AddReplicaRemovedHook fires from the single chokepoint all removal paths
+		// funnel through (RemoveNodeModel / RemoveAllNodeModelReplicas), so this
+		// one hook covers every path: reconciler scale-down, probe reaper,
+		// health-monitor reap, RemoteUnloaderAdapter, and the router. Registering
+		// it only inside this enabled block keeps the disabled path a true no-op
+		// for the prefix cache; other subsystems register their own hooks
+		// independently and are unaffected either way.
+		registry.AddReplicaRemovedHook(func(model, node string, replica int) {
+			if replica < 0 {
+				prefixSync.InvalidateNode(model, node)
+			} else {
+				prefixSync.Invalidate(model, prefixcache.ReplicaKey{NodeID: node, Replica: replica})
+			}
+		})
+
+		distributedhdr.PrefixChainHook = func(model, prompt string) []uint64 {
+			return prefixcache.ExtractChain(model, prompt, prefixCfg)
+		}
+
+		// Apply peers' observations/invalidations to the same Sync. ApplyObserve
+		// and ApplyInvalidate update only the local index and do not re-publish,
+		// so there is no broadcast loop.
+		if _, err := messaging.SubscribeJSON(natsClient, messaging.SubjectPrefixCacheObserve, func(ev messaging.PrefixCacheObserveEvent) {
+			prefixSync.ApplyObserve(ev, time.Now())
+		}); err != nil {
+			return nil, fmt.Errorf("subscribing to %s: %w", messaging.SubjectPrefixCacheObserve, err)
+		}
+		if _, err := messaging.SubscribeJSON(natsClient, messaging.SubjectPrefixCacheInvalidate, func(ev messaging.PrefixCacheInvalidateEvent) {
+			prefixSync.ApplyInvalidate(ev)
+		}); err != nil {
+			return nil, fmt.Errorf("subscribing to %s: %w", messaging.SubjectPrefixCacheInvalidate, err)
+		}
+		if _, err := messaging.SubscribeJSON(natsClient, messaging.SubjectPrefixCachePressure, func(ev messaging.PrefixCachePressureEvent) {
+			pressure.ApplyPressure(ev, time.Now())
+		}); err != nil {
+			return nil, fmt.Errorf("subscribing to %s: %w", messaging.SubjectPrefixCachePressure, err)
+		}
+
+		// Keep an exact-residency index current so backend producers can report
+		// their real KV state without coupling to router internals. Routing stays
+		// on the guessed provider until a backend producer is available.
+		reportedIndex := prefixcache.NewReportedIndex()
+		if _, err := messaging.SubscribeJSON(natsClient, messaging.SubjectPrefixCacheResidency, reportedIndex.Apply); err != nil {
+			return nil, fmt.Errorf("subscribing to %s: %w", messaging.SubjectPrefixCacheResidency, err)
+		}
+
+		// Background eviction: sweep idle entries on the app context. Stopped
+		// when the app context is cancelled (mirrors the reconciler loop which
+		// also runs on options.Context). TTL/2 keeps stale entries from
+		// outliving their idle window by more than half a TTL.
+		evictInterval := prefixCfg.TTL / 2
+		go func() {
+			ticker := time.NewTicker(evictInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-cfg.Context.Done():
+					return
+				case <-ticker.C:
+					prefixSync.Evict(time.Now())
+				}
+			}
+		}()
+		xlog.Info("Prefix-cache-aware routing enabled", "ttl", prefixCfg.TTL, "evictInterval", evictInterval)
+	} else {
+		xlog.Info("Prefix-cache-aware routing disabled: using round-robin routing")
+	}
 
 	// All dependencies ready — build SmartRouter with all options at once
+	var conflictResolver nodes.ConcurrencyConflictResolver
+	var pinnedResolver nodes.PinnedModelResolver
+	var modelFiles func(string) []string
+	if configLoader != nil {
+		conflictResolver = configLoader
+		pinnedResolver = configLoader
+		if cfg.SystemState != nil {
+			modelFiles = declaredModelFiles(configLoader, cfg.SystemState.Model.ModelsPath)
+		}
+	}
+	if pinned != nil {
+		pinnedResolver = pinned
+	}
+	modelCleanup := nodes.NewModelCleanupService(registry, remoteUnloader)
 	router := nodes.NewSmartRouter(registry, nodes.SmartRouterOptions{
-		Unloader:      remoteUnloader,
-		FileStager:    fileStager,
-		GalleriesJSON: routerGalleriesJSON,
-		AuthToken:     routerAuthToken,
-		DB:            authDB,
+		Unloader:         remoteUnloader,
+		ModelCleanup:     modelCleanup,
+		FileStager:       fileStager,
+		GalleriesJSON:    routerGalleriesJSON,
+		AuthToken:        routerAuthToken,
+		DB:               authDB,
+		ConflictResolver: conflictResolver,
+		PinnedResolver:   pinnedResolver,
+		ModelFiles:       modelFiles,
+		PrefixProvider:   prefixProvider,
+		PrefixConfig:     prefixCfg,
+		Pressure:         pressure,
+		SharedModels:     cfg.Distributed.SharedModels,
+		// A closure over the live ApplicationConfig, NOT a snapshot: the
+		// runtime setting (distributed_disk_headroom_check) mutates this exact
+		// member, so a snapshot here would make the toggle a no-op until
+		// restart. env/CLI sets the boot value, POST /api/settings overrides it
+		// live, and this is the single member both write.
+		DiskHeadroomEnabled: func() bool { return !cfg.Distributed.DiskHeadroomDisabled },
+		// RAW, not OrDefault: zero means "derive the budget per model from the
+		// checkpoint size" (config.ModelLoadTimeoutForSize), which is what makes
+		// a 70 GB video checkpoint work without the operator first hitting a
+		// DeadlineExceeded and going looking for a knob. A non-zero value here is
+		// an explicit override and is used verbatim.
+		ModelLoadTimeout: cfg.Distributed.ModelLoadTimeout,
+		// Cap how long a cold load may hold the per-model advisory lock. Derived
+		// from BOTH configured budgets it has to cover, so raising either the
+		// install timeout (slow links pulling multi-GB images) or the model load
+		// timeout (very large checkpoints) widens the ceiling too, instead of
+		// letting a stale bound cut a legitimately slow load short.
+		ModelLoadCeiling: nodes.ModelLoadCeilingFor(
+			cfg.Distributed.BackendInstallTimeoutOrDefault(),
+			cfg.Distributed.ModelLoadTimeoutOrDefault(),
+		),
+		// Bounds the REQUEST, not the load: a caller out of budget gets 503 with
+		// live staging progress while the job keeps running underneath.
+		ModelLoadWait: cfg.Distributed.ModelLoadWait,
 	})
 
-	// Create ReplicaReconciler for auto-scaling model replicas
+	// Wire staging-progress broadcasting so file-staging shows up on every
+	// replica, not just the one performing the transfer. Without this, a
+	// /api/operations poll that round-robins onto a peer sees no staging row and
+	// the progress flickers. The origin publishes; peers mirror via the wildcard.
+	// A silently disabled safety check is how the original incident stayed
+	// invisible for sixteen minutes. Say so once, loudly, at startup.
+	if cfg.Distributed.DiskHeadroomDisabled {
+		xlog.Info("Disk-headroom admission check is DISABLED: node selection will ignore whether a worker can store the model, and staging may fail with ENOSPC partway through a transfer",
+			"knob", config.FlagDiskHeadroomCheck, "env", "LOCALAI_DISTRIBUTED_DISK_HEADROOM_CHECK")
+	}
+
+	router.StagingTracker().SetPublisher(natsClient)
+	if _, err := router.StagingTracker().SubscribeBroadcasts(natsClient); err != nil {
+		xlog.Warn("Failed to subscribe to staging progress broadcasts", "error", err)
+	}
+
+	// Create ReplicaReconciler for auto-scaling model replicas. Adapter +
+	// RegistrationToken feed the state-reconciliation passes: pending op
+	// drain uses the adapter, and model health probes use the token to auth
+	// against workers' gRPC HealthCheck.
 	reconciler := nodes.NewReplicaReconciler(nodes.ReplicaReconcilerOptions{
-		Registry:       registry,
-		Scheduler:      router,
-		Unloader:       remoteUnloader,
-		DB:             authDB,
-		Interval:       30 * time.Second,
-		ScaleDownDelay: 5 * time.Minute,
+		Registry:          registry,
+		Scheduler:         router,
+		Unloader:          remoteUnloader,
+		Adapter:           remoteUnloader,
+		RegistrationToken: cfg.Distributed.RegistrationToken,
+		DB:                authDB,
+		Interval:          30 * time.Second,
+		ScaleDownDelay:    5 * time.Minute,
+		ProbeStaleAfter:   2 * time.Minute,
+		Pressure:          pressure,
+		PressureThreshold: prefixCfg.PressureScaleThreshold,
+		PinnedResolver:    pinnedResolver,
 	})
 
 	// Create ModelRouterAdapter to wire into ModelLoader
@@ -258,6 +484,8 @@ func initDistributed(cfg *config.ApplicationConfig, authDB *gorm.DB) (*Distribut
 	success = true
 	return &DistributedServices{
 		Nats:         natsClient,
+		WorkQueue:    workQueue,
+		AgentControl: nodes.NewNATSAgentControl(natsClient),
 		Store:        store,
 		Registry:     registry,
 		Router:       router,
@@ -272,6 +500,9 @@ func initDistributed(cfg *config.ApplicationConfig, authDB *gorm.DB) (*Distribut
 		FileStager:   fileStager,
 		ModelAdapter: modelAdapter,
 		Unloader:     remoteUnloader,
+		ModelCleanup: modelCleanup,
+
+		WorkerHTTPDial: workerHTTPDial,
 	}, nil
 }
 

@@ -1,14 +1,18 @@
 +++
 title = "Model Context Protocol (MCP)"
-weight = 20
+weight = 22
 toc = true
 description = "Agentic capabilities with Model Context Protocol integration"
 tags = ["MCP", "Agents", "Tools", "Advanced"]
 categories = ["Features"]
 +++
 
+![Server-side vs client-side MCP: the model's tool loop runs on the server or in the browser](/images/diagrams/mcp-server-vs-client.png)
+
 
 LocalAI now supports the **Model Context Protocol (MCP)**, enabling powerful agentic capabilities by connecting AI models to external tools and services. This feature allows your LocalAI models to interact with various MCP servers, providing access to real-time data, APIs, and specialized tools.
+
+{{< agentic-routing current="mcp" >}}
 
 ## What is MCP?
 
@@ -83,11 +87,19 @@ agent:
 
 ### Configuration Options
 
+In the interactive model editor, **Remote MCP Servers** and **MCP STDIO Servers** are YAML editors. Enter only the embedded `mcpServers` document shown inside the `remote: |` or `stdio: |` block above; the editor supplies the outer model configuration keys.
+
 #### Remote Servers (`remote`)
 Configure HTTP-based MCP servers:
 
 - **`url`**: The MCP server endpoint URL
 - **`token`**: Bearer token for authentication (optional)
+
+LocalAI automatically selects the transport for remote model MCP servers. It tries Streamable HTTP first, including servers that do not assign session IDs. If the initial POST returns HTTP 400, 404, or 405, LocalAI retries with legacy SSE. Both attempts share the discovery timeout and use the configured bearer token. Authentication failures and redirects do not trigger fallback.
+
+Use the endpoint URL published by your server: usually `/mcp` for Streamable HTTP or `/sse` for legacy SSE. Legacy SSE servers must advertise a message endpoint on the same origin (scheme, host, and port). No transport setting is required.
+
+Remote model MCP connections originate from the LocalAI process. If LocalAI runs in Docker, the URL must therefore resolve and be reachable **from the LocalAI container**, not only from the host browser. For another service in the same Compose project, use its Compose service name and container port. Host-only DNS names, VPN DNS, and private routes must also be made available inside the container.
 
 #### STDIO Servers (`stdio`)
 Configure local command-based MCP servers:
@@ -99,6 +111,19 @@ Configure local command-based MCP servers:
 #### Agent Configuration (`agent`)
 
 - **`max_iterations`**: Maximum number of MCP tool execution loop iterations (default: 10). Each iteration allows the model to call tools and receive results before generating the next response.
+
+## Agent-scoped MCP servers
+
+The `mcp:` block above attaches MCP servers to a **model**: every request that uses that model config can reach those tools. LocalAI's [agents]({{% relref "features/agents" %}}) can also attach MCP servers to a single **agent**, independent of the model it runs on. This is the mechanism the Agents feature advertises as "MCP Servers".
+
+Use model-scoped MCP (the `mcp:` block in a model YAML) when the tools belong to the model itself and every caller of that model should get them. Use agent-scoped MCP when only one agent should have a given tool, or when different agents sharing the same model need different tools.
+
+Agent-scoped MCP servers are configured per agent, not in a model YAML:
+
+- **In the web UI:** open the **Agents** page, edit an agent, and fill in its **MCP Servers** (remote HTTP servers) and **MCP STDIO Servers** (local command servers) fields. The JSON shape is the same `mcpServers` map used above.
+- **In an agent config (JSON):** the agent stores remote servers under `mcp_servers` and local command servers under `mcp_stdio_servers`, so an exported/imported agent carries its MCP servers with it.
+
+An agent-scoped MCP server that is unreachable is a common reason an imported agent's tool "times out or is unavailable"; see the checklist in {{% relref "getting-started/first-agent" %}}.
 
 ## Usage
 
@@ -163,22 +188,28 @@ You can list available MCP servers and their tools for a given model:
 curl http://localhost:8080/v1/mcp/servers/my-mcp-model
 ```
 
-Returns:
+Returns a model wrapper and one status entry for every configured server:
 
 ```json
-[
-  {
-    "name": "weather-api",
-    "type": "remote",
-    "tools": ["get_weather", "get_forecast"]
-  },
-  {
-    "name": "search-engine",
-    "type": "remote",
-    "tools": ["web_search", "image_search"]
-  }
-]
+{
+  "model": "my-mcp-model",
+  "servers": [
+    {
+      "name": "weather-api",
+      "type": "remote",
+      "tools": ["get_weather", "get_forecast"]
+    },
+    {
+      "name": "search-engine",
+      "type": "remote",
+      "tools": [],
+      "error": "connection failed: ..."
+    }
+  ]
+}
 ```
+
+The Chat **MCP → Servers** tab uses this endpoint. A configured server remains listed when it is unavailable, shows the discovery error, and cannot be selected until a later discovery attempt succeeds. Reopening the dropdown or returning to the Servers tab retries discovery.
 
 ### MCP Prompts
 
@@ -382,7 +413,7 @@ MCP sessions are automatically managed by LocalAI:
 - **Cleanup on model unload**: When a model is unloaded (idle watchdog eviction, manual stop, or shutdown), all associated MCP sessions are closed and resources freed
 - **Graceful shutdown**: All MCP sessions are closed when LocalAI shuts down
 
-This means you don't need to manually manage MCP connections — they follow the model's lifecycle automatically.
+This means you don't need to manually manage MCP connections - they follow the model's lifecycle automatically.
 
 ## Supported MCP Servers
 
@@ -531,7 +562,7 @@ In addition to server-side MCP (where the backend connects to MCP servers), Loca
 
 ### How It Works
 
-1. **Add servers in the UI**: Click the "Client MCP" button in the chat header and add MCP server URLs
+1. **Add servers in the UI**: Click the **MCP** chip above the message box, open the **Client** tab, and add MCP server URLs
 2. **Browser connects directly**: The browser uses the MCP TypeScript SDK (`StreamableHTTPClientTransport` or `SSEClientTransport`) to connect to MCP servers
 3. **Tool discovery**: Connected servers' tools are sent as `tools` in the chat request body
 4. **Browser-side execution**: When the LLM calls a client-side tool, the browser executes it against the MCP server and sends the result back in a follow-up request

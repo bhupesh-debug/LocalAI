@@ -1,7 +1,7 @@
 +++
 disableToc = false
 title = "Constrained Grammars"
-weight = 15
+weight = 12
 url = "/features/constrained_grammars/"
 +++
 
@@ -70,3 +70,4 @@ For more complex grammars, you can define multi-line BNF rules. The grammar pars
 
 - [OpenAI Functions]({{%relref "features/openai-functions" %}}) - Function calling with structured outputs
 - [Text Generation]({{%relref "features/text-generation" %}}) - General text generation capabilities
+- [Moderation]({{%relref "features/moderation" %}}) - OpenAI-compatible safety classification whose response is constrained to the moderation schema

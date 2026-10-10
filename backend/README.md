@@ -46,7 +46,8 @@ The backend system provides language-specific Dockerfiles that handle the build 
 - **vllm**: High-performance LLM inference
 - **mlx**: Apple Silicon optimization
 - **diffusers**: Stable Diffusion models
-- **Audio**: coqui, faster-whisper, kitten-tts
+- **longcat-video**: CUDA text/image-to-video and speech-driven avatar generation
+- **Audio**: coqui, faster-whisper, funasr, kitten-tts
 - **Vision**: mlx-vlm, rfdetr
 - **Specialized**: rerankers, chatterbox, kokoro
 
@@ -55,6 +56,7 @@ The backend system provides language-specific Dockerfiles that handle the build 
 - **stablediffusion-ggml**: Stable Diffusion in Go with GGML Cpp backend
 - **piper**: Text-to-speech synthesis Golang with C bindings using rhaspy/piper
 - **local-store**: Vector storage backend
+- **valkey-store**: Durable vector storage backend backed by Valkey Search (FT.*)
 
 #### C++ Backends (`cpp/`)
 - **llama-cpp**: Llama.cpp integration

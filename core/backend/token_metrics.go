@@ -10,6 +10,7 @@ import (
 )
 
 func TokenMetrics(
+	ctx context.Context,
 	modelFile string,
 	loader *model.ModelLoader,
 	appConfig *config.ApplicationConfig,
@@ -25,8 +26,13 @@ func TokenMetrics(
 	if model == nil {
 		return nil, fmt.Errorf("could not loadmodel model")
 	}
+	release, err := AcquireGlobalBackendSlot()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 
-	res, err := model.GetTokenMetrics(context.Background(), &proto.MetricsRequest{})
+	res, err := model.GetTokenMetrics(ctx, &proto.MetricsRequest{})
 
 	return res, err
 }

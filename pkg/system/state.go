@@ -19,6 +19,9 @@ type SystemState struct {
 	Backend   Backend
 	Model     Model
 	VRAM      uint64
+	// StagingPath holds in-flight downloads before extraction; empty
+	// falls back to the OS temp directory.
+	StagingPath string
 
 	systemCapabilities string
 
@@ -26,6 +29,17 @@ type SystemState struct {
 	BackendImagesReleaseTag string
 	BackendImagesBranchTag  string
 	BackendDevSuffix        string
+	// PreferDevelopmentBackends installs the development image as the primary
+	// backend URI (the released image becomes a fallback) rather than only using
+	// development as a download fallback when the released image is missing.
+	PreferDevelopmentBackends bool
+
+	// RequireBackendIntegrity is the strict-integrity switch bound to
+	// --require-backend-integrity / LOCALAI_REQUIRE_BACKEND_INTEGRITY. The
+	// backend install path takes it as a call argument; the gallery index
+	// fetch reads it from here because the listing code it runs under never
+	// sees the application config.
+	RequireBackendIntegrity bool
 }
 
 type SystemStateOptions func(*SystemState)
@@ -39,6 +53,12 @@ func WithBackendPath(path string) SystemStateOptions {
 func WithBackendSystemPath(path string) SystemStateOptions {
 	return func(s *SystemState) {
 		s.Backend.BackendsSystemPath = path
+	}
+}
+
+func WithStagingPath(path string) SystemStateOptions {
+	return func(s *SystemState) {
+		s.StagingPath = path
 	}
 }
 
@@ -63,6 +83,18 @@ func WithBackendImagesBranchTag(tag string) SystemStateOptions {
 func WithBackendDevSuffix(suffix string) SystemStateOptions {
 	return func(s *SystemState) {
 		s.BackendDevSuffix = suffix
+	}
+}
+
+func WithRequireBackendIntegrity(require bool) SystemStateOptions {
+	return func(s *SystemState) {
+		s.RequireBackendIntegrity = require
+	}
+}
+
+func WithPreferDevelopmentBackends(prefer bool) SystemStateOptions {
+	return func(s *SystemState) {
+		s.PreferDevelopmentBackends = prefer
 	}
 }
 

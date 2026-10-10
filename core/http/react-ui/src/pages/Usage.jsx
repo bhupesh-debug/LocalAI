@@ -1,889 +1,375 @@
-import { useState, useEffect, useCallback, useRef, Fragment } from 'react'
+/* eslint-disable no-unused-vars -- components used only inside JSX look unused to this config, which has no eslint-plugin-react */
+import { Fragment, useMemo, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { useOutletContext } from 'react-router-dom'
-import { useAuth } from '../context/AuthContext'
-import { apiUrl } from '../utils/basePath'
+import { useTrafficWindow, useUsage } from '../hooks/useTraffic'
+import {
+  bucketLabel, compactCount, filterRows, groupId, groupUsage, keyRows, projectTotals, quotaForecast,
+  saveFile, seriesByBucket, sortRows, stackedByGroup, toCSV, totalsOf,
+} from '../utils/traffic'
+import TrafficChart from '../components/traffic/TrafficChart'
+import WindowSwitch from '../components/traffic/WindowSwitch'
+import { cssVars } from '../utils/modelLedger'
+import Icon from '../components/Icon'
 import LoadingSpinner from '../components/LoadingSpinner'
+import './traffic.css'
 
-const PERIODS = [
-  { key: 'day', label: 'Day' },
-  { key: 'week', label: 'Week' },
-  { key: 'month', label: 'Month' },
-  { key: 'all', label: 'All' },
-]
+// Estimated cost is opt-in and entirely local. LocalAI has no price of its own;
+// a multi-user install can type a price per million tokens to size a bill. The
+// prices stay in this browser and apply to recorded token counts.
+const PRICING_KEY = 'localai_token_pricing'
 
-const TOTAL_BUCKETS = { day: 24, week: 7, month: 30 }
-const HOURS_PER_BUCKET = { day: 1, week: 24, month: 24, all: 730 }
-
-function formatNumber(n) {
-  if (n == null) return '0'
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M'
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K'
-  return String(n)
+function loadPricing() {
+  try {
+    const p = JSON.parse(localStorage.getItem(PRICING_KEY) || '{}')
+    return { prompt: Number(p.prompt) || 0, completion: Number(p.completion) || 0 }
+  } catch { return { prompt: 0, completion: 0 } }
 }
 
-function StatCard({ icon, label, value, muted }) {
+function savePricing(p) {
+  try { localStorage.setItem(PRICING_KEY, JSON.stringify(p)) } catch { /* ignore */ }
+}
+
+const costOf = (row, p) => ((row.prompt || 0) / 1e6) * p.prompt + ((row.completion || 0) / 1e6) * p.completion
+function costText(n) {
+  if (!n) return '$0.00'
+  return n < 0.01 ? '<$0.01' : `$${n.toFixed(2)}`
+}
+
+function SortHead({ col, label, sort, onSort, className }) {
+  const active = sort.key === col
   return (
-    <div className="card" style={{ padding: 'var(--spacing-sm) var(--spacing-md)', flex: '1 1 0', minWidth: 120, opacity: muted ? 0.7 : 1 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
-        <i className={icon} style={{ color: 'var(--color-text-muted)', fontSize: '0.75rem' }} />
-        <span style={{ fontSize: '0.6875rem', color: 'var(--color-text-muted)', fontWeight: 500, textTransform: 'uppercase', letterSpacing: '0.03em' }}>{label}</span>
-      </div>
-      <div style={{ fontSize: '1.375rem', fontWeight: 700, fontFamily: 'JetBrains Mono, monospace', color: muted ? 'var(--color-text-secondary)' : 'var(--color-text-primary)' }}>
-        {muted ? '~' : ''}{formatNumber(value)}
-      </div>
-    </div>
+    <th scope="col" className={className} aria-sort={active ? (sort.direction === 'asc' ? 'ascending' : 'descending') : undefined}>
+      <button type="button" className="dk-table-sort" onClick={() => onSort({ key: col, direction: active && sort.direction === 'desc' ? 'asc' : 'desc' })}>
+        {label}
+        <Icon name="arrow-up" className="dk-icon" />
+      </button>
+    </th>
   )
 }
 
-function UsageBar({ value, max }) {
-  const pct = max > 0 ? Math.min((value / max) * 100, 100) : 0
+function lastUsed(iso, t) {
+  if (!iso) return '-'
+  const ms = Date.parse(iso)
+  if (Number.isNaN(ms)) return '-'
+  const diff = Date.now() - ms
+  if (diff < 60_000) return t('table.justNow')
+  if (diff < 3_600_000) return t('table.minutesAgo', { count: Math.round(diff / 60_000) })
+  if (diff < 86_400_000) return t('table.hoursAgo', { count: Math.round(diff / 3_600_000) })
+  return t('table.daysAgo', { count: Math.round(diff / 86_400_000) })
+}
+
+// The time series of one row, opened in place under it.
+function RowDetail({ id, by, buckets, period, t, cost, pricing }) {
+  const mine = useMemo(() => buckets.filter(b => groupId(b, by) === id), [buckets, by, id])
+  const series = useMemo(() => seriesByBucket(mine), [mine])
+  const projected = projectTotals(series, period)
+  const columns = series.map(p => ({
+    key: p.bucket, label: p.bucket, tick: bucketLabel(p.bucket, period),
+    segments: [{ id: 'prompt', value: p.prompt }, { id: 'completion', value: p.completion }],
+  }))
+  if (series.length === 0) return <p className="tf-note-line">{t('usage.noSeries')}</p>
   return (
-    <div style={{
-      width: '100%', height: 6, borderRadius: 3,
-      background: 'var(--color-bg-primary)',
-      overflow: 'hidden',
-    }}>
-      <div style={{
-        width: `${pct}%`, height: '100%', borderRadius: 3,
-        background: 'var(--color-primary)',
-        transition: 'width 0.3s ease',
-      }} />
-    </div>
-  )
-}
-
-function aggregateByModel(buckets) {
-  const map = {}
-  for (const b of buckets) {
-    const key = b.model || '(unknown)'
-    if (!map[key]) {
-      map[key] = { model: key, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, request_count: 0 }
-    }
-    map[key].prompt_tokens += b.prompt_tokens
-    map[key].completion_tokens += b.completion_tokens
-    map[key].total_tokens += b.total_tokens
-    map[key].request_count += b.request_count
-  }
-  return Object.values(map).sort((a, b) => b.total_tokens - a.total_tokens)
-}
-
-function aggregateByUser(buckets) {
-  const map = {}
-  for (const b of buckets) {
-    const key = b.user_id || '(unknown)'
-    if (!map[key]) {
-      map[key] = { user_id: key, user_name: b.user_name || key, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, request_count: 0 }
-    }
-    map[key].prompt_tokens += b.prompt_tokens
-    map[key].completion_tokens += b.completion_tokens
-    map[key].total_tokens += b.total_tokens
-    map[key].request_count += b.request_count
-  }
-  return Object.values(map).sort((a, b) => b.total_tokens - a.total_tokens)
-}
-
-function aggregateByBucket(buckets) {
-  const map = {}
-  for (const b of buckets) {
-    if (!b.bucket) continue
-    if (!map[b.bucket]) {
-      map[b.bucket] = { bucket: b.bucket, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, request_count: 0 }
-    }
-    map[b.bucket].prompt_tokens += b.prompt_tokens
-    map[b.bucket].completion_tokens += b.completion_tokens
-    map[b.bucket].total_tokens += b.total_tokens
-    map[b.bucket].request_count += b.request_count
-  }
-  return Object.values(map).sort((a, b) => a.bucket.localeCompare(b.bucket))
-}
-
-function aggregateByBucketForUser(buckets, userId) {
-  return aggregateByBucket(buckets.filter(b => b.user_id === userId))
-}
-
-function generateUserPredictions(adminUsage, userRows, period) {
-  const result = {}
-  for (const u of userRows) {
-    const ts = aggregateByBucketForUser(adminUsage, u.user_id)
-    const preds = generatePredictions(ts, period)
-    result[u.user_id] = { timeSeries: ts, predictions: preds }
-  }
-  return result
-}
-
-function formatBucket(bucket, period) {
-  if (!bucket) return ''
-  if (period === 'day') {
-    return bucket.split(' ')[1] || bucket
-  }
-  if (period === 'week' || period === 'month') {
-    const d = new Date(bucket + 'T00:00:00')
-    if (!isNaN(d)) return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
-    return bucket
-  }
-  const [y, m] = bucket.split('-')
-  if (y && m) {
-    const d = new Date(Number(y), Number(m) - 1)
-    if (!isNaN(d)) return d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' })
-  }
-  return bucket
-}
-
-function formatYLabel(n) {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M'
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K'
-  return String(n)
-}
-
-// --- Prediction helpers ---
-
-function linearRegression(values) {
-  const n = values.length
-  if (n < 2) return null
-  let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0
-  for (let i = 0; i < n; i++) {
-    sumX += i
-    sumY += values[i]
-    sumXY += i * values[i]
-    sumX2 += i * i
-  }
-  const denom = n * sumX2 - sumX * sumX
-  if (denom === 0) return { slope: 0, intercept: sumY / n }
-  const slope = (n * sumXY - sumX * sumY) / denom
-  const intercept = (sumY - slope * sumX) / n
-  return { slope, intercept }
-}
-
-function generateFutureBucketLabels(lastBucket, count, period) {
-  const labels = []
-  if (period === 'day') {
-    // lastBucket like "2026-03-21 14:00"
-    const parts = lastBucket.split(' ')
-    const datePart = parts[0] || ''
-    const hourStr = (parts[1] || '00:00').split(':')[0]
-    let hour = parseInt(hourStr, 10)
-    for (let i = 0; i < count; i++) {
-      hour++
-      if (hour >= 24) hour = 0
-      labels.push(`${datePart} ${String(hour).padStart(2, '0')}:00`)
-    }
-  } else if (period === 'week' || period === 'month') {
-    // lastBucket like "2026-03-21"
-    const d = new Date(lastBucket + 'T00:00:00')
-    for (let i = 0; i < count; i++) {
-      d.setDate(d.getDate() + 1)
-      const y = d.getFullYear()
-      const m = String(d.getMonth() + 1).padStart(2, '0')
-      const day = String(d.getDate()).padStart(2, '0')
-      labels.push(`${y}-${m}-${day}`)
-    }
-  } else {
-    // all: lastBucket like "2026-03"
-    const [y, m] = lastBucket.split('-').map(Number)
-    let year = y, month = m
-    for (let i = 0; i < count; i++) {
-      month++
-      if (month > 12) { month = 1; year++ }
-      labels.push(`${year}-${String(month).padStart(2, '0')}`)
-    }
-  }
-  return labels
-}
-
-function generatePredictions(timeSeries, period) {
-  if (!timeSeries || timeSeries.length < 2) return null
-
-  const n = timeSeries.length
-  const totalBuckets = TOTAL_BUCKETS[period]
-  const remaining = totalBuckets ? Math.max(totalBuckets - n, 0) : 3 // 'all' gets 3 extra months
-  if (remaining === 0) return null
-
-  const metrics = ['prompt_tokens', 'completion_tokens', 'total_tokens', 'request_count']
-  const regressions = {}
-  for (const m of metrics) {
-    regressions[m] = linearRegression(timeSeries.map(d => d[m]))
-  }
-
-  const lastBucket = timeSeries[n - 1].bucket
-  const futureLabels = generateFutureBucketLabels(lastBucket, remaining, period)
-
-  const predictedBuckets = futureLabels.map((label, i) => {
-    const idx = n + i
-    const entry = { bucket: label, predicted: true }
-    for (const m of metrics) {
-      const reg = regressions[m]
-      entry[m] = reg ? Math.max(0, Math.round(reg.intercept + reg.slope * idx)) : 0
-    }
-    return entry
-  })
-
-  const existingTotals = {
-    prompt_tokens: timeSeries.reduce((s, d) => s + d.prompt_tokens, 0),
-    completion_tokens: timeSeries.reduce((s, d) => s + d.completion_tokens, 0),
-    total_tokens: timeSeries.reduce((s, d) => s + d.total_tokens, 0),
-    request_count: timeSeries.reduce((s, d) => s + d.request_count, 0),
-  }
-  const projectedTotals = { ...existingTotals }
-  for (const b of predictedBuckets) {
-    for (const m of metrics) {
-      projectedTotals[m] += b[m]
-    }
-  }
-
-  return { predictedBuckets, projectedTotals }
-}
-
-function formatDuration(hours) {
-  if (!isFinite(hours) || hours < 0) return 'N/A'
-  if (hours < 1) return '< 1 hour'
-  if (hours < 48) return `~${Math.round(hours)} hours`
-  const days = Math.round(hours / 24)
-  if (days < 60) return `~${days} days`
-  return `~${Math.round(days / 30)} months`
-}
-
-function computeQuotaExhaustion(quotas, timeSeries, period) {
-  if (!quotas?.length || !timeSeries?.length) return []
-
-  const totalTokens = timeSeries.reduce((s, b) => s + b.total_tokens, 0)
-  const totalRequests = timeSeries.reduce((s, b) => s + b.request_count, 0)
-  const bucketCount = timeSeries.length
-  const hpb = HOURS_PER_BUCKET[period] || 24
-  const tokensPerHour = bucketCount > 0 ? (totalTokens / bucketCount) / hpb : 0
-  const requestsPerHour = bucketCount > 0 ? (totalRequests / bucketCount) / hpb : 0
-
-  const results = []
-  for (const q of quotas) {
-    const items = []
-
-    if (q.max_total_tokens != null) {
-      const remaining = q.max_total_tokens - (q.current_tokens || 0)
-      const hoursLeft = tokensPerHour > 0 ? remaining / tokensPerHour : Infinity
-      const resetsAt = q.resets_at ? new Date(q.resets_at) : null
-      const hoursUntilReset = resetsAt ? Math.max(0, (resetsAt - Date.now()) / 3600000) : Infinity
-      items.push({
-        label: 'Tokens',
-        current: q.current_tokens || 0,
-        max: q.max_total_tokens,
-        hoursLeft: Math.min(hoursLeft, hoursUntilReset),
-        withinLimits: hoursLeft >= hoursUntilReset,
-      })
-    }
-
-    if (q.max_requests != null) {
-      const remaining = q.max_requests - (q.current_requests || 0)
-      const hoursLeft = requestsPerHour > 0 ? remaining / requestsPerHour : Infinity
-      const resetsAt = q.resets_at ? new Date(q.resets_at) : null
-      const hoursUntilReset = resetsAt ? Math.max(0, (resetsAt - Date.now()) / 3600000) : Infinity
-      items.push({
-        label: 'Requests',
-        current: q.current_requests || 0,
-        max: q.max_requests,
-        hoursLeft: Math.min(hoursLeft, hoursUntilReset),
-        withinLimits: hoursLeft >= hoursUntilReset,
-      })
-    }
-
-    if (items.length > 0) {
-      results.push({ model: q.model || 'All models', window: q.window, items })
-    }
-  }
-  return results
-}
-
-// --- Components ---
-
-function PredictionCards({ predictions, quotaExhaustion, period }) {
-  if (!predictions) {
-    return (
-      <div className="card" style={{ padding: 'var(--spacing-md)', marginBottom: 'var(--spacing-md)', borderTop: '2px solid var(--color-primary)', borderTopLeftRadius: 0, borderTopRightRadius: 0, opacity: 0.6 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.8125rem', color: 'var(--color-text-muted)' }}>
-          <i className="fas fa-chart-line" />
-          <span>Not enough data to predict trends (need at least 2 data points)</span>
-        </div>
-      </div>
-    )
-  }
-
-  const { projectedTotals } = predictions
-  const periodLabel = period === 'all' ? '(next 3 months)' : `end of ${period}`
-
-  return (
-    <div style={{ marginBottom: 'var(--spacing-md)' }}>
-      <div className="card" style={{ padding: 'var(--spacing-md)', borderTop: '2px solid var(--color-primary)', borderTopLeftRadius: 0, borderTopRightRadius: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 'var(--spacing-sm)' }}>
-          <i className="fas fa-chart-line" style={{ color: 'var(--color-primary)', fontSize: '0.8125rem' }} />
-          <span style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--color-text-primary)' }}>
-            Projected {periodLabel}
-          </span>
-          <span style={{ fontSize: '0.6875rem', color: 'var(--color-text-muted)', fontStyle: 'italic' }}>
-            based on linear trend
-          </span>
-        </div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 'var(--spacing-sm)' }}>
-          <StatCard icon="fas fa-arrow-right-arrow-left" label="Proj. Requests" value={projectedTotals.request_count} muted />
-          <StatCard icon="fas fa-arrow-up" label="Proj. Prompt" value={projectedTotals.prompt_tokens} muted />
-          <StatCard icon="fas fa-arrow-down" label="Proj. Completion" value={projectedTotals.completion_tokens} muted />
-          <StatCard icon="fas fa-coins" label="Proj. Total" value={projectedTotals.total_tokens} muted />
-        </div>
-      </div>
-
-      {quotaExhaustion.length > 0 && (
-        <div className="card" style={{ padding: 'var(--spacing-md)', marginTop: 'var(--spacing-sm)' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 'var(--spacing-sm)' }}>
-            <i className="fas fa-gauge-high" style={{ color: 'var(--color-text-muted)', fontSize: '0.8125rem' }} />
-            <span style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--color-text-primary)' }}>Quota forecast</span>
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-sm)' }}>
-            {quotaExhaustion.map((q, qi) => (
-              <div key={qi}>
-                <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--color-text-secondary)', marginBottom: 4 }}>
-                  {q.model} <span style={{ fontWeight: 400, color: 'var(--color-text-muted)' }}>({q.window} window)</span>
-                </div>
-                {q.items.map((item, ii) => (
-                  <div key={ii} style={{ display: 'flex', alignItems: 'center', gap: 'var(--spacing-sm)', marginBottom: 4 }}>
-                    <span style={{ minWidth: 70, fontSize: '0.75rem', color: 'var(--color-text-muted)', fontFamily: 'JetBrains Mono, monospace' }}>
-                      {item.label}
-                    </span>
-                    <div style={{ flex: 1, maxWidth: 200 }}>
-                      <UsageBar value={item.current} max={item.max} />
-                    </div>
-                    <span style={{ fontSize: '0.75rem', fontFamily: 'JetBrains Mono, monospace', color: 'var(--color-text-muted)', minWidth: 100 }}>
-                      {formatNumber(item.current)}/{formatNumber(item.max)}
-                    </span>
-                    {item.withinLimits ? (
-                      <span style={{ fontSize: '0.6875rem', color: 'var(--color-success, #22c55e)' }}>
-                        <i className="fas fa-check" style={{ marginRight: 4 }} />Within limits
-                      </span>
-                    ) : (
-                      <span style={{ fontSize: '0.6875rem', color: 'var(--color-warning, #f59e0b)' }}>
-                        <i className="fas fa-exclamation-triangle" style={{ marginRight: 4 }} />{formatDuration(item.hoursLeft)} left
-                      </span>
-                    )}
-                  </div>
-                ))}
-              </div>
-            ))}
-          </div>
-        </div>
+    <div className="tf-detail">
+      <TrafficChart
+        testId="row-chart"
+        title={t('usage.rowChart')}
+        sub={t('charts.tokensUnit')}
+        columns={columns}
+        groups={[{ id: 'prompt', name: t('charts.in'), series: 1 }, { id: 'completion', name: t('charts.out'), series: 2 }]}
+      />
+      {projected && (
+        <p className="tf-note-line" data-testid="row-projection">
+          {t('usage.projected', { value: compactCount(projected.total) })}
+          {cost ? ` ${t('usage.projectedCost', { value: costText(costOf(projected, pricing)) })}` : ''}
+        </p>
       )}
-    </div>
-  )
-}
-
-function UsageTimeChart({ data, predictedData, period }) {
-  const containerRef = useRef(null)
-  const [width, setWidth] = useState(600)
-  const [tooltip, setTooltip] = useState(null)
-
-  useEffect(() => {
-    if (!containerRef.current) return
-    const observer = new ResizeObserver(entries => {
-      for (const entry of entries) {
-        setWidth(entry.contentRect.width)
-      }
-    })
-    observer.observe(containerRef.current)
-    return () => observer.disconnect()
-  }, [])
-
-  if (!data || data.length === 0) return null
-
-  const allData = predictedData ? [...data, ...predictedData] : data
-  const actualCount = data.length
-
-  const height = 200
-  const margin = { top: 16, right: 16, bottom: 40, left: 56 }
-  const chartW = width - margin.left - margin.right
-  const chartH = height - margin.top - margin.bottom
-
-  const maxVal = Math.max(...allData.map(d => d.total_tokens), 1)
-  const barWidth = Math.max(Math.min(chartW / allData.length - 2, 40), 4)
-  const barGap = (chartW - barWidth * allData.length) / (allData.length + 1)
-
-  // Y-axis ticks (4 ticks)
-  const ticks = [0, 1, 2, 3, 4].map(i => Math.round(maxVal * i / 4))
-
-  return (
-    <div className="card" style={{ padding: 'var(--spacing-md)', marginBottom: 'var(--spacing-md)' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 'var(--spacing-sm)' }}>
-        <span style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--color-text-primary)' }}>Tokens over time</span>
-        <div style={{ display: 'flex', gap: 'var(--spacing-md)', fontSize: '0.6875rem', color: 'var(--color-text-muted)' }}>
-          <span><span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 2, background: 'var(--color-primary)', marginRight: 4, verticalAlign: 'middle' }} />Prompt</span>
-          <span><span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 2, background: 'var(--color-primary)', opacity: 0.35, marginRight: 4, verticalAlign: 'middle' }} />Completion</span>
-          {predictedData && predictedData.length > 0 && (
-            <span>
-              <span style={{
-                display: 'inline-block', width: 8, height: 8, borderRadius: 2,
-                border: '1.5px dashed var(--color-primary)', background: 'transparent',
-                marginRight: 4, verticalAlign: 'middle', opacity: 0.6,
-              }} />
-              Predicted
-            </span>
-          )}
-        </div>
-      </div>
-      <div ref={containerRef} style={{ position: 'relative', width: '100%' }}>
-        <svg width={width} height={height} style={{ display: 'block' }}>
-          <g transform={`translate(${margin.left},${margin.top})`}>
-            {/* Grid lines and Y labels */}
-            {ticks.map((t, i) => {
-              const y = chartH - (t / maxVal) * chartH
-              return (
-                <g key={i}>
-                  <line x1={0} y1={y} x2={chartW} y2={y} stroke="var(--color-border)" strokeOpacity={0.5} strokeDasharray={i === 0 ? 'none' : '3,3'} />
-                  <text x={-8} y={y + 4} textAnchor="end" fontSize="10" fill="var(--color-text-muted)" fontFamily="JetBrains Mono, monospace">
-                    {formatYLabel(t)}
-                  </text>
-                </g>
-              )
-            })}
-            {/* Actual bars */}
-            {data.map((d, i) => {
-              const x = barGap + i * (barWidth + barGap)
-              const promptH = (d.prompt_tokens / maxVal) * chartH
-              const compH = (d.completion_tokens / maxVal) * chartH
-              return (
-                <g key={d.bucket}
-                  onMouseEnter={(e) => {
-                    const rect = containerRef.current.getBoundingClientRect()
-                    setTooltip({
-                      x: e.clientX - rect.left,
-                      y: e.clientY - rect.top,
-                      data: d,
-                    })
-                  }}
-                  onMouseMove={(e) => {
-                    const rect = containerRef.current.getBoundingClientRect()
-                    setTooltip(prev => prev ? {
-                      ...prev,
-                      x: e.clientX - rect.left,
-                      y: e.clientY - rect.top,
-                    } : null)
-                  }}
-                  onMouseLeave={() => setTooltip(null)}
-                  style={{ cursor: 'default' }}
-                >
-                  {/* Invisible hit area */}
-                  <rect x={x} y={0} width={barWidth} height={chartH} fill="transparent" />
-                  {/* Prompt tokens (bottom) */}
-                  <rect x={x} y={chartH - promptH - compH} width={barWidth} height={promptH} fill="var(--color-primary)" rx={2} />
-                  {/* Completion tokens (top) */}
-                  <rect x={x} y={chartH - compH} width={barWidth} height={compH} fill="var(--color-primary)" opacity={0.35} rx={2} />
-                </g>
-              )
-            })}
-            {/* Separator line between actual and predicted */}
-            {predictedData && predictedData.length > 0 && (() => {
-              const sepX = barGap + actualCount * (barWidth + barGap) - barGap / 2
-              return (
-                <line x1={sepX} y1={0} x2={sepX} y2={chartH}
-                  stroke="var(--color-text-muted)" strokeOpacity={0.4} strokeDasharray="4,3" strokeWidth={1} />
-              )
-            })()}
-            {/* Predicted bars */}
-            {predictedData && predictedData.map((d, i) => {
-              const idx = actualCount + i
-              const x = barGap + idx * (barWidth + barGap)
-              const promptH = (d.prompt_tokens / maxVal) * chartH
-              const compH = (d.completion_tokens / maxVal) * chartH
-              const totalH = promptH + compH
-              return (
-                <g key={`pred-${d.bucket}`}
-                  onMouseEnter={(e) => {
-                    const rect = containerRef.current.getBoundingClientRect()
-                    setTooltip({
-                      x: e.clientX - rect.left,
-                      y: e.clientY - rect.top,
-                      data: d,
-                      predicted: true,
-                    })
-                  }}
-                  onMouseMove={(e) => {
-                    const rect = containerRef.current.getBoundingClientRect()
-                    setTooltip(prev => prev ? {
-                      ...prev,
-                      x: e.clientX - rect.left,
-                      y: e.clientY - rect.top,
-                    } : null)
-                  }}
-                  onMouseLeave={() => setTooltip(null)}
-                  style={{ cursor: 'default' }}
-                >
-                  {/* Invisible hit area */}
-                  <rect x={x} y={0} width={barWidth} height={chartH} fill="transparent" />
-                  {/* Predicted bar outline */}
-                  {totalH > 0 && (
-                    <rect x={x} y={chartH - totalH} width={barWidth} height={totalH}
-                      fill="var(--color-primary)" fillOpacity={0.08}
-                      stroke="var(--color-primary)" strokeOpacity={0.35} strokeDasharray="3,2" strokeWidth={1}
-                      rx={2} />
-                  )}
-                  {/* Prompt fill (faded) */}
-                  <rect x={x} y={chartH - promptH - compH} width={barWidth} height={promptH}
-                    fill="var(--color-primary)" opacity={0.15} rx={2} />
-                  {/* Completion fill (more faded) */}
-                  <rect x={x} y={chartH - compH} width={barWidth} height={compH}
-                    fill="var(--color-primary)" opacity={0.08} rx={2} />
-                </g>
-              )
-            })}
-            {/* X-axis labels */}
-            {allData.map((d, i) => {
-              const x = barGap + i * (barWidth + barGap) + barWidth / 2
-              // Skip some labels if too many
-              const skip = allData.length > 20 ? Math.ceil(allData.length / 12) : 1
-              if (i % skip !== 0) return null
-              return (
-                <text key={d.bucket} x={x} y={chartH + 16} textAnchor="middle" fontSize="10"
-                  fill={d.predicted ? 'var(--color-text-muted)' : 'var(--color-text-secondary)'}
-                  fontFamily="JetBrains Mono, monospace"
-                  fontStyle={d.predicted ? 'italic' : 'normal'}
-                >
-                  {formatBucket(d.bucket, period)}
-                </text>
-              )
-            })}
-          </g>
-        </svg>
-        {tooltip && (
-          <div style={{
-            position: 'absolute',
-            left: tooltip.x + 12,
-            top: tooltip.y - 8,
-            background: 'var(--color-bg-tertiary)',
-            border: '1px solid var(--color-border)',
-            borderRadius: 'var(--radius-md)',
-            padding: 'var(--spacing-xs) var(--spacing-sm)',
-            fontSize: '0.75rem',
-            fontFamily: 'JetBrains Mono, monospace',
-            color: 'var(--color-text-primary)',
-            pointerEvents: 'none',
-            zIndex: 10,
-            boxShadow: 'var(--shadow-md)',
-            whiteSpace: 'nowrap',
-          }}>
-            <div style={{ fontWeight: 600, marginBottom: 2 }}>
-              {tooltip.predicted && <span style={{ color: 'var(--color-text-muted)', fontStyle: 'italic', marginRight: 4 }}>Predicted</span>}
-              {formatBucket(tooltip.data.bucket, period)}
-            </div>
-            <div><span style={{ color: 'var(--color-primary)' }}>Prompt:</span> {tooltip.predicted ? '~' : ''}{tooltip.data.prompt_tokens.toLocaleString()}</div>
-            <div><span style={{ color: 'var(--color-text-secondary)' }}>Completion:</span> {tooltip.predicted ? '~' : ''}{tooltip.data.completion_tokens.toLocaleString()}</div>
-            <div style={{ color: 'var(--color-text-muted)', borderTop: '1px solid var(--color-border)', marginTop: 2, paddingTop: 2 }}>
-              {tooltip.predicted ? '~' : ''}{tooltip.data.request_count} requests
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
-
-function ModelDistChart({ rows }) {
-  if (!rows || rows.length === 0) return null
-
-  const maxVal = Math.max(...rows.map(r => r.total_tokens), 1)
-  const barH = 24
-  const gap = 4
-  const height = rows.length * (barH + gap) + gap
-
-  return (
-    <div className="card" style={{ padding: 'var(--spacing-md)', marginBottom: 'var(--spacing-md)' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 'var(--spacing-sm)' }}>
-        <span style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--color-text-primary)' }}>Token distribution by model</span>
-        <div style={{ display: 'flex', gap: 'var(--spacing-md)', fontSize: '0.6875rem', color: 'var(--color-text-muted)' }}>
-          <span><span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 2, background: 'var(--color-primary)', marginRight: 4, verticalAlign: 'middle' }} />Prompt</span>
-          <span><span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 2, background: 'var(--color-primary)', opacity: 0.35, marginRight: 4, verticalAlign: 'middle' }} />Completion</span>
-        </div>
-      </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: gap }}>
-        {rows.map(row => {
-          const promptPct = (row.prompt_tokens / maxVal) * 100
-          const compPct = (row.completion_tokens / maxVal) * 100
-          return (
-            <div key={row.model} style={{ display: 'flex', alignItems: 'center', gap: 'var(--spacing-sm)' }}>
-              <div style={{
-                width: 120, minWidth: 120, fontSize: '0.75rem', fontFamily: 'JetBrains Mono, monospace',
-                color: 'var(--color-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-              }} title={row.model}>
-                {row.model}
-              </div>
-              <div style={{ flex: 1, height: barH, background: 'var(--color-bg-primary)', borderRadius: 4, overflow: 'hidden', display: 'flex' }}>
-                <div style={{ width: `${promptPct}%`, height: '100%', background: 'var(--color-primary)', transition: 'width 0.3s ease' }} />
-                <div style={{ width: `${compPct}%`, height: '100%', background: 'var(--color-primary)', opacity: 0.35, transition: 'width 0.3s ease' }} />
-              </div>
-              <div style={{
-                minWidth: 60, textAlign: 'right', fontSize: '0.75rem', fontFamily: 'JetBrains Mono, monospace',
-                color: 'var(--color-text-muted)', fontWeight: 600,
-              }}>
-                {formatNumber(row.total_tokens)}
-              </div>
-            </div>
-          )
-        })}
-      </div>
     </div>
   )
 }
 
 export default function Usage() {
-  const { addToast } = useOutletContext()
-  const { isAdmin, authEnabled } = useAuth()
-  const [period, setPeriod] = useState('month')
-  const [loading, setLoading] = useState(true)
-  const [usage, setUsage] = useState([])
-  const [totals, setTotals] = useState({})
-  const [adminUsage, setAdminUsage] = useState([])
-  const [adminTotals, setAdminTotals] = useState({})
-  const [activeTab, setActiveTab] = useState('models')
-  const [quotas, setQuotas] = useState([])
-  const [selectedUserId, setSelectedUserId] = useState(null)
+  const { addToast } = useOutletContext() || {}
+  const { t } = useTranslation('traffic')
+  const { window: win } = useTrafficWindow()
+  const usage = useUsage(win.period, { sources: true })
+  const { isAdmin, authEnabled } = usage
 
-  const fetchUsage = useCallback(async () => {
-    setLoading(true)
-    try {
-      const usagePromise = fetch(apiUrl(`/api/auth/usage?period=${period}`))
-      const quotaPromise = fetch(apiUrl('/api/auth/quota'))
+  const [by, setBy] = useState('model')
+  const [model, setModel] = useState('')
+  const [query, setQuery] = useState('')
+  const [sort, setSort] = useState({ key: 'total', direction: 'desc' })
+  const [compact, setCompact] = useState(false)
+  const [open, setOpen] = useState(() => new Set())
+  const [pricing, setPricingState] = useState(loadPricing)
+  const [showPricing, setShowPricing] = useState(false)
+  const setPricing = p => { setPricingState(p); savePricing(p) }
+  const costOn = pricing.prompt > 0 || pricing.completion > 0
 
-      const [res, quotaRes] = await Promise.all([usagePromise, quotaPromise])
+  const groups = [
+    { id: 'model', label: t('usage.byModel') },
+    ...(isAdmin ? [{ id: 'user', label: t('usage.byUser') }] : []),
+    ...(authEnabled ? [{ id: 'key', label: t('usage.byKey') }] : []),
+  ]
+  const grouping = groups.some(g => g.id === by) ? by : 'model'
 
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
-      setUsage(data.usage || [])
-      setTotals(data.totals || {})
+  const keyBuckets = usage.keys?.buckets || []
+  const keysTotals = usage.keys?.totals
+  const ledgerRows = useMemo(
+    () => (model ? usage.rows.filter(b => b.model === model) : usage.rows),
+    [usage.rows, model],
+  )
+  const bucketsFor = grouping === 'key' ? keyBuckets : ledgerRows
+  const rows = useMemo(() => {
+    const base = grouping === 'key' ? keyRows(keysTotals, { showUser: isAdmin }) : groupUsage(ledgerRows, grouping)
+    return sortRows(filterRows(base, query), sort)
+  }, [grouping, keysTotals, ledgerRows, isAdmin, query, sort])
 
-      if (quotaRes.ok) {
-        const quotaData = await quotaRes.json()
-        setQuotas(quotaData.quotas || [])
-      }
+  const totals = useMemo(() => totalsOf(ledgerRows), [ledgerRows])
+  const series = useMemo(() => seriesByBucket(ledgerRows), [ledgerRows])
+  const models = useMemo(() => [...new Set(usage.rows.map(b => b.model).filter(Boolean))].sort(), [usage.rows])
+  const stack = useMemo(() => stackedByGroup(bucketsFor, grouping, 4), [bucketsFor, grouping])
+  const columns = useMemo(() => stack.points.map(p => ({
+    key: p.bucket, label: p.bucket, tick: bucketLabel(p.bucket, win.period),
+    segments: stack.groups.map(g => ({ id: g.id, value: p.values[g.id] || 0 })),
+  })), [stack, win.period])
+  const forecast = useMemo(() => quotaForecast(usage.quotas, series, win.period), [usage.quotas, series, win.period])
+  const projected = useMemo(() => projectTotals(series, win.period), [series, win.period])
+  const peak = rows.reduce((m, r) => Math.max(m, r.total), 0)
+  const windowName = t(`window.long.${win.id}`)
+  const groupName = groups.find(g => g.id === grouping)?.label || ''
 
-      if (isAdmin) {
-        const adminRes = await fetch(apiUrl(`/api/auth/admin/usage?period=${period}`))
-        if (adminRes.ok) {
-          const adminData = await adminRes.json()
-          setAdminUsage(adminData.usage || [])
-          setAdminTotals(adminData.totals || {})
-        }
-      }
-    } catch (err) {
-      addToast(`Failed to load usage: ${err.message}`, 'error')
-    } finally {
-      setLoading(false)
-    }
-  }, [period, isAdmin, addToast])
+  const toggleOpen = id => setOpen(prev => {
+    const next = new Set(prev)
+    if (next.has(id)) next.delete(id); else next.add(id)
+    return next
+  })
 
-  useEffect(() => {
-    if (authEnabled) fetchUsage()
-    else setLoading(false)
-  }, [fetchUsage, authEnabled])
-
-  if (!authEnabled) {
-    return (
-      <div className="page">
-        <div className="empty-state">
-          <div className="empty-state-icon"><i className="fas fa-chart-bar" /></div>
-          <h2 className="empty-state-title">Usage tracking unavailable</h2>
-          <p className="empty-state-text">Authentication must be enabled to track API usage.</p>
-        </div>
-      </div>
-    )
+  // Export what the table holds, as it is sorted and filtered. Done here, in
+  // the browser: there is no export endpoint.
+  const exportColumns = [
+    { label: groupName, value: r => r.name },
+    ...(grouping === 'model' || grouping === 'user' ? [] : [{ label: t('table.owner'), value: r => r.sub }]),
+    { label: t('table.requests'), value: r => r.requests },
+    { label: t('table.tokensIn'), value: r => r.prompt },
+    { label: t('table.tokensOut'), value: r => r.completion },
+    { label: t('table.tokens'), value: r => r.total },
+    ...(costOn ? [{ label: t('table.cost'), value: r => (r.prompt == null ? '' : costOf(r, pricing).toFixed(4)) }] : []),
+  ]
+  const stamp = new Date().toISOString().slice(0, 10)
+  const exportCsv = () => {
+    saveFile(`usage-${grouping}-${win.id}-${stamp}.csv`, toCSV(exportColumns, rows), 'text/csv')
+    addToast?.(t('usage.exported', { count: rows.length }), 'success', 2000)
+  }
+  const exportJson = () => {
+    const out = rows.map(r => Object.fromEntries(exportColumns.map(c => [c.label, c.value(r)])))
+    saveFile(`usage-${grouping}-${win.id}-${stamp}.json`, JSON.stringify(out, null, 2), 'application/json')
+    addToast?.(t('usage.exported', { count: rows.length }), 'success', 2000)
   }
 
-  const modelRows = aggregateByModel(isAdmin ? adminUsage : usage)
-  const userRows = isAdmin ? aggregateByUser(adminUsage) : []
-  const maxTokens = modelRows.reduce((max, r) => Math.max(max, r.total_tokens), 0)
-  const maxUserTokens = userRows.reduce((max, r) => Math.max(max, r.total_tokens), 0)
-
-  const displayTotals = isAdmin ? adminTotals : totals
-  const displayUsage = isAdmin ? adminUsage : usage
-  const timeSeries = aggregateByBucket(displayUsage)
-
-  const predictions = generatePredictions(timeSeries, period)
-  const quotaExhaustion = computeQuotaExhaustion(quotas, timeSeries, period)
-  const userPredictions = isAdmin && userRows.length > 0 ? generateUserPredictions(adminUsage, userRows, period) : {}
-
-  const monoCell = { fontFamily: 'JetBrains Mono, monospace', fontSize: '0.8125rem' }
+  const cols = 7 + (costOn ? 1 : 0)
 
   return (
-    <div className="page">
-      <div className="page-header" style={{ marginBottom: 'var(--spacing-sm)' }}>
-        <h1 className="page-title">Usage</h1>
-        <p className="page-subtitle">API token usage statistics</p>
-      </div>
-
-      {/* Period selector + tabs */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--spacing-xs)', marginBottom: 'var(--spacing-md)', flexWrap: 'wrap' }}>
-        {PERIODS.map(p => (
-          <button
-            key={p.key}
-            className={`btn btn-sm ${period === p.key ? 'btn-primary' : 'btn-secondary'}`}
-            onClick={() => setPeriod(p.key)}
-          >
-            {p.label}
-          </button>
-        ))}
-        {isAdmin && (
-          <>
-            <div style={{ width: 1, height: 20, background: 'var(--color-border-subtle)', margin: '0 var(--spacing-xs)' }} />
-            <button
-              className={`btn btn-sm ${activeTab === 'models' ? 'btn-primary' : 'btn-secondary'}`}
-              onClick={() => setActiveTab('models')}
-            >
-              <i className="fas fa-cube" style={{ fontSize: '0.7rem' }} /> Models
-            </button>
-            <button
-              className={`btn btn-sm ${activeTab === 'users' ? 'btn-primary' : 'btn-secondary'}`}
-              onClick={() => setActiveTab('users')}
-            >
-              <i className="fas fa-users" style={{ fontSize: '0.7rem' }} /> Users
-            </button>
-          </>
-        )}
-        <div style={{ flex: 1 }} />
-        <button className="btn btn-secondary btn-sm" onClick={fetchUsage} disabled={loading} style={{ gap: 4 }}>
-          <i className={`fas fa-rotate${loading ? ' fa-spin' : ''}`} /> Refresh
-        </button>
-      </div>
-
-      {loading ? (
-        <div style={{ display: 'flex', justifyContent: 'center', padding: 'var(--spacing-xl)' }}>
-          <LoadingSpinner size="lg" />
+    <div className="page page--wide tf-page" data-testid="usage-page">
+      <header className="tf-head">
+        <div className="tf-head__lead">
+          <h1 className="tf-title">{t('usage.title', { window: windowName })}</h1>
         </div>
+        <div className="tf-head__acts">
+          <WindowSwitch />
+          <button type="button" className="dk-btn dk-btn--secondary dk-btn--icon" aria-label={t('refresh')} onClick={usage.reload} disabled={usage.loading}>
+            <Icon name="refresh" spin={usage.loading} />
+          </button>
+        </div>
+      </header>
+      <p className="tf-source">{isAdmin ? t('usage.sourceAdmin') : t('usage.sourceOwn')}</p>
+
+      {usage.error && (
+        <div className="tf-error" role="alert">
+          <Icon name="alert-circle" />
+          <span>{t('usage.error', { message: String(usage.error.message || usage.error) })}</span>
+          <button type="button" className="dk-btn dk-btn--secondary dk-btn--sm" onClick={usage.reload}>{t('retry')}</button>
+        </div>
+      )}
+
+      {usage.loading && usage.rows.length === 0 ? (
+        <div className="tf-loading" data-testid="usage-loading"><LoadingSpinner size="lg" /></div>
       ) : (
         <>
-          {/* Summary cards */}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 'var(--spacing-sm)', marginBottom: 'var(--spacing-md)' }}>
-            <StatCard icon="fas fa-arrow-right-arrow-left" label="Requests" value={displayTotals.request_count} />
-            <StatCard icon="fas fa-arrow-up" label="Prompt" value={displayTotals.prompt_tokens} />
-            <StatCard icon="fas fa-arrow-down" label="Completion" value={displayTotals.completion_tokens} />
-            <StatCard icon="fas fa-coins" label="Total" value={displayTotals.total_tokens} />
+          <div className="tf-controls">
+            <div className="tf-controls__group">
+              <span className="tf-controls__label" id="usage-group-label">{t('usage.groupBy')}</span>
+              <div className="dk-segmented" role="radiogroup" aria-labelledby="usage-group-label">
+                {groups.map(g => (
+                  <button key={g.id} type="button" role="radio" aria-checked={grouping === g.id} className="dk-seg" onClick={() => { setBy(g.id); setOpen(new Set()) }}>
+                    {g.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="tf-controls__group tf-controls__group--end">
+              {grouping !== 'key' && models.length > 1 && (
+                <label className="tf-controls__field">
+                  <span>{t('usage.modelFilter')}</span>
+                  <select className="dk-select" value={model} onChange={e => setModel(e.target.value)}>
+                    <option value="">{t('usage.allModels')}</option>
+                    {models.map(m => <option key={m} value={m}>{m}</option>)}
+                  </select>
+                </label>
+              )}
+              <div className="dk-input-icon tf-search">
+                <Icon name="search" className="dk-icon" />
+                <input className="dk-input" type="search" aria-label={t('usage.search')} placeholder={t('usage.search')} value={query} onChange={e => setQuery(e.target.value)} />
+              </div>
+              <button type="button" className="dk-btn dk-btn--secondary" aria-pressed={showPricing || costOn} onClick={() => setShowPricing(v => !v)}>
+                <Icon name="dollar" /> {costOn ? t('usage.pricing') : t('usage.setPricing')}
+              </button>
+            </div>
           </div>
 
-          {/* Predictions */}
-          {timeSeries.length > 0 && (
-            <PredictionCards predictions={predictions} quotaExhaustion={quotaExhaustion} period={period} />
+          {showPricing && (
+            <div className="dk-card tf-pricing" data-testid="pricing-panel">
+              <label className="dk-field">
+                <span className="dk-label">{t('usage.pricePrompt')}</span>
+                <input className="dk-input dk-input--mono" type="number" min="0" step="0.01" placeholder="0.00" value={pricing.prompt || ''} onChange={e => setPricing({ ...pricing, prompt: Number(e.target.value) || 0 })} />
+              </label>
+              <label className="dk-field">
+                <span className="dk-label">{t('usage.priceCompletion')}</span>
+                <input className="dk-input dk-input--mono" type="number" min="0" step="0.01" placeholder="0.00" value={pricing.completion || ''} onChange={e => setPricing({ ...pricing, completion: Number(e.target.value) || 0 })} />
+              </label>
+              {costOn && <button type="button" className="dk-btn dk-btn--ghost" onClick={() => setPricing({ prompt: 0, completion: 0 })}><Icon name="close" /> {t('usage.clearPricing')}</button>}
+              <p className="tf-note-line">{t('usage.pricingNote')}</p>
+            </div>
           )}
 
-          {/* Charts */}
-          <UsageTimeChart data={timeSeries} predictedData={predictions?.predictedBuckets} period={period} />
-          {activeTab === 'models' && <ModelDistChart rows={modelRows} />}
+          {rows.length === 0 && !usage.error ? (
+            <div className="dk-empty tf-empty" data-testid="usage-empty">
+              <Icon name="chart-bar" className="dk-empty-icon" />
+              <h2 className="dk-empty-title">{query || model ? t('usage.noMatch') : t('usage.emptyTitle')}</h2>
+              <p className="dk-empty-text">{query || model ? t('usage.noMatchText') : t('usage.emptyText')}</p>
+            </div>
+          ) : (
+            <>
+              <p className="tf-summary" data-testid="usage-summary">
+                <strong>{compactCount(totals.requests)}</strong> {t('usage.summaryRequests')} · <strong>{compactCount(totals.prompt)}</strong> {t('usage.summaryIn')} · <strong>{compactCount(totals.completion)}</strong> {t('usage.summaryOut')}
+                {costOn && <> · <strong>{costText(costOf(totals, pricing))}</strong> {t('usage.summaryCost')}</>}
+                {projected && <> · {t('usage.projectedLine', { value: compactCount(projected.total) })}</>}
+              </p>
 
-          {/* Table */}
-          {activeTab === 'models' && (
-            modelRows.length === 0 ? (
-              <div className="empty-state">
-                <div className="empty-state-icon"><i className="fas fa-chart-bar" /></div>
-                <h2 className="empty-state-title">No usage data</h2>
-                <p className="empty-state-text">Usage data will appear here as API requests are made.</p>
-              </div>
-            ) : (
-              <div className="table-container">
-                <table className="table">
-                  <thead>
-                    <tr>
-                      <th>Model</th>
-                      <th style={{ width: 90 }}>Requests</th>
-                      <th style={{ width: 110 }}>Prompt</th>
-                      <th style={{ width: 110 }}>Completion</th>
-                      <th style={{ width: 110 }}>Total</th>
-                      <th style={{ width: 140 }}></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {modelRows.map(row => (
-                      <tr key={row.model}>
-                        <td style={monoCell}>{row.model}</td>
-                        <td style={monoCell}>{formatNumber(row.request_count)}</td>
-                        <td style={monoCell}>{formatNumber(row.prompt_tokens)}</td>
-                        <td style={monoCell}>{formatNumber(row.completion_tokens)}</td>
-                        <td style={{ ...monoCell, fontWeight: 600 }}>{formatNumber(row.total_tokens)}</td>
-                        <td><UsageBar value={row.total_tokens} max={maxTokens} /></td>
+              {forecast.length > 0 && (
+                <section className="tf-section" data-testid="quota-forecast">
+                  <h2 className="tf-h2">{t('usage.quotas')}</h2>
+                  <ul className="tf-quotas">
+                    {forecast.map((q, qi) => q.items.map(item => (
+                      <li key={`${qi}-${item.label}`} className="tf-quota">
+                        <span className="tf-quota__name">{q.model || t('usage.allModels')} <span className="tf-sub">{q.window}</span></span>
+                        <span className="tf-quota__what">{t(`usage.quota.${item.label}`)}</span>
+                        <span className="dk-meter tf-quota__meter" role="img" aria-label={`${compactCount(item.current)} / ${compactCount(item.max)}`}>
+                          <span className="dk-meter-seg" style={cssVars({ '--dk-w': `${Math.min(100, (item.current / item.max) * 100).toFixed(1)}%` })} />
+                        </span>
+                        <span className="dk-mono tf-quota__fig">{compactCount(item.current)} / {compactCount(item.max)}</span>
+                        <span className={`tf-quota__pace${item.within ? '' : ' tf-quota__pace--warn'}`}>
+                          <Icon name={item.within ? 'check' : 'warning'} /> {item.within ? t('usage.quota.within') : t('usage.quota.runsOut', { time: hoursText(item.hoursLeft, t) })}
+                        </span>
+                      </li>
+                    )))}
+                  </ul>
+                </section>
+              )}
+
+              <section className="tf-section">
+                <TrafficChart
+                  testId="usage-chart"
+                  title={t('usage.chartTitle', { group: groupName.toLowerCase() })}
+                  sub={t('usage.chartSub', { window: windowName })}
+                  columns={columns}
+                  groups={stack.groups.map(g => ({ ...g, name: g.id === '__other__' ? t('usage.other') : g.name }))}
+                  unit={t('charts.tokensUnit')}
+                  emptyLabel={t('charts.noBuckets')}
+                />
+              </section>
+
+              <section className="tf-section">
+                <div className="tf-section__head">
+                  <h2 className="tf-h2">{groupName} <span className="tf-sub">{t('usage.rowCount', { count: rows.length })}</span></h2>
+                  <div className="tf-section__acts">
+                    <label className="tf-switch">
+                      <button type="button" className="dk-switch" role="switch" aria-checked={compact} aria-label={t('usage.compact')} onClick={() => setCompact(v => !v)} />
+                      <span>{t('usage.compact')}</span>
+                    </label>
+                    <button type="button" className="dk-btn dk-btn--secondary dk-btn--sm" onClick={exportCsv}><Icon name="download" /> {t('usage.exportCsv')}</button>
+                    <button type="button" className="dk-btn dk-btn--secondary dk-btn--sm" onClick={exportJson}><Icon name="download" /> {t('usage.exportJson')}</button>
+                  </div>
+                </div>
+                <div className="dk-table-wrap" data-testid="usage-table">
+                  <table className={`dk-table tf-table${compact ? ' dk-table--compact' : ''}`}>
+                    <caption className="dk-sr-only">{t('usage.caption', { group: groupName })}</caption>
+                    <thead>
+                      <tr>
+                        <th scope="col" className="dk-table-toggle-cell"><span className="dk-sr-only">{t('table.open')}</span></th>
+                        <SortHead col="name" label={groupName} sort={sort} onSort={setSort} />
+                        <SortHead col="requests" label={t('table.requests')} sort={sort} onSort={setSort} className="dk-num" />
+                        <SortHead col="prompt" label={t('table.tokensIn')} sort={sort} onSort={setSort} className="dk-num dk-hide-phone" />
+                        <SortHead col="completion" label={t('table.tokensOut')} sort={sort} onSort={setSort} className="dk-num dk-hide-phone" />
+                        <SortHead col="total" label={t('table.tokens')} sort={sort} onSort={setSort} className="dk-num" />
+                        {costOn && <th scope="col" className="dk-num dk-hide-phone">{t('table.cost')}</th>}
+                        <th scope="col" className="dk-hide-phone">{grouping === 'key' ? t('table.lastUsed') : t('table.share')}</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )
-          )}
-
-          {activeTab === 'users' && isAdmin && (
-            userRows.length === 0 ? (
-              <div className="empty-state">
-                <div className="empty-state-icon"><i className="fas fa-users" /></div>
-                <h2 className="empty-state-title">No user usage data</h2>
-                <p className="empty-state-text">Per-user usage data will appear here as users make API requests.</p>
-              </div>
-            ) : (
-              <div className="table-container">
-                <table className="table">
-                  <thead>
-                    <tr>
-                      <th></th>
-                      <th>User</th>
-                      <th style={{ width: 90 }}>Requests</th>
-                      <th style={{ width: 110 }}>Prompt</th>
-                      <th style={{ width: 110 }}>Completion</th>
-                      <th style={{ width: 110 }}>Total</th>
-                      <th style={{ width: 110 }}>Proj. Total</th>
-                      <th style={{ width: 140 }}></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {userRows.map(row => {
-                      const up = userPredictions[row.user_id]
-                      const isExpanded = selectedUserId === row.user_id
-                      return (
-                        <Fragment key={row.user_id}>
-                          <tr
-                            onClick={() => setSelectedUserId(isExpanded ? null : row.user_id)}
-                            style={{ cursor: 'pointer' }}
-                          >
-                            <td style={{ width: 28, textAlign: 'center', color: 'var(--color-text-muted)', fontSize: '0.7rem' }}>
-                              <i className={`fas fa-chevron-${isExpanded ? 'down' : 'right'}`} />
-                            </td>
-                            <td style={{ fontSize: '0.8125rem' }}>{row.user_name}</td>
-                            <td style={monoCell}>{formatNumber(row.request_count)}</td>
-                            <td style={monoCell}>{formatNumber(row.prompt_tokens)}</td>
-                            <td style={monoCell}>{formatNumber(row.completion_tokens)}</td>
-                            <td style={{ ...monoCell, fontWeight: 600 }}>{formatNumber(row.total_tokens)}</td>
-                            <td style={{ ...monoCell, color: 'var(--color-text-muted)', fontStyle: 'italic' }}>
-                              {up?.predictions ? `~${formatNumber(up.predictions.projectedTotals.total_tokens)}` : '-'}
-                            </td>
-                            <td><UsageBar value={row.total_tokens} max={maxUserTokens} /></td>
-                          </tr>
-                          {isExpanded && up && (
-                            <tr>
-                              <td colSpan={8} style={{ padding: 0, background: 'var(--color-bg-secondary)' }}>
-                                <div style={{ padding: 'var(--spacing-md)' }}>
-                                  {up.predictions && (
-                                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(100px, 1fr))', gap: 'var(--spacing-xs)', marginBottom: 'var(--spacing-sm)' }}>
-                                      <StatCard icon="fas fa-arrow-right-arrow-left" label="Proj. Requests" value={up.predictions.projectedTotals.request_count} muted />
-                                      <StatCard icon="fas fa-arrow-up" label="Proj. Prompt" value={up.predictions.projectedTotals.prompt_tokens} muted />
-                                      <StatCard icon="fas fa-arrow-down" label="Proj. Completion" value={up.predictions.projectedTotals.completion_tokens} muted />
-                                      <StatCard icon="fas fa-coins" label="Proj. Total" value={up.predictions.projectedTotals.total_tokens} muted />
-                                    </div>
-                                  )}
-                                  {up.timeSeries.length > 0 ? (
-                                    <UsageTimeChart data={up.timeSeries} predictedData={up.predictions?.predictedBuckets} period={period} />
-                                  ) : (
-                                    <div style={{ fontSize: '0.8125rem', color: 'var(--color-text-muted)', padding: 'var(--spacing-sm)' }}>
-                                      No time series data for this user.
-                                    </div>
-                                  )}
-                                </div>
+                    </thead>
+                    <tbody>
+                      {rows.map(r => {
+                        const isOpen = open.has(r.id)
+                        return (
+                          <Fragment key={r.id}>
+                            <tr data-row data-clickable data-entity={r.name} onClick={e => { if (!e.target.closest('button, a')) toggleOpen(r.id) }}>
+                              <td className="dk-table-toggle-cell">
+                                <button type="button" className="dk-table-toggle" aria-expanded={isOpen} aria-label={t('table.openRow', { name: r.name })} onClick={() => toggleOpen(r.id)}>
+                                  <Icon name="chevron-right" className="dk-icon" />
+                                </button>
+                              </td>
+                              <td>
+                                <span className="dk-table-name dk-mono">{r.name}</span>
+                                {r.sub && <span className="dk-table-sub">{r.sub}</span>}
+                              </td>
+                              <td className="dk-num">{compactCount(r.requests)}</td>
+                              <td className="dk-num dk-hide-phone">{r.prompt == null ? '-' : compactCount(r.prompt)}</td>
+                              <td className="dk-num dk-hide-phone">{r.completion == null ? '-' : compactCount(r.completion)}</td>
+                              <td className="dk-num">{compactCount(r.total)}</td>
+                              {costOn && <td className="dk-num dk-hide-phone">{r.prompt == null ? '-' : costText(costOf(r, pricing))}</td>}
+                              <td className="dk-hide-phone">
+                                {grouping === 'key'
+                                  ? <span className="tf-sub">{lastUsed(r.lastUsed, t)}</span>
+                                  : <span className="tf-share" role="img" aria-label={`${peak > 0 ? Math.round((r.total / peak) * 100) : 0}%`}><span style={cssVars({ '--dk-w': `${peak > 0 ? Math.max(1, (r.total / peak) * 100).toFixed(1) : 0}%` })} /></span>}
                               </td>
                             </tr>
-                          )}
-                        </Fragment>
-                      )
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )
+                            {isOpen && (
+                              <tr className="dk-table-detail">
+                                <td colSpan={cols}>
+                                  <div className="dk-table-detail-body">
+                                    <RowDetail id={r.id} by={grouping} buckets={bucketsFor} period={win.period} t={t} cost={costOn} pricing={pricing} />
+                                  </div>
+                                </td>
+                              </tr>
+                            )}
+                          </Fragment>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="tf-note-line">{t('usage.noEndpoint')}</p>
+              </section>
+            </>
           )}
         </>
       )}
     </div>
   )
+}
+
+function hoursText(hours, t) {
+  if (!Number.isFinite(hours) || hours < 0) return '-'
+  if (hours < 1) return t('usage.quota.lessThanHour')
+  if (hours < 48) return t('usage.quota.hours', { count: Math.round(hours) })
+  return t('usage.quota.days', { count: Math.round(hours / 24) })
 }

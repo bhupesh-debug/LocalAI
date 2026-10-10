@@ -4,16 +4,19 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	pb "github.com/mudler/LocalAI/pkg/grpc/proto"
+	"gorm.io/gorm"
 )
 
 // --- fakeModelRouterForSmartRouter implements ModelRouter ---
 
 type fakeModelRouterForSmartRouter struct {
+	fakeLoadJobStore
 	mu              sync.Mutex
 	node            *BackendNode
 	nodeModel       *NodeModel
@@ -27,34 +30,77 @@ func newFakeModelRouterForSmartRouter() *fakeModelRouterForSmartRouter {
 	}
 }
 
-func (f *fakeModelRouterForSmartRouter) FindAndLockNodeWithModel(_ context.Context, _ string) (*BackendNode, *NodeModel, error) {
+func (f *fakeModelRouterForSmartRouter) FindAndLockNodeWithModel(_ context.Context, _ string, _ []string, _ *RoutePreference) (*BackendNode, *NodeModel, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.node, f.nodeModel, f.findErr
 }
 
-func (f *fakeModelRouterForSmartRouter) DecrementInFlight(_ context.Context, nodeID, modelName string) error {
+func (f *fakeModelRouterForSmartRouter) DecrementInFlight(_ context.Context, nodeID, modelName string, _ int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.decrementCalled[nodeID+":"+modelName]++
 	return nil
 }
 
-func (f *fakeModelRouterForSmartRouter) IncrementInFlight(_ context.Context, _, _ string) error {
+func (f *fakeModelRouterForSmartRouter) IncrementInFlight(_ context.Context, _, _ string, _ int) error {
 	return nil
 }
-func (f *fakeModelRouterForSmartRouter) RemoveNodeModel(_ context.Context, _, _ string) error {
+func (f *fakeModelRouterForSmartRouter) RemoveNodeModel(_ context.Context, _, _ string, _ int) error {
 	return nil
 }
-func (f *fakeModelRouterForSmartRouter) TouchNodeModel(_ context.Context, _, _ string) {}
-func (f *fakeModelRouterForSmartRouter) SetNodeModel(_ context.Context, _, _, _, _ string, _ int) error {
+func (f *fakeModelRouterForSmartRouter) RemoveAllNodeModelReplicas(_ context.Context, _, _ string) error {
 	return nil
 }
-func (f *fakeModelRouterForSmartRouter) SetNodeModelLoadInfo(_ context.Context, _, _, _ string, _ []byte) error {
+func (f *fakeModelRouterForSmartRouter) TouchNodeModel(_ context.Context, _, _ string, _ int) {}
+func (f *fakeModelRouterForSmartRouter) SetNodeModel(_ context.Context, _, _ string, _ int, _, _ string, _ int) error {
 	return nil
+}
+func (f *fakeModelRouterForSmartRouter) SetNodeModelRevision(ctx context.Context, nodeID, modelName string, replicaIndex int, state, address string, initialInFlight int, _, _ string) error {
+	return f.SetNodeModel(ctx, nodeID, modelName, replicaIndex, state, address, initialInFlight)
+}
+func (f *fakeModelRouterForSmartRouter) SetNodeModelLoadInfo(_ context.Context, _, _ string, _ int, _ string, _ []byte) error {
+	return nil
+}
+func (f *fakeModelRouterForSmartRouter) SetNodeModelLoadInfoRevision(ctx context.Context, nodeID, modelName string, replicaIndex int, backendType, _ string, optsBlob []byte) error {
+	return f.SetNodeModelLoadInfo(ctx, nodeID, modelName, replicaIndex, backendType, optsBlob)
+}
+func (f *fakeModelRouterForSmartRouter) UpsertModelLoadInfo(_ context.Context, _, _ string, _ []byte) error {
+	return nil
+}
+func (f *fakeModelRouterForSmartRouter) UpsertModelLoadInfoRevision(ctx context.Context, modelName, backendType, _ string, optsBlob []byte) error {
+	return f.UpsertModelLoadInfo(ctx, modelName, backendType, optsBlob)
 }
 func (f *fakeModelRouterForSmartRouter) GetModelLoadInfo(_ context.Context, _ string) (string, []byte, error) {
 	return "", nil, fmt.Errorf("not found")
+}
+func (f *fakeModelRouterForSmartRouter) GetModelLoadInfoRevision(ctx context.Context, modelName string) (string, string, []byte, error) {
+	backend, blob, err := f.GetModelLoadInfo(ctx, modelName)
+	return backend, "", blob, err
+}
+func (f *fakeModelRouterForSmartRouter) AdvanceModelConfigRevision(_ context.Context, _, _ string) ([]NodeModel, error) {
+	return nil, nil
+}
+func (f *fakeModelRouterForSmartRouter) EstablishModelConfigRevision(_ context.Context, _, _ string) error {
+	return nil
+}
+func (f *fakeModelRouterForSmartRouter) GetModelConfigRevision(_ context.Context, _ string) (string, error) {
+	return "", gorm.ErrRecordNotFound
+}
+func (f *fakeModelRouterForSmartRouter) GetNodeModel(_ context.Context, nodeID, modelName string, replicaIndex int) (*NodeModel, error) {
+	return &NodeModel{NodeID: nodeID, ModelName: modelName, ReplicaIndex: replicaIndex}, nil
+}
+func (f *fakeModelRouterForSmartRouter) RecordModelCleanupFailure(_ context.Context, _, _ string, _ int, _ string, _ time.Time) error {
+	return nil
+}
+func (f *fakeModelRouterForSmartRouter) ListModelCleanupRetries(_ context.Context, _ time.Time, _ int) ([]NodeModel, error) {
+	return nil, nil
+}
+func (f *fakeModelRouterForSmartRouter) NextFreeReplicaIndex(_ context.Context, _, _ string, _ int) (int, error) {
+	return 0, nil
+}
+func (f *fakeModelRouterForSmartRouter) CountReplicasOnNode(_ context.Context, _, _ string) (int, error) {
+	return 0, nil
 }
 func (f *fakeModelRouterForSmartRouter) FindNodeWithVRAM(_ context.Context, _ uint64) (*BackendNode, error) {
 	return nil, nil
@@ -68,7 +114,7 @@ func (f *fakeModelRouterForSmartRouter) FindLeastLoadedNode(_ context.Context) (
 func (f *fakeModelRouterForSmartRouter) FindGlobalLRUModelWithZeroInFlight(_ context.Context) (*NodeModel, error) {
 	return nil, nil
 }
-func (f *fakeModelRouterForSmartRouter) FindLRUModel(_ context.Context, _ string) (*NodeModel, error) {
+func (f *fakeModelRouterForSmartRouter) FindLRUModel(_ context.Context, _ string, _ []string) (*NodeModel, error) {
 	return nil, nil
 }
 func (f *fakeModelRouterForSmartRouter) Get(_ context.Context, nodeID string) (*BackendNode, error) {
@@ -82,8 +128,23 @@ func (f *fakeModelRouterForSmartRouter) Get(_ context.Context, nodeID string) (*
 func (f *fakeModelRouterForSmartRouter) GetModelScheduling(_ context.Context, _ string) (*ModelSchedulingConfig, error) {
 	return nil, nil
 }
+func (f *fakeModelRouterForSmartRouter) GetGoverningScheduling(_ context.Context, _ string) (*ModelSchedulingConfig, error) {
+	return nil, nil
+}
 func (f *fakeModelRouterForSmartRouter) FindNodesBySelector(_ context.Context, _ map[string]string) ([]BackendNode, error) {
 	return nil, nil
+}
+func (f *fakeModelRouterForSmartRouter) FindNodesWithFreeSlot(_ context.Context, _ string, _ []string) ([]BackendNode, error) {
+	return nil, nil
+}
+func (f *fakeModelRouterForSmartRouter) NarrowByDiskHeadroom(_ context.Context, candidateNodeIDs []string, _ uint64) ([]string, error) {
+	return candidateNodeIDs, nil
+}
+func (f *fakeModelRouterForSmartRouter) ReserveVRAM(_ context.Context, _ string, _ uint64) error {
+	return nil
+}
+func (f *fakeModelRouterForSmartRouter) ReleaseVRAM(_ context.Context, _ string, _ uint64) error {
+	return nil
 }
 func (f *fakeModelRouterForSmartRouter) FindNodeWithVRAMFromSet(_ context.Context, _ uint64, _ []string) (*BackendNode, error) {
 	return nil, nil
@@ -95,6 +156,12 @@ func (f *fakeModelRouterForSmartRouter) FindLeastLoadedNodeFromSet(_ context.Con
 	return nil, nil
 }
 func (f *fakeModelRouterForSmartRouter) GetNodeLabels(_ context.Context, _ string) ([]NodeLabel, error) {
+	return nil, nil
+}
+func (f *fakeModelRouterForSmartRouter) FindNodesWithModel(_ context.Context, _ string) ([]BackendNode, error) {
+	return nil, nil
+}
+func (f *fakeModelRouterForSmartRouter) LoadedReplicaStats(_ context.Context, _ string, _ []string) ([]ReplicaCandidate, error) {
 	return nil, nil
 }
 
@@ -155,7 +222,7 @@ var _ = Describe("ModelRouterAdapter", func() {
 			adapter := NewModelRouterAdapter(sr)
 
 			opts := &pb.ModelOptions{Model: "test-model"}
-			m, err := adapter.Route(context.Background(), "llama-cpp", "test-model", "test-model", "model.gguf", opts, false)
+			m, err := adapter.Route(context.Background(), "llama-cpp", "test-model", "test-model", "model.gguf", "", opts, false)
 
 			Expect(err).NotTo(HaveOccurred())
 			Expect(m).NotTo(BeNil())
@@ -167,19 +234,26 @@ var _ = Describe("ModelRouterAdapter", func() {
 			adapter.mu.Unlock()
 			Expect(hasRelease).To(BeTrue())
 
-			// The initial in-flight reservation is released via OnFirstComplete after
-			// the first inference call, not during ReleaseModel. ReleaseModel only
-			// closes the client.
+			// The initial in-flight reservation is released by whichever comes
+			// first: the first inference completing, or the route being released.
+			// Nothing has happened yet, so it is still held.
 			fakeReg.mu.Lock()
 			countBeforeRelease := fakeReg.decrementCalled["node-1:test-model"]
 			fakeReg.mu.Unlock()
 			Expect(countBeforeRelease).To(Equal(0))
 
+			// Releasing the route without any inference must give it back, or the
+			// counter leaks and pins the replica against every eviction query.
 			adapter.ReleaseModel("test-model")
-			fakeReg.mu.Lock()
-			countAfterRelease := fakeReg.decrementCalled["node-1:test-model"]
-			fakeReg.mu.Unlock()
-			Expect(countAfterRelease).To(Equal(0))
+			Eventually(func() int {
+				fakeReg.mu.Lock()
+				defer fakeReg.mu.Unlock()
+				return fakeReg.decrementCalled["node-1:test-model"]
+			}).Should(Equal(1))
 		})
 	})
 })
+
+func (f *fakeModelRouterForSmartRouter) MarkUnhealthy(_ context.Context, _ string) error {
+	return nil
+}

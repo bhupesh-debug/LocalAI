@@ -31,6 +31,10 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
 
 Available additional parameters: `top_p`, `top_k`, `max_tokens`
 
+Reasoning models return their thinking in the `reasoning` field. When a model reasons and calls a tool in the same turn, see [Interleaved Thinking with Tool Calls]({{%relref "features/interleaved-thinking" %}}).
+
+When `stream: true` is set and the llama.cpp backend fails before the first chunk, for example because the prompt exceeds the context size, the request fails with an HTTP error. The error message is not streamed as assistant content. An error after streaming has started is reported inside the stream.
+
 ### Edit completions
 
 https://platform.openai.com/docs/api-reference/edits
@@ -238,6 +242,61 @@ curl http://localhost:8080/v1/responses \
   }'
 ```
 
+#### WebSocket Responses
+
+Connect to `ws://localhost:8080/v1/responses` (or `wss://` when TLS is
+enabled) and send `response.create` messages over the WebSocket. Only one
+response may be in progress on a connection. Wait for `response.completed` or
+`response.failed` for the active response before sending the next
+`response.create`. An `error` that rejects an invalid or additional
+`response.create` applies only to that rejected message; it does not terminate
+a response that is already in progress.
+
+Set the WebSocket-only `generate` field to `false` to prepare a request without
+running inference:
+
+```json
+{
+  "type": "response.create",
+  "model": "ggml-koala-7b-model-q4_0-r2.bin",
+  "generate": false,
+  "store": false,
+  "input": "Say this is a test!"
+}
+```
+
+LocalAI emits `response.created` followed by `response.completed` with no
+generated output. The completed response still has an ID that can continue the
+prepared request:
+
+```json
+{
+  "type": "response.create",
+  "model": "ggml-koala-7b-model-q4_0-r2.bin",
+  "store": false,
+  "previous_response_id": "resp_abc123",
+  "input": []
+}
+```
+
+Response IDs created with `store: false` are available only on the WebSocket
+connection that created them and are removed when that connection closes. A
+`previous_response_id` chain can contain multiple responses; LocalAI replays the
+complete conversation from the oldest response through the referenced response
+before appending the new input. Keep `store: false` for every descendant of a
+connection-local response. LocalAI rejects a `store: true` response that depends
+on connection-local history because the resulting stored chain would be broken
+after the WebSocket closes.
+
+After delivery, LocalAI discards buffered stream events for `store: false`
+responses but retains their request and final response for continuation. A
+connection admits at most 128 local responses and accepts a new local request
+only while its current serialized history plus that request is at most 64 MiB.
+When either admission threshold is reached, LocalAI returns
+`connection_store_limit_reached`; reconnect to start a new local history. With
+authentication enabled, globally stored response IDs can be continued only by
+the identity that created them.
+
 #### Request Parameters
 
 | Parameter | Type | Required | Description |
@@ -282,6 +341,15 @@ curl http://localhost:8080/v1/responses \
     "max_output_tokens": 1024
   }'
 ```
+
+#### Streaming responses
+
+Set `"stream": true` to receive Server-Sent Events. Each `response.output_item.added` event assigns an `output_index` to an item.
+Use that index and the item ID to associate later deltas and completion events with the same item.
+
+If a request without explicit tools produces reasoning, the stream uses separate items for reasoning and answer text.
+Each item keeps its original index throughout the stream.
+The `response.completed` event includes both items in the same index order, followed by any automatically parsed tool calls.
 
 #### Background Processing
 
@@ -329,6 +397,22 @@ Cancel a background response that's still in progress:
 curl -X POST http://localhost:8080/v1/responses/resp_abc123/cancel
 ```
 
+#### Multiple Replicas (Distributed Mode)
+
+In distributed mode LocalAI replicates response metadata across frontend
+replicas, so retrieval, `previous_response_id` chaining and cancellation work
+regardless of which replica the load balancer picks:
+
+- `GET /v1/responses/{id}` returns the response from any replica.
+- `POST /v1/responses/{id}/cancel` is delegated over NATS to the replica that is
+  actually generating, so generation really stops. If that replica is gone, the
+  response is reported as `cancelled` without blocking.
+- **Streaming resume (`?stream=true`) is served only by the replica that created
+  the response.** The event buffer lives in that process's memory and is not
+  replicated. A resume request that reaches another replica returns HTTP 409
+  naming the owning replica instead of silently returning a truncated stream.
+  Poll the response instead, or route resume requests with session affinity.
+
 #### Tool Calling
 
 Open Responses API supports function calling with tools:
@@ -360,6 +444,11 @@ curl http://localhost:8080/v1/responses \
     "max_output_tokens": 1024
   }'
 ```
+
+For streaming requests with JSON tool output, LocalAI waits for the complete JSON
+object before emitting a completed `function_call` item. Arguments can span
+multiple tokens. Read the arguments from the `response.output_item.done` event
+before executing the tool.
 
 #### Reasoning Configuration
 
@@ -499,7 +588,7 @@ The `llama.cpp` backend supports additional configuration options that can be sp
 |--------|------|-------------|---------|
 | `use_jinja` or `jinja` | boolean | Enable Jinja2 template processing for chat templates. When enabled, the backend uses Jinja2-based chat templates from the model for formatting messages. | `use_jinja:true` |
 | `context_shift` | boolean | Enable context shifting, which allows the model to dynamically adjust context window usage. | `context_shift:true` |
-| `cache_ram` | integer | Set the maximum RAM cache size in MiB for KV cache. Use `-1` for unlimited (default). | `cache_ram:2048` |
+| `cache_ram` | integer | Size budget in MiB for the **server-side prompt cache** (a host-RAM store of idle slot KV states that's reloaded on a prompt-prefix hit, see [upstream PR #16391](https://github.com/ggml-org/llama.cpp/pull/16391)). Default: `8192` MiB (llama.cpp default). `-1` removes the limit. `0` disables the prompt cache entirely. Together with `kv_unified` and `cache_idle_slots` this is what makes a repeated system prompt skip prefill on subsequent calls. | `cache_ram:4096` |
 | `parallel` or `n_parallel` | integer | Enable parallel request processing. When set to a value greater than 1, enables continuous batching for handling multiple requests concurrently. | `parallel:4` |
 | `grpc_servers` or `rpc_servers` | string | Comma-separated list of gRPC server addresses for distributed inference. Allows distributing workload across multiple llama.cpp workers. | `grpc_servers:localhost:50051,localhost:50052` |
 | `fit_params` or `fit` | boolean | Enable auto-adjustment of model/context parameters to fit available device memory. Default: `true`. | `fit_params:true` |
@@ -512,8 +601,12 @@ The `llama.cpp` backend supports additional configuration options that can be sp
 | `check_tensors` | boolean | Validate tensor data for invalid values during model loading. Default: `false`. | `check_tensors:true` |
 | `warmup` | boolean | Enable warmup run after model loading. Default: `true`. | `warmup:false` |
 | `no_op_offload` | boolean | Disable offloading host tensor operations to device. Default: `false`. | `no_op_offload:true` |
-| `kv_unified` or `unified_kv` | boolean | Enable unified KV cache. Default: `false`. | `kv_unified:true` |
-| `n_ctx_checkpoints` or `ctx_checkpoints` | integer | Maximum number of context checkpoints per slot. Default: `8`. | `ctx_checkpoints:4` |
+| `device` or `devices` | string | Select the llama.cpp backend devices to use. Repeat the option or pass a comma-separated list; unlisted devices are excluded. Use the names reported by `llama-server --list-devices` / `--list-devices`. | `devices:CUDA1,CUDA2,CUDA3` |
+| `kv_unified` or `unified_kv` | boolean | Use a single unified KV buffer shared across all sequences. Default: `true` (LocalAI override; upstream defaults to `false` but auto-enables it when slot count is auto). **Required for `cache_idle_slots` and scoring**: without it the server force-disables idle-slot saving at init, and score-enabled models are rejected at load time. | `kv_unified:false` |
+| `cache_idle_slots` or `idle_slots_cache` | boolean | On a new task, save the previous slot's KV state into the prompt cache (and clear the slot) so a later request with the same prefix can warm-load it. Default: `true`. Auto-disabled by the server if `kv_unified=false` or `cache_ram=0`. | `cache_idle_slots:false` |
+| `n_ctx_checkpoints` or `ctx_checkpoints` | integer | Maximum number of context checkpoints per slot (used for partial-prefix recovery, e.g. SWA). Default: `32`. | `ctx_checkpoints:16` |
+| `checkpoint_min_step` or `checkpoint_min_spacing` (aliases: `checkpoint_every_nt`, `checkpoint_every_n_tokens`) | integer | Minimum spacing in tokens between context checkpoints. `0` disables the minimum-spacing gate. Default: `256`. (Renamed upstream from `checkpoint_every_nt`; semantics shifted from a fixed cadence to a minimum spacing.) | `checkpoint_min_step:1024` |
+| `split_mode` or `sm` | string | How to split the model across multiple GPUs: `none` (single GPU only), `layer` (default - split layers and KV across GPUs), `row` (split rows across GPUs), `tensor` (experimental tensor parallelism, requires `flash_attention: true`, manually set `context_size`, and a llama.cpp build that includes [#19378](https://github.com/ggml-org/llama.cpp/pull/19378); it historically also required KV-cache quantization to be disabled, but [#23792](https://github.com/ggml-org/llama.cpp/pull/23792) lifts that restriction so `cache_type_k`/`cache_type_v` quantization can be combined with tensor parallelism on builds that include it). | `split_mode:tensor` |
 
 **Example configuration with options:**
 
@@ -527,12 +620,48 @@ options:
   - context_shift:true
   - cache_ram:4096
   - parallel:2
+  - devices:CUDA1,CUDA2,CUDA3
   - fit_params:true
   - fit_target:1024
   - slot_prompt_similarity:0.5
 ```
 
 **Note:** The `parallel` option can also be set via the `LLAMACPP_PARALLEL` environment variable, and `grpc_servers` can be set via the `LLAMACPP_GRPC_SERVERS` environment variable. Options specified in the YAML file take precedence over environment variables.
+
+An explicit `parallel: 1` (or `n_parallel: 1`) in the model options takes precedence over `LLAMACPP_PARALLEL`, like any other value. The environment variable is only used when neither option is set; if it is missing or not a number, the backend uses one slot.
+
+##### Hardware auto-tuning (and how to override it)
+
+On a detected GPU, LocalAI fills a few performance-relevant defaults the model config leaves unset - a larger physical batch on NVIDIA Blackwell, and a VRAM-scaled `parallel` slot count for concurrent serving. Both are gated on **per-device** VRAM at the model's context: when a large context already fills a single card (e.g. a 27B model with a 200k context across 2×16 GiB), the batch boost and the extra parallel slots are suppressed so they can't tip the tighter GPU into CUDA out-of-memory.
+
+Anything you set explicitly in the model YAML always wins, so to pin a value just set it (e.g. `batch: 512` or `options: ["parallel:1"]`). The effective values are logged at `INFO` when a model loads (`effective runtime tuning …`). To turn the hardware auto-tuning off entirely and run llama.cpp's stock behavior, set:
+
+```
+LOCALAI_DISABLE_HARDWARE_DEFAULTS=true
+```
+
+##### Server-side prompt cache (repeated system prompts)
+
+Agents, coding assistants, and Anthropic/OpenAI-compatible CLIs typically resend the same large system prompt on every turn. The llama.cpp server can short-circuit prefill for the matching prefix by stashing idle slot KV states in host RAM and reloading them on a hit. Three settings interact:
+
+| Setting | Default | Role |
+|---|---|---|
+| `cache_ram:N` | `8192` (llama.cpp default) | Allocates the host-side prompt cache. `0` disables it. |
+| `kv_unified:true` | `true` | Single unified KV buffer (**prerequisite** for idle-slot saving). |
+| `cache_idle_slots:true` | `true` | Persists the idle slot's KV into the prompt cache on task switch. |
+
+All three are on by default since LocalAI v4.3, so the prompt cache works out of the box for the common single-slot setup. If you're on an older release, or you've explicitly disabled one of them, add the following to recover the behaviour:
+
+```yaml
+options:
+  - cache_ram:4096       # or -1 for no limit
+  - kv_unified:true
+  - cache_idle_slots:true
+```
+
+Set `cache_ram:0` to opt out of the prompt cache entirely (saves host RAM at the cost of re-prefilling repeated prompts).
+
+`cache_ram:-1` removes the limit. With idle-slot saving on, every distinct prompt then leaves its slot state in host RAM, so a workload with many different prompts (classification, ingestion) grows the backend by roughly the KV size of each prompt until the host runs out of memory.
 
 #### Reference
 
@@ -541,7 +670,7 @@ options:
 
 ### ik_llama.cpp
 
-[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) is a hard fork of `llama.cpp` by Iwan Kawrakow that focuses on superior CPU and hybrid GPU/CPU performance. It ships additional quantization types (IQK quants), custom quantization mixes, Multi-head Latent Attention (MLA) for DeepSeek models, and fine-grained tensor offload controls — particularly useful for running very large models on commodity CPU hardware.
+[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) is a hard fork of `llama.cpp` by Iwan Kawrakow that focuses on superior CPU and hybrid GPU/CPU performance. It ships additional quantization types (IQK quants), custom quantization mixes, Multi-head Latent Attention (MLA) for DeepSeek models, and fine-grained tensor offload controls - particularly useful for running very large models on commodity CPU hardware.
 
 {{% notice note %}}
 
@@ -559,7 +688,7 @@ The `ik-llama-cpp` backend supports the following features:
 
 #### Setup
 
-The backend is distributed as a separate container image and can be installed from the LocalAI backend gallery, or specified directly in a model configuration. GGUF models loaded with this backend benefit from ik_llama.cpp's optimized CPU kernels — especially useful for MoE models and large quantized models that would otherwise be GPU-bound.
+The backend is distributed as a separate container image and can be installed from the LocalAI backend gallery, or specified directly in a model configuration. GGUF models loaded with this backend benefit from ik_llama.cpp's optimized CPU kernels - especially useful for MoE models and large quantized models that would otherwise be GPU-bound.
 
 #### YAML configuration
 
@@ -582,7 +711,7 @@ The aliases `ik-llama` and `ik_llama` are also accepted.
 
 ### turboquant (llama.cpp fork with TurboQuant KV-cache)
 
-[llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) is a `llama.cpp` fork that adds the **TurboQuant KV-cache** quantization scheme. It reuses the upstream `llama.cpp` codebase and ships as a drop-in alternative backend inside LocalAI, sharing the same gRPC server sources as the stock `llama-cpp` backend — so any GGUF model that runs on `llama-cpp` also runs on `turboquant`.
+[llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) is a `llama.cpp` fork that adds the **TurboQuant KV-cache** quantization scheme. It reuses the upstream `llama.cpp` codebase and ships as a drop-in alternative backend inside LocalAI, sharing the same gRPC server sources as the stock `llama-cpp` backend - so any GGUF model that runs on `llama-cpp` also runs on `turboquant`.
 
 You would pick `turboquant` when you want **smaller KV-cache memory pressure** (longer contexts on the same VRAM) or to experiment with the fork's quantized KV representations on top of the standard `cache_type_k` / `cache_type_v` knobs already supported by upstream `llama.cpp`.
 
@@ -623,7 +752,7 @@ cache_type_v: turbo3
 context_size: 8192
 ```
 
-The `cache_type_k` / `cache_type_v` fields map to llama.cpp's `-ctk` / `-ctv` flags. The stock `llama-cpp` backend only accepts the standard llama.cpp types — to use `turbo2` / `turbo3` / `turbo4` you need this `turboquant` backend, which is where the fork's TurboQuant code paths actually take effect. Pick `q8_0` here and you're just running stock llama.cpp KV quantization; pick `turbo*` and you're running TurboQuant.
+The `cache_type_k` / `cache_type_v` fields map to llama.cpp's `-ctk` / `-ctv` flags. The stock `llama-cpp` backend only accepts the standard llama.cpp types - to use `turbo2` / `turbo3` / `turbo4` you need this `turboquant` backend, which is where the fork's TurboQuant code paths actually take effect. Pick `q8_0` here and you're just running stock llama.cpp KV quantization; pick `turbo*` and you're running TurboQuant.
 
 #### Reference
 
@@ -664,6 +793,440 @@ curl http://localhost:8080/v1/completions -H "Content-Type: application/json" -d
  }'
 ```
 
+#### Passing arbitrary vLLM options with `engine_args`
+
+A subset of `AsyncEngineArgs` is exposed as typed YAML fields
+(`tensor_parallel_size`, `gpu_memory_utilization`, `quantization`,
+`max_model_len`, `dtype`, `trust_remote_code`, `enforce_eager`, …).
+Anything else can be passed through the generic `engine_args:` map.
+Keys are forwarded verbatim to vLLM's engine; unknown keys fail at load
+time with the closest valid name as a hint. Nested maps materialise
+into vLLM's nested config dataclasses (`SpeculativeConfig`,
+`KVTransferConfig`, `CompilationConfig`, …).
+
+Speculative decoding (DFlash, ngram, eagle, deepseek_mtp, …) is
+configured this way:
+
+```yaml
+name: qwen3.5-4b-dflash
+backend: vllm
+parameters:
+  model: Qwen/Qwen3.5-4B
+context_size: 8192
+max_model_len: 8192
+trust_remote_code: true
+quantization: fp8
+template:
+  use_tokenizer_template: true
+engine_args:
+  speculative_config:
+    method: dflash
+    model: z-lab/Qwen3.5-4B-DFlash
+    num_speculative_tokens: 15
+```
+
+The shape of `speculative_config` follows vLLM's
+[`SpeculativeConfig`](https://docs.vllm.ai/en/latest/api/vllm/config/speculative.html)
+- `method` picks the algorithm, the remaining keys are method-specific.
+Drafters from [z-lab](https://huggingface.co/z-lab) are paired with
+specific target models; pick the one that matches your target. The
+drafter loads in its native precision regardless of the target's
+`quantization:` setting.
+
+Another example - picking a non-default attention backend (e.g. on
+hardware where the default cutlass kernels aren't supported):
+
+```yaml
+engine_args:
+  attention_backend: TRITON_ATTN
+```
+
+#### CLI-style engine flags in `options`
+
+Engine arguments can also be written in `options:` with vLLM's own CLI
+spelling, which is handy when copying a command line out of vLLM's
+documentation:
+
+```yaml
+options:
+  - --quantization:gptq_marlin
+  - --enable-prefix-caching
+  - --kv-cache-dtype:fp8_e5m2
+  - --reasoning-parser:qwen3
+```
+
+Rules:
+
+- Only `--` prefixed entries are treated as engine flags; everything
+  else in `options:` (`tool_parser:`, `reasoning_parser:`, …) keeps its
+  existing meaning. Both `--flag:value` and `--flag=value` are accepted.
+- Dashes become underscores (`--enable-prefix-caching` →
+  `enable_prefix_caching`) and the value is coerced to the target
+  field's type. A bare `--flag` sets a boolean field to `true`.
+- Unknown or uncoercible flags are logged on the backend's stderr and
+  skipped rather than failing the load. `engine_args:` stays strict and
+  is applied last, so it wins on conflict.
+
+`engine_args:` remains the form to use for anything structured (nested
+configs, maps); `options:` is a convenience for flat flags.
+
+#### Multi-node data parallelism
+
+`engine_args.data_parallel_size > 1` combined with the
+`local-ai p2p-worker vllm` follower lets a single model span multiple
+GPU nodes. See [vLLM Multi-Node (Data-Parallel)]({{% relref
+"features/distributed-mode#vllm-multi-node-data-parallel" %}})
+for the head/follower configuration and a worked Kimi-K2.6 example.
+
+### SGLang
+
+[SGLang](https://github.com/sgl-project/sglang) is a fast serving
+framework for LLMs and VLMs with a focus on prefix caching, speculative
+decoding, and multi-modal generation. LocalAI ships a gRPC backend that
+wraps SGLang's async `Engine`, including its native function-call and
+reasoning parsers.
+
+#### Setup
+
+```yaml
+name: sglang
+backend: sglang
+parameters:
+  model: "Qwen/Qwen3-4B"
+template:
+  use_tokenizer_template: true
+```
+
+The backend will pull the model from HuggingFace on first load.
+
+#### Passing arbitrary SGLang options with `engine_args`
+
+The same `engine_args:` map that the vLLM backend accepts is also
+honoured by the SGLang backend. Keys are validated against
+[`ServerArgs`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py)
+- SGLang's central configuration dataclass - and forwarded verbatim to
+`Engine(**kwargs)`. Unknown keys fail at load time with the closest
+valid name as a hint. Unlike vLLM, `ServerArgs` is flat: speculative
+decoding fields are top-level (`speculative_algorithm`,
+`speculative_draft_model_path`, etc.) rather than nested under a
+`speculative_config:` dict.
+
+The typed YAML fields shared with vLLM are mapped to their SGLang
+equivalents (`gpu_memory_utilization` → `mem_fraction_static`,
+`enforce_eager` → `disable_cuda_graph`, `tensor_parallel_size` →
+`tp_size`, `max_model_len` → `context_length`). Anything else,
+including all speculative-decoding flags, goes under `engine_args:`.
+
+##### Speculative decoding: Gemma 4 with Multi-Token Prediction
+
+Google publishes paired "assistant" drafters for every Gemma 4 size.
+The drafters use Multi-Token Prediction (MTP) to propose several
+candidate tokens per target step, which SGLang then verifies in
+parallel. Flags below are transcribed verbatim from the
+[SGLang Gemma 4 cookbook](https://docs.sglang.io/cookbook/autoregressive/Google/Gemma4#speculative-decoding-mtp-server-commands).
+
+For consumer GPUs in the 16-24 GB range, use **E4B** (8 B total /
+4 B effective parameters):
+
+```yaml
+name: gemma-4-e4b-mtp
+backend: sglang
+parameters:
+  model: google/gemma-4-E4B-it
+context_size: 4096
+template:
+  use_tokenizer_template: true
+options:
+  - tool_parser:gemma4
+  - reasoning_parser:gemma4
+engine_args:
+  mem_fraction_static: 0.85
+  speculative_algorithm: NEXTN
+  speculative_draft_model_path: google/gemma-4-E4B-it-assistant
+  speculative_num_steps: 5
+  speculative_num_draft_tokens: 6
+  speculative_eagle_topk: 1
+```
+
+For smaller cards (8-12 GB), drop to **E2B** (5 B total / 2 B effective)
+by swapping the model paths to `google/gemma-4-E2B-it` and
+`google/gemma-4-E2B-it-assistant`; the rest of the flags stay the same.
+
+`NEXTN` is normalised to `EAGLE` inside `ServerArgs.__post_init__`, so
+either value works - the cookbook uses `NEXTN`. `mem_fraction_static`
+is the share of GPU memory SGLang reserves for the model + KV pool;
+0.85 is the cookbook's default and adapts to whatever single GPU the
+backend is running on.
+
+The 31 B dense and 26 B-A4B MoE Gemma 4 variants exist in the same
+cookbook but require `--tp-size 2`, so they're not in the gallery as
+single-GPU recipes.
+
+> **SGLang version requirement.** Gemma 4 support landed in SGLang via
+> [PR #21952](https://github.com/sgl-project/sglang/pull/21952). The
+> LocalAI sglang backend pins a release that includes it; if you've
+> overridden the pin to an older version, this recipe will fail with a
+> "model architecture not recognised" error at load time.
+
+##### Other speculative algorithms
+
+`speculative_algorithm:` also accepts `EAGLE`/`EAGLE3` (paired with an
+EAGLE-style draft head), `DFLASH` (block-diffusion drafters from
+[z-lab](https://huggingface.co/z-lab) for the Qwen3 family), `STANDALONE`
+(a smaller draft LLM verifying a larger target), and `NGRAM` (no draft
+model - pure prefix-history speculation). See SGLang's
+[speculative-decoding docs](https://docs.sglang.io/advanced_features/speculative_decoding.html)
+for the full algorithm matrix.
+
+#### Tool calling and reasoning parsers
+
+SGLang's native parsers stream `tool_calls` and `reasoning_content`
+inside `ChatDelta` - the LocalAI Python backend wires them up
+per-request rather than via `engine_args:`. Pick a parser by name:
+
+```yaml
+options:
+  - tool_parser:hermes
+  - reasoning_parser:deepseek_r1
+```
+
+The full list of registered parsers lives in `sglang.srt.function_call`
+and `sglang.srt.parser.reasoning_parser`.
+
+#### Reasoning defaults and token budgets
+
+Set SGLang reasoning options in the model's `options:` list:
+
+```yaml
+options:
+  - reasoning_parser:qwen3
+  - thinking_budget:512
+  - reasoning_default:on
+engine_args:
+  enable_strict_thinking: true
+```
+
+`thinking_budget` sets a positive integer token budget for reasoning on each request.
+Invalid, zero, and negative values produce a warning and leave the budget unset.
+SGLang requires `engine_args.enable_strict_thinking: true` to enforce the budget.
+LocalAI warns if you configure a budget without that engine option.
+Keep the budget well below the `max_tokens` of your requests: if `max_tokens` is reached first,
+the budget never triggers and the whole reply can be spent on reasoning, leaving the answer empty.
+
+`reasoning_default:on` or `reasoning_default:off` sets the default for LocalAI's tokenizer chat template.
+Request metadata `enable_thinking` set to `"true"` or `"false"` overrides this default.
+An explicit prompt bypasses tokenizer template rendering.
+When no default or request override is set, the template keeps its own behavior.
+
+LocalAI signals required reasoning when the rendered prompt ends with the configured parser's opening reasoning token.
+An explicit output grammar disables this detection.
+Configure a reasoning parser that matches your model.
+
+The backend reads these options when it loads the model.
+`POST /models/reload` rereads model configuration files but does not update options in an already loaded backend.
+Restarting only the backend does not reread configuration files.
+Restart LocalAI after changing these options to reload both the configuration and the backend.
+
+
+### vllm.cpp
+
+[vllm.cpp](https://github.com/mudler/vllm.cpp) is the LocalAI team's C++ port of
+vLLM: the same continuous-batching scheduler, paged KV cache and prefix caching,
+with no Python at inference time. It consumes either a HuggingFace safetensors
+model directory or a `.gguf` file, and applies the model's chat template,
+tool-call parsing and reasoning split engine-side.
+
+This section is the configuration reference. For installing the backend and the
+ready-made models the gallery ships for it, see the
+[vllm.cpp backend page]({{% relref "features/vllm-cpp" %}}).
+
+#### Setup
+
+```yaml
+name: vllm-cpp
+backend: vllm-cpp
+parameters:
+  model: "Qwen/Qwen3-4B"
+context_size: 8192
+template:
+  use_tokenizer_template: true
+```
+
+#### Configuring the engine with `engine_args`
+
+The same `engine_args:` map the vLLM and SGLang backends accept is honoured
+here, with keys spelled exactly as vLLM's own CLI flags - so a `speculative_config`
+or `kv_transfer_config` block written for vLLM works verbatim. Unknown keys are
+ignored rather than fatal; the engine validates the documents it is handed and
+reports a precise error at load.
+
+```yaml
+name: qwen35-a3b
+backend: vllm-cpp
+parameters:
+  model: "Qwen/Qwen3.5-A3B"
+context_size: 16384
+template:
+  use_tokenizer_template: true
+engine_args:
+  # KV cache sizing: num_blocks * block_size tokens of cache.
+  block_size: 32
+  num_blocks: 1024
+  # Concurrency and the per-step chunked-prefill token budget.
+  max_num_seqs: 32
+  max_num_batched_tokens: 8192
+  # Automatic prefix caching. Omit to keep the model's own default
+  # (on for dense models, off for hybrid / attention-free ones).
+  enable_prefix_caching: true
+  # Scheduler admission order: fcfs (default), priority, or lpm
+  # (cache-aware longest-prefix-match; needs prefix caching to have any effect).
+  scheduling_policy: lpm
+```
+
+| Key | Meaning | Default |
+|-----|---------|---------|
+| `block_size` | KV-cache block size, in tokens per block | 32 |
+| `num_blocks` | KV-cache blocks to allocate | 256 |
+| `max_model_len` | Max sequence length; also settable as `context_size` / `max_model_len` | model config |
+| `max_num_seqs` | Max concurrent sequences the scheduler admits | 8 |
+| `max_num_batched_tokens` | Per-step chunked-prefill token budget | per-arch (2048 dense, 4096/8192 MoE) |
+| `enable_prefix_caching` | Automatic prefix caching; `enable_radix_attention` is an accepted alias | model default |
+| `enable_jump_forward` | Jump-forward decoding, which emits grammar-forced tokens without a model step. Only affects constrained requests (`grammar`, JSON schema) | off |
+| `scheduling_policy` | `fcfs`, `priority`, or `lpm` | `fcfs` |
+| `tool_parser` / `reasoning_parser` | Force a parser instead of chat-template auto-detection | auto |
+| `tokenizer_config` | Override the `tokenizer_config.json` the chat template is read from | `<model_dir>/tokenizer_config.json` |
+| `speculative_config` | Speculative decoding (see below) | disabled |
+| `kv_transfer_config` | External KV connector / LMCache (see below) | none |
+| `hf_overrides` | JSON object of `config.json` keys merged over the model directory's own, as vLLM's `--hf-overrides` (see the [vllm.cpp backend page]({{% relref "features/vllm-cpp" %}}#overriding-configjson-keys-hf_overrides)) | none |
+
+Raising `max_num_batched_tokens` lets more prefill land in a single step, at the
+cost of decode latency for requests queued behind it. The default deliberately
+does not scale with `max_num_seqs`, which is what keeps a large concurrent
+prefill from blowing up the per-step activation on the hybrid architectures.
+
+`enable_prefix_caching` and `enable_jump_forward` are tri-state at the engine
+boundary: omitting the key defers to a default (the model's own capability for
+prefix caching, an environment variable for jump forward), while an explicit
+`false` forces the feature off. Those are genuinely different - prefix caching
+defaults *on* for dense models - so write the key only when you mean to override.
+
+#### Speculative decoding
+
+`speculative_config:` takes the same JSON object as vLLM's
+`--speculative-config`. Three methods are supported.
+
+> **Architecture limit.** At the current engine pin, `mtp` and `dflash` are
+> **Qwen3.5 / Qwen3.6 only**. The engine builds a widened speculative KV cache
+> directly for those families rather than through the model registry, so a
+> speculative config on any other architecture (Llama, GLM, Gemma, Mistral, ...)
+> will not work regardless of checkpoint format. `ngram` needs no draft weights
+> and is not subject to this limit.
+
+> **Format support.** `mtp` and `dflash` now work from a `.gguf` target as well
+> as safetensors. An MTP head is read from the GGUF's `nextn.*` tensors when the
+> file declares `<arch>.nextn_predict_layers`; a GGUF exported WITHOUT the head
+> (converted with `--no-mtp`, or predating llama.cpp's Qwen3.5 MTP support) is
+> refused at load naming that as the reason. A DFlash draft may itself be a
+> `dflash`-arch GGUF, and the target may be a GGUF too. `ngram` needs no draft
+> weights and works on any format.
+
+**MTP** (Multi-Token Prediction) uses a draft head shipped inside the target
+checkpoint's own `mtp.*` tensors, so there is no second model to download. It
+requires a **safetensors** checkpoint - the `mtp.*` tensors do not survive GGUF
+conversion, and an MTP config over a `.gguf` model is rejected at load.
+
+```yaml
+engine_args:
+  speculative_config:
+    method: mtp
+    # Optional; defaults to the checkpoint's own head depth, which is
+    # usually the right value. Must be a multiple of that depth.
+    num_speculative_tokens: 1
+```
+
+**DFlash** uses a separate block-diffusion drafter that proposes a whole block
+of tokens in one non-autoregressive forward pass. Unlike MTP, the draft is its
+own checkpoint, so `model:` is **required**:
+
+```yaml
+engine_args:
+  speculative_config:
+    method: dflash
+    model: z-lab/Qwen3.6-27B-DFlash
+    num_speculative_tokens: 4
+```
+
+The draft shares the *target's* `embed_tokens` and `lm_head`, so both must come
+from the same model family and the target must be safetensors.
+
+**The engine does not download the draft.** `model:` is resolved, in order,
+as a path as given, then as the last path segment under LocalAI's models
+directory (`z-lab/Qwen3.6-27B-DFlash` → `<models>/Qwen3.6-27B-DFlash`, which is
+what LocalAI's own downloader produces), then as the whole reference under the
+models directory. Install the draft into LocalAI first, or give an absolute path
+to a directory containing `config.json`. If none of those resolve, the load
+fails immediately naming every location that was tried, rather than reporting a
+missing checkpoint from inside the engine.
+
+**N-gram** needs no draft model at all - it proposes from the prompt's own
+suffix history. `num_speculative_tokens` is required:
+
+```yaml
+engine_args:
+  speculative_config:
+    method: ngram
+    num_speculative_tokens: 4
+    prompt_lookup_min: 5
+    prompt_lookup_max: 5
+```
+
+> **Auto-configuration on import.** When you import a safetensors repository
+> with `backend: vllm-cpp`, LocalAI reads the checkpoint's `config.json` and, if
+> it declares an MTP head (`mtp_num_hidden_layers`), writes
+> `speculative_config: {method: mtp}` into the generated `engine_args` for you.
+> An explicit `speculative_config` in your own config is never overwritten.
+> Importing a DFlash *draft* repository is refused with a warning: a drafter
+> cannot serve on its own, so import the target model and point
+> `speculative_config.model` at the draft.
+
+#### External KV cache with LMCache
+
+`kv_transfer_config:` takes vLLM's `--kv-transfer-config` JSON and selects an
+external KV-cache connector. The `lm://` LMCache client lets prefill KV be
+stored to and reloaded from a shared `lmcache.v1.server`, so a prefix computed
+by one replica does not have to be recomputed by the next:
+
+```yaml
+engine_args:
+  kv_transfer_config:
+    kv_connector: LMCacheConnector
+    kv_role: kv_both          # required whenever kv_connector is set
+    kv_connector_extra_config:
+      host: 127.0.0.1
+      port: 65432
+```
+
+`kv_role` is one of `kv_producer` (store only), `kv_consumer` (load only), or
+`kv_both`. An unregistered connector name, a missing role, or a malformed
+document fails the load with an explicit error rather than silently running
+without the cache.
+
+#### Legacy `options:` list
+
+Earlier versions configured this backend through the flat `options:` list, and
+those configs keep working. Every key in the table above is still read from
+there in `key:value` form, and `engine_args` wins on any key set in both:
+
+```yaml
+options:
+  - max_num_seqs:32
+  - enable_prefix_caching:true
+```
+
+New configs should prefer `engine_args:`, which is the only place the nested
+`speculative_config` / `kv_transfer_config` documents can be written naturally
+rather than as a single-line JSON string.
+
 ### Transformers
 
 [Transformers](https://huggingface.co/docs/transformers/index) is a State-of-the-art Machine Learning library for PyTorch, TensorFlow, and JAX.
@@ -702,7 +1265,7 @@ The backend will automatically download the required files in order to run the m
 - `OVModelForCausalLM` requires OpenVINO IR [Text Generation](https://huggingface.co/models?library=openvino&pipeline_tag=text-generation) models from Hugging face
 - `OVModelForFeatureExtraction` works with any Safetensors Transformer [Feature Extraction](https://huggingface.co/models?pipeline_tag=feature-extraction&library=transformers,safetensors) model from Huggingface (Embedding Model)
 
-Please note that streaming is currently not implemente in `AutoModelForCausalLM` for Intel GPU.
+Please note that streaming is currently not implemented in `AutoModelForCausalLM` for Intel GPU.
 AMD GPU support is not implemented.
 Although AMD CPU is not officially supported by OpenVINO there are reports that it works: YMMV.
 

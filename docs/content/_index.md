@@ -1,63 +1,48 @@
 +++
-title = "LocalAI"
-description = "The free, OpenAI, Anthropic alternative. Your All-in-One Complete AI Stack"
+disableToc = false
+title = "LocalAI documentation"
+description = "Install LocalAI, run models, and operate it in production."
 type = "home"
 +++
 
-**The free, OpenAI, Anthropic alternative. Your All-in-One Complete AI Stack** - Run powerful language models, autonomous agents, and document intelligence **locally** on your hardware. 
+LocalAI is the open source AI runtime: a small core that speaks the OpenAI and
+Anthropic APIs, with each inference backend added only when a model needs it.
+It runs text, vision, speech, sound, images, video, embeddings, reranking, and
+autonomous agents on hardware you control, from a CPU laptop to a distributed
+GPU cluster.
 
-**No cloud, no limits, no compromise.**
-
-{{% notice tip %}}
-**[⭐ Star us on GitHub](https://github.com/mudler/LocalAI)** - 40k+ stars and growing!
-
-**Drop-in replacement for OpenAI API** - modular suite of tools that work seamlessly together or independently. 
-
-Start with **[LocalAI](https://localai.io)**'s OpenAI-compatible API, extend with **[LocalAGI](https://github.com/mudler/LocalAGI)**'s autonomous agents, and enhance with **[LocalRecall](https://github.com/mudler/LocalRecall)**'s semantic search - all running locally on your hardware.
-
-**Open Source** MIT Licensed.
-{{% /notice %}}
-
-<center><iframe width="560" height="315" src="https://www.youtube.com/embed/PDqYhB9nNHA?si=jUClTH7uuGMwMvFw" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe></center>
-
-## Why Choose LocalAI?
-
-**OpenAI API Compatible** - Run AI models locally with our modular ecosystem. From language models to autonomous agents and semantic search, build your complete AI stack without the cloud.
-
-### Key Features
-
-- **LLM Inferencing**: LocalAI is a free, **Open Source** OpenAI alternative. Run **LLMs**, generate **images**, **audio** and more **locally** with consumer grade hardware.
-- **Agentic-first**: Extend LocalAI with LocalAGI, an autonomous AI agent platform that runs locally, no coding required. Build and deploy autonomous agents with ease.
-- **Memory and Knowledge base**: Extend LocalAI with LocalRecall, A local rest api for semantic search and memory management. Perfect for AI applications.
-- **OpenAI Compatible**: Drop-in replacement for OpenAI API. Compatible with existing applications and libraries.
-- **No GPU Required**: Run on consumer grade hardware. No need for expensive GPUs or cloud services.
-- **Multiple Models**: Support for various model families including LLMs, image generation, and audio models. Supports multiple backends for inferencing.
-- **Privacy Focused**: Keep your data local. No data leaves your machine, ensuring complete privacy.
-- **Easy Setup**: Simple installation and configuration. Get started in minutes with Binaries installation, Docker, Podman, Kubernetes or local installation.
-- **Community Driven**: Active community support and regular updates. Contribute and help shape the future of LocalAI.
-
-## Quick Start
-
-**Docker is the recommended installation method** for most users:
+New here? Read the [Overview]({{% relref "overview" %}}) for what LocalAI is
+and how the pieces fit together, then follow the
+[Quickstart]({{% relref "getting-started/quickstart" %}}).
 
 ```bash
-docker run -p 8080:8080 --name local-ai -ti localai/localai:latest
+docker run -ti --name local-ai -p 8080:8080 localai/localai:latest
 ```
 
-For complete installation instructions, see the [Installation guide](/installation/).
+## Sections
 
-## Get Started
+- **[Getting started]({{% relref "getting-started" %}})** - install LocalAI,
+  run your first model, call the API, and fix the common startup problems.
+- **[Features]({{% relref "features" %}})** - every capability, grouped by
+  modality: text, agents, audio, vision, image and video, retrieval,
+  distributed inference, and model management.
+- **[Advanced]({{% relref "advanced" %}})** - model configuration, VRAM
+  management, reverse proxies and TLS, and the rest of the fine-grained
+  control surface.
+- **[Operations]({{% relref "operations" %}})** - running and governing an
+  instance: middleware, cloud and MITM proxies, backend monitoring.
+- **[Reference]({{% relref "reference" %}})** - architecture, CLI flags, the
+  compatibility table, API and runtime errors, system info, and binaries.
+- **[FAQ]({{% relref "faq" %}})** - short answers to the questions that come up
+  most often.
 
-1. **[Install LocalAI](/installation/)** - Choose your installation method (Docker recommended)
-2. **[Quickstart Guide](/getting-started/quickstart/)** - Get started quickly after installation
-3. **[Install and Run Models](/getting-started/models/)** - Learn how to work with AI models
-4. **[Try It Out](/getting-started/try-it-out/)** - Explore examples and use cases
+## Also useful
 
-## Learn More
-
-- [Explore available models](https://models.localai.io)
-- [Model compatibility](/model-compatibility/)
-- [Try out examples](https://github.com/mudler/LocalAI-examples)
-- [Join the community](https://discord.gg/uJAeKSAGDy)
-- [Check the LocalAI Github repository](https://github.com/mudler/LocalAI)
-- [Check the LocalAGI Github repository](https://github.com/mudler/LocalAGI)
+- **[Integrations]({{% relref "integrations" %}})** - projects and tools built
+  on top of LocalAI.
+- **[News]({{% relref "whats-new" %}})** - where release notes live.
+- **[Model gallery](https://models.localai.io)** - browse the models you can
+  install with one click.
+- **[GitHub](https://github.com/mudler/LocalAI)** and
+  **[Discord](https://discord.gg/uJAeKSAGDy)** - report an issue or ask a
+  question.

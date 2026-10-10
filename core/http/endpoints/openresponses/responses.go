@@ -3,6 +3,7 @@ package openresponses
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/mudler/LocalAI/core/backend"
 	"github.com/mudler/LocalAI/core/config"
+	"github.com/mudler/LocalAI/core/http/auth"
 	mcpTools "github.com/mudler/LocalAI/core/http/endpoints/mcp"
 	openaiEndpoint "github.com/mudler/LocalAI/core/http/endpoints/openai"
 	"github.com/mudler/LocalAI/core/http/middleware"
@@ -29,7 +31,7 @@ import (
 // @Param request body schema.OpenResponsesRequest true "Request body"
 // @Success 200 {object} schema.ORResponseResource "Response"
 // @Router /v1/responses [post]
-func ResponsesEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator *templates.Evaluator, appConfig *config.ApplicationConfig, natsClient mcpTools.MCPNATSClient) echo.HandlerFunc {
+func ResponsesEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator *templates.Evaluator, appConfig *config.ApplicationConfig, agentControl mcpTools.AgentControl) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		createdAt := time.Now().Unix()
 		responseID := fmt.Sprintf("resp_%s", uuid.New().String())
@@ -56,33 +58,17 @@ func ResponsesEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, eval
 			shouldStore = false
 		}
 
-		// Handle previous_response_id if provided
-		var previousResponse *schema.ORResponseResource
+		// Handle previous_response_id if provided.
 		var messages []schema.Message
 		if input.PreviousResponseID != "" {
-			stored, err := store.Get(input.PreviousResponseID)
+			previousMessages, err := resolvePreviousResponseMessages(store, input.PreviousResponseID, cfg, ownerFromContext(c))
 			if err != nil {
-				return sendOpenResponsesError(c, 404, "not_found", fmt.Sprintf("previous response not found: %s", input.PreviousResponseID), "previous_response_id")
+				if notFound, ok := err.(*previousResponseNotFoundError); ok {
+					return sendOpenResponsesError(c, 404, "not_found", notFound.Error(), "previous_response_id")
+				}
+				return sendOpenResponsesError(c, 400, "invalid_request", err.Error(), "")
 			}
-			previousResponse = stored.Response
-
-			// Also convert previous response input to messages
-			previousInputMessages, err := convertORInputToMessages(stored.Request.Input, cfg)
-			if err != nil {
-				return sendOpenResponsesError(c, 400, "invalid_request", fmt.Sprintf("failed to convert previous input: %v", err), "")
-			}
-
-			// Convert previous response output items to messages
-			previousOutputMessages, err := convertOROutputItemsToMessages(previousResponse.Output)
-			if err != nil {
-				return sendOpenResponsesError(c, 400, "invalid_request", fmt.Sprintf("failed to convert previous response: %v", err), "")
-			}
-
-			// Concatenate: previous_input + previous_output + new_input
-			// Start with previous input messages
-			messages = previousInputMessages
-			// Add previous output as assistant messages
-			messages = append(messages, previousOutputMessages...)
+			messages = previousMessages
 		}
 
 		// Convert Open Responses input to internal Messages
@@ -95,7 +81,7 @@ func ResponsesEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, eval
 
 		// Add instructions as system message if provided
 		if input.Instructions != "" {
-			messages = append([]schema.Message{{Role: "system", StringContent: input.Instructions}}, messages...)
+			messages = append([]schema.Message{{Role: "system", Content: input.Instructions, StringContent: input.Instructions}}, messages...)
 		}
 
 		// Handle tools
@@ -122,7 +108,7 @@ func ResponsesEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, eval
 				if !hasMCPRequest {
 					enabledServers = nil // backward compat: auto-activate all servers
 				}
-				mcpExecutor = mcpTools.NewToolExecutor(c.Request().Context(), natsClient, cfg.Name, remote, stdio, enabledServers)
+				mcpExecutor = mcpTools.NewToolExecutor(c.Request().Context(), agentControl, cfg.Name, remote, stdio, enabledServers)
 
 				// Prompt and resource injection (pre-processing step — resolves locally regardless of distributed mode)
 				if hasMCPRequest {
@@ -218,7 +204,7 @@ func ResponsesEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, eval
 			}
 
 			// Generate grammar to constrain model output to valid function calls
-			jsStruct := funcsWithNoAction.ToJSONStructure(cfg.FunctionsConfig.FunctionNameKey, cfg.FunctionsConfig.FunctionNameKey)
+			jsStruct := cfg.FunctionsConfig.ToJSONStructure(funcsWithNoAction)
 			g, err := jsStruct.Grammar(cfg.FunctionsConfig.GrammarOptions()...)
 			if err == nil {
 				cfg.Grammar = g
@@ -246,8 +232,10 @@ func ResponsesEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, eval
 			// Create cancellable context for background execution
 			bgCtx, bgCancel := context.WithCancel(context.Background())
 
-			// Store the background response
-			store.StoreBackground(responseID, input, queuedResponse, bgCancel, input.Stream)
+			// Store the background response and stamp its owner before the ID
+			// is returned to the client, so later GET/cancel/resume can verify
+			// the caller owns it.
+			store.StoreBackgroundOwned(responseID, input, queuedResponse, bgCancel, input.Stream, ownerFromContext(c))
 
 			// Start background processing goroutine
 			go func() {
@@ -261,7 +249,7 @@ func ResponsesEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, eval
 
 				if input.Stream {
 					// Background streaming processing (buffer events)
-					finalResponse, bgErr = handleBackgroundStream(bgCtx, store, responseID, createdAt, input, cfg, ml, cl, appConfig, predInput, openAIReq, funcs, shouldUseFn, mcpExecutor, evaluator)
+					finalResponse, bgErr = handleBackgroundStream(bgCtx, store, responseID, createdAt, input, cfg, ml, cl, appConfig, predInput, openAIReq, funcs, shouldUseFn, true, mcpExecutor, evaluator)
 				} else {
 					// Background non-streaming processing
 					finalResponse, bgErr = handleBackgroundNonStream(bgCtx, store, responseID, createdAt, input, cfg, ml, cl, appConfig, predInput, openAIReq, funcs, shouldUseFn, mcpExecutor, evaluator)
@@ -299,7 +287,7 @@ func convertORInputToMessages(input any, cfg *config.ModelConfig) ([]schema.Mess
 	switch v := input.(type) {
 	case string:
 		// Simple string = user message
-		return []schema.Message{{Role: "user", StringContent: v}}, nil
+		return []schema.Message{{Role: "user", Content: v, StringContent: v}}, nil
 	case []any:
 		// Array of items
 		for _, itemRaw := range v {
@@ -309,6 +297,16 @@ func convertORInputToMessages(input any, cfg *config.ModelConfig) ([]schema.Mess
 			}
 
 			itemType, _ := itemMap["type"].(string)
+			// OpenAI SDK helpers (e.g. client.responses.create(input=[{"role":...,"content":...}]))
+			// send message items without a "type" discriminator. Treat a bare {role, content}
+			// object as type:"message" so the chat-completions and responses paths agree.
+			if itemType == "" {
+				if _, hasRole := itemMap["role"].(string); hasRole {
+					if _, hasContent := itemMap["content"]; hasContent {
+						itemType = "message"
+					}
+				}
+			}
 			switch itemType {
 			case "message":
 				msg, err := convertORMessageItem(itemMap, cfg)
@@ -498,6 +496,104 @@ func extractReasoningContentFromORItem(item *schema.ORItemField) string {
 		return s
 	}
 	return ""
+}
+
+type previousResponseNotFoundError struct {
+	ResponseID string
+}
+
+func (e *previousResponseNotFoundError) Error() string {
+	return fmt.Sprintf("previous response not found: %s", e.ResponseID)
+}
+
+// resolvePreviousResponseMessages reconstructs the complete stored conversation
+// ending at responseID. Requests are stored as incremental deltas, so replaying
+// only the immediately previous request loses older turns after the first chain.
+func resolvePreviousResponseMessages(store *ResponseStore, responseID string, cfg *config.ModelConfig, callerID string) ([]schema.Message, error) {
+	messages, _, err := resolvePreviousResponseMessagesFromSources(
+		[]previousResponseStoreSource{{store: store}},
+		responseID,
+		cfg,
+		callerID,
+	)
+	return messages, err
+}
+
+type previousResponseStoreSource struct {
+	store           *ResponseStore
+	connectionLocal bool
+}
+
+// resolvePreviousResponseMessagesFromSources resolves each hop against the
+// stores in priority order and reports whether the resulting chain contains
+// connection-local state. Every hop is owner-checked so a known response ID
+// cannot be used to replay another caller's conversation.
+func resolvePreviousResponseMessagesFromSources(sources []previousResponseStoreSource, responseID string, cfg *config.ModelConfig, callerID string) ([]schema.Message, bool, error) {
+	type chainEntry struct {
+		id       string
+		request  schema.OpenResponsesRequest
+		response schema.ORResponseResource
+	}
+
+	var chain []chainEntry
+	usedConnectionLocal := false
+	seen := make(map[string]struct{})
+	for currentID := responseID; currentID != ""; {
+		if _, exists := seen[currentID]; exists {
+			return nil, false, fmt.Errorf("previous_response_id cycle detected at %s", currentID)
+		}
+		seen[currentID] = struct{}{}
+
+		var stored *StoredResponse
+		var connectionLocal bool
+		for _, source := range sources {
+			if source.store == nil {
+				continue
+			}
+			candidate, err := source.store.Get(currentID)
+			if err == nil {
+				if !accessAllowed(candidate, callerID) {
+					return nil, false, &previousResponseNotFoundError{ResponseID: currentID}
+				}
+				stored = candidate
+				connectionLocal = source.connectionLocal
+				break
+			}
+		}
+		if stored == nil {
+			return nil, false, &previousResponseNotFoundError{ResponseID: currentID}
+		}
+
+		stored.mu.RLock()
+		if stored.Request == nil || stored.Response == nil {
+			stored.mu.RUnlock()
+			return nil, false, fmt.Errorf("stored previous response %s is incomplete", currentID)
+		}
+		request := *stored.Request
+		response := *stored.Response
+		response.Output = append([]schema.ORItemField(nil), stored.Response.Output...)
+		stored.mu.RUnlock()
+
+		chain = append(chain, chainEntry{id: currentID, request: request, response: response})
+		usedConnectionLocal = usedConnectionLocal || connectionLocal
+		currentID = request.PreviousResponseID
+	}
+
+	var messages []schema.Message
+	for i := len(chain) - 1; i >= 0; i-- {
+		entry := chain[i]
+		inputMessages, err := convertORInputToMessages(entry.request.Input, cfg)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to convert previous input for %s: %w", entry.id, err)
+		}
+		outputMessages, err := convertOROutputItemsToMessages(entry.response.Output)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to convert previous response %s: %w", entry.id, err)
+		}
+		messages = append(messages, inputMessages...)
+		messages = append(messages, outputMessages...)
+	}
+	return messages, usedConnectionLocal, nil
 }
 
 // convertOROutputItemsToMessages converts Open Responses output items to internal Messages.
@@ -709,8 +805,10 @@ func convertORMessageItem(itemMap map[string]any, cfg *config.ModelConfig) (sche
 		msg.StringVideos = stringVideos
 		msg.StringAudios = stringAudios
 
-		// Template multimodal content
-		if len(stringImages) > 0 || len(stringVideos) > 0 || len(stringAudios) > 0 {
+		// Template multimodal content. Skipped when the backend handles templating
+		// itself (UseTokenizerTemplate) — it also injects markers server-side and
+		// StringContent is not consumed by the evaluator in that path.
+		if (len(stringImages) > 0 || len(stringVideos) > 0 || len(stringAudios) > 0) && !cfg.TemplateConfig.UseTokenizerTemplate {
 			msg.StringContent, _ = templates.TemplateMultiModal(cfg.TemplateConfig.Multimodal, templates.MultiModalOptions{
 				TotalImages:     len(stringImages),
 				TotalVideos:     len(stringVideos),
@@ -771,7 +869,7 @@ func convertORToolsToFunctions(input *schema.OpenResponsesRequest, cfg *config.M
 		case map[string]any:
 			if tcType, ok := tc["type"].(string); ok && tcType == "function" {
 				if name, ok := tc["name"].(string); ok {
-					cfg.SetFunctionCallString(name)
+					cfg.SetFunctionCallNameString(name)
 				}
 			}
 		}
@@ -996,7 +1094,7 @@ func handleBackgroundNonStream(ctx context.Context, store *ResponseStore, respon
 }
 
 // handleBackgroundStream handles background streaming responses with event buffering
-func handleBackgroundStream(ctx context.Context, store *ResponseStore, responseID string, createdAt int64, input *schema.OpenResponsesRequest, cfg *config.ModelConfig, ml *model.ModelLoader, cl *config.ModelConfigLoader, appConfig *config.ApplicationConfig, predInput string, openAIReq *schema.OpenAIRequest, funcs functions.Functions, shouldUseFn bool, mcpExecutor mcpTools.ToolExecutor, evaluator *templates.Evaluator) (*schema.ORResponseResource, error) {
+func handleBackgroundStream(ctx context.Context, store *ResponseStore, responseID string, createdAt int64, input *schema.OpenResponsesRequest, cfg *config.ModelConfig, ml *model.ModelLoader, cl *config.ModelConfigLoader, appConfig *config.ApplicationConfig, predInput string, openAIReq *schema.OpenAIRequest, funcs functions.Functions, shouldUseFn bool, shouldStore bool, mcpExecutor mcpTools.ToolExecutor, evaluator *templates.Evaluator) (*schema.ORResponseResource, error) {
 	// Populate openAIReq fields for ComputeChoices
 	openAIReq.Tools = convertORToolsToOpenAIFormat(input.Tools)
 	openAIReq.ToolsChoice = input.ToolChoice
@@ -1009,7 +1107,7 @@ func handleBackgroundStream(ctx context.Context, store *ResponseStore, responseI
 	sequenceNumber := 0
 
 	// Emit response.created
-	responseCreated := buildORResponse(responseID, createdAt, nil, schema.ORStatusInProgress, input, []schema.ORItemField{}, nil, true)
+	responseCreated := buildORResponse(responseID, createdAt, nil, schema.ORStatusInProgress, input, []schema.ORItemField{}, nil, shouldStore)
 	bufferEvent(store, responseID, &schema.ORStreamEvent{
 		Type:           "response.created",
 		SequenceNumber: sequenceNumber,
@@ -1281,7 +1379,7 @@ func handleBackgroundStream(ctx context.Context, store *ResponseStore, responseI
 		InputTokens:  lastTokenUsage.Prompt,
 		OutputTokens: lastTokenUsage.Completion,
 		TotalTokens:  lastTokenUsage.Prompt + lastTokenUsage.Completion,
-	}, true)
+	}, shouldStore)
 
 	// Emit response.completed
 	bufferEvent(store, responseID, &schema.ORStreamEvent{
@@ -1342,9 +1440,12 @@ func handleOpenResponsesNonStream(c echo.Context, responseID string, createdAt i
 		template = predInput
 	}
 	thinkingStartToken := reason.DetectThinkingStartToken(template, &cfg.ReasoningConfig)
+	if cfg.TemplateConfig.UseTokenizerTemplate {
+		thinkingStartToken = reason.DetectThinkingStartTokenInTemplate(template, &cfg.ReasoningConfig)
+	}
 
 	// Extract reasoning from result before cleaning
-	reasoningContent, cleanedResult := reason.ExtractReasoningWithConfig(result, thinkingStartToken, cfg.ReasoningConfig)
+	reasoningContent, cleanedResult := reason.ExtractReasoningComplete(result, thinkingStartToken, cfg.ReasoningConfig)
 
 	// Parse tool calls if using functions
 	var outputItems []schema.ORItemField
@@ -1574,7 +1675,7 @@ func handleOpenResponsesNonStream(c echo.Context, responseID string, createdAt i
 	// Store response for future reference (if enabled)
 	if shouldStore {
 		store := GetGlobalStore()
-		store.Store(responseID, input, response)
+		store.StoreOwned(responseID, input, response, ownerFromContext(c))
 	}
 
 	return c.JSON(200, response)
@@ -1622,6 +1723,9 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 		template = predInput
 	}
 	thinkingStartToken := reason.DetectThinkingStartToken(template, &cfg.ReasoningConfig)
+	if cfg.TemplateConfig.UseTokenizerTemplate {
+		thinkingStartToken = reason.DetectThinkingStartTokenInTemplate(template, &cfg.ReasoningConfig)
+	}
 
 	// Track state for streaming
 	var currentMessageID string
@@ -1769,49 +1873,37 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 					return true
 				}
 
-				// Try JSON parsing as fallback
-				jsonResults, jsonErr := functions.ParseJSONIterative(cleanedResult, true)
-				if jsonErr == nil && len(jsonResults) > lastEmittedToolCallCount {
+				// Only completed JSON calls can be emitted as completed SSE items.
+				jsonResults := parseStreamingJSONToolCalls(cleanedResult)
+				if len(jsonResults) > lastEmittedToolCallCount {
 					for i := lastEmittedToolCallCount; i < len(jsonResults); i++ {
-						jsonObj := jsonResults[i]
-						if name, ok := jsonObj["name"].(string); ok && name != "" {
-							args := "{}"
-							if argsVal, ok := jsonObj["arguments"]; ok {
-								if argsStr, ok := argsVal.(string); ok {
-									args = argsStr
-								} else {
-									argsBytes, _ := json.Marshal(argsVal)
-									args = string(argsBytes)
-								}
-							}
+						tc := jsonResults[i]
+						toolCallID := fmt.Sprintf("fc_%s", uuid.New().String())
+						outputIndex++
 
-							toolCallID := fmt.Sprintf("fc_%s", uuid.New().String())
-							outputIndex++
-
-							functionCallItem := &schema.ORItemField{
-								Type:      "function_call",
-								ID:        toolCallID,
-								Status:    "completed",
-								CallID:    toolCallID,
-								Name:      name,
-								Arguments: args,
-							}
-							sendSSEEvent(c, &schema.ORStreamEvent{
-								Type:           "response.output_item.added",
-								SequenceNumber: sequenceNumber,
-								OutputIndex:    &outputIndex,
-								Item:           functionCallItem,
-							})
-							sequenceNumber++
-
-							sendSSEEvent(c, &schema.ORStreamEvent{
-								Type:           "response.output_item.done",
-								SequenceNumber: sequenceNumber,
-								OutputIndex:    &outputIndex,
-								Item:           functionCallItem,
-							})
-							sequenceNumber++
+						functionCallItem := &schema.ORItemField{
+							Type:      "function_call",
+							ID:        toolCallID,
+							Status:    "completed",
+							CallID:    toolCallID,
+							Name:      tc.Name,
+							Arguments: tc.Arguments,
 						}
+						sendSSEEvent(c, &schema.ORStreamEvent{
+							Type:           "response.output_item.added",
+							SequenceNumber: sequenceNumber,
+							OutputIndex:    &outputIndex,
+							Item:           functionCallItem,
+						})
+						sequenceNumber++
+
+						sendSSEEvent(c, &schema.ORStreamEvent{
+							Type:           "response.output_item.done",
+							SequenceNumber: sequenceNumber,
+							OutputIndex:    &outputIndex,
+							Item:           functionCallItem,
+						})
+						sequenceNumber++
 					}
 					lastEmittedToolCallCount = len(jsonResults)
 					c.Response().Flush()
@@ -1969,6 +2061,10 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 
 			// Source reasoning from: (1) ChatDeltas from C++ autoparser, (2) extractor's
 			// streaming state, (3) final extraction from the finetuned result.
+			// Issue #9985: when the autoparser delivered Content but no
+			// ReasoningContent, it was running in the "pure content" PEG fallback
+			// (non-jinja path) which leaves reasoning tags embedded in content.
+			// Fall back to the streaming Go-side extractor's split in that case.
 			if chatDeltaReasoning := functions.ReasoningFromChatDeltas(chatDeltas); chatDeltaReasoning != "" {
 				finalReasoning = chatDeltaReasoning
 				finalCleanedResult = functions.ContentFromChatDeltas(chatDeltas)
@@ -1980,7 +2076,7 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 				finalCleanedResult = extractor.CleanedContent()
 			}
 			if finalReasoning == "" && finalCleanedResult == "" {
-				finalReasoning, finalCleanedResult = reason.ExtractReasoningWithConfig(result, thinkingStartToken, cfg.ReasoningConfig)
+				finalReasoning, finalCleanedResult = reason.ExtractReasoningComplete(result, thinkingStartToken, cfg.ReasoningConfig)
 			}
 
 			// Close reasoning item if it exists and wasn't closed yet
@@ -2305,7 +2401,7 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 		// Store response for future reference (if enabled)
 		if shouldStore {
 			store := GetGlobalStore()
-			store.Store(responseID, input, responseCompleted)
+			store.StoreOwned(responseID, input, responseCompleted, ownerFromContext(c))
 		}
 
 		// Send [DONE]
@@ -2316,6 +2412,8 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 	}
 
 	// Non-tool-call streaming path
+	messageOutputIndex := outputIndex
+	var reasoningOutputIndex int
 	// Emit output_item.added for message
 	currentMessageID = fmt.Sprintf("msg_%s", uuid.New().String())
 	messageItem := &schema.ORItemField{
@@ -2328,7 +2426,7 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 	sendSSEEvent(c, &schema.ORStreamEvent{
 		Type:           "response.output_item.added",
 		SequenceNumber: sequenceNumber,
-		OutputIndex:    &outputIndex,
+		OutputIndex:    &messageOutputIndex,
 		Item:           messageItem,
 	})
 	sequenceNumber++
@@ -2340,7 +2438,7 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 		Type:           "response.content_part.added",
 		SequenceNumber: sequenceNumber,
 		ItemID:         currentMessageID,
-		OutputIndex:    &outputIndex,
+		OutputIndex:    &messageOutputIndex,
 		ContentIndex:   &currentContentIndex,
 		Part:           &emptyTextPart,
 	})
@@ -2363,10 +2461,11 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 		}
 
 		// Handle reasoning item
-		if extractor.Reasoning() != "" {
+		if extractor.Reasoning() != "" || reasoningDelta != "" {
 			// Check if we need to create reasoning item
 			if currentReasoningID == "" {
 				outputIndex++
+				reasoningOutputIndex = outputIndex
 				currentReasoningID = fmt.Sprintf("reasoning_%s", uuid.New().String())
 				reasoningItem := &schema.ORItemField{
 					Type:   "reasoning",
@@ -2376,7 +2475,7 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 				sendSSEEvent(c, &schema.ORStreamEvent{
 					Type:           "response.output_item.added",
 					SequenceNumber: sequenceNumber,
-					OutputIndex:    &outputIndex,
+					OutputIndex:    &reasoningOutputIndex,
 					Item:           reasoningItem,
 				})
 				sequenceNumber++
@@ -2388,7 +2487,7 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 					Type:           "response.content_part.added",
 					SequenceNumber: sequenceNumber,
 					ItemID:         currentReasoningID,
-					OutputIndex:    &outputIndex,
+					OutputIndex:    &reasoningOutputIndex,
 					ContentIndex:   &currentReasoningContentIndex,
 					Part:           &emptyPart,
 				})
@@ -2401,7 +2500,7 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 					Type:           "response.output_text.delta",
 					SequenceNumber: sequenceNumber,
 					ItemID:         currentReasoningID,
-					OutputIndex:    &outputIndex,
+					OutputIndex:    &reasoningOutputIndex,
 					ContentIndex:   &currentReasoningContentIndex,
 					Delta:          strPtr(reasoningDelta),
 					Logprobs:       emptyLogprobs(),
@@ -2418,7 +2517,7 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 				Type:           "response.output_text.delta",
 				SequenceNumber: sequenceNumber,
 				ItemID:         currentMessageID,
-				OutputIndex:    &outputIndex,
+				OutputIndex:    &messageOutputIndex,
 				ContentIndex:   &currentContentIndex,
 				Delta:          strPtr(contentDelta),
 				Logprobs:       emptyLogprobs(),
@@ -2477,7 +2576,7 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 		finalCleanedResult = extractor.CleanedContent()
 	}
 	if finalReasoning == "" && finalCleanedResult == "" {
-		finalReasoning, finalCleanedResult = reason.ExtractReasoningWithConfig(result, thinkingStartToken, cfg.ReasoningConfig)
+		finalReasoning, finalCleanedResult = reason.ExtractReasoningComplete(result, thinkingStartToken, cfg.ReasoningConfig)
 	}
 
 	// Close reasoning item if it exists and wasn't closed yet
@@ -2487,7 +2586,7 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 			Type:           "response.output_text.done",
 			SequenceNumber: sequenceNumber,
 			ItemID:         currentReasoningID,
-			OutputIndex:    &outputIndex,
+			OutputIndex:    &reasoningOutputIndex,
 			ContentIndex:   &currentReasoningContentIndex,
 			Text:           strPtr(finalReasoning),
 			Logprobs:       emptyLogprobs(),
@@ -2500,7 +2599,7 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 			Type:           "response.content_part.done",
 			SequenceNumber: sequenceNumber,
 			ItemID:         currentReasoningID,
-			OutputIndex:    &outputIndex,
+			OutputIndex:    &reasoningOutputIndex,
 			ContentIndex:   &currentReasoningContentIndex,
 			Part:           &reasoningPart,
 		})
@@ -2516,7 +2615,7 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 		sendSSEEvent(c, &schema.ORStreamEvent{
 			Type:           "response.output_item.done",
 			SequenceNumber: sequenceNumber,
-			OutputIndex:    &outputIndex,
+			OutputIndex:    &reasoningOutputIndex,
 			Item:           reasoningItem,
 		})
 		sequenceNumber++
@@ -2550,7 +2649,7 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 		Type:           "response.output_text.done",
 		SequenceNumber: sequenceNumber,
 		ItemID:         currentMessageID,
-		OutputIndex:    &outputIndex,
+		OutputIndex:    &messageOutputIndex,
 		ContentIndex:   &currentContentIndex,
 		Text:           strPtr(result),
 		Logprobs:       logprobsPtr(mcpStreamLogprobs),
@@ -2563,7 +2662,7 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 		Type:           "response.content_part.done",
 		SequenceNumber: sequenceNumber,
 		ItemID:         currentMessageID,
-		OutputIndex:    &outputIndex,
+		OutputIndex:    &messageOutputIndex,
 		ContentIndex:   &currentContentIndex,
 		Part:           &resultPart,
 	})
@@ -2575,7 +2674,7 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 	sendSSEEvent(c, &schema.ORStreamEvent{
 		Type:           "response.output_item.done",
 		SequenceNumber: sequenceNumber,
-		OutputIndex:    &outputIndex,
+		OutputIndex:    &messageOutputIndex,
 		Item:           messageItem,
 	})
 	sequenceNumber++
@@ -2615,34 +2714,9 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 	// Emit response.completed
 	now := time.Now().Unix()
 
-	// Collect final output items (reasoning first, then messages, then tool calls)
-	var finalOutputItems []schema.ORItemField
-	// Add reasoning item if it exists
-	if currentReasoningID != "" && finalReasoning != "" {
-		finalOutputItems = append(finalOutputItems, schema.ORItemField{
-			Type:    "reasoning",
-			ID:      currentReasoningID,
-			Status:  "completed",
-			Content: []schema.ORContentPart{makeOutputTextPart(finalReasoning)},
-		})
-	}
-	// Add message item
-	if len(collectedOutputItems) > 0 {
-		// Use collected items (may include reasoning already)
-		for _, item := range collectedOutputItems {
-			if item.Type == "message" {
-				finalOutputItems = append(finalOutputItems, item)
-			}
-		}
-	} else {
-		finalOutputItems = append(finalOutputItems, *messageItem)
-	}
-	// Add function_call items from fallback
-	for _, item := range collectedOutputItems {
-		if item.Type == "function_call" {
-			finalOutputItems = append(finalOutputItems, item)
-		}
-	}
+	// The final output array must use the indices announced in the stream.
+	// The message is opened first, followed by reasoning and fallback calls.
+	finalOutputItems := append([]schema.ORItemField{*messageItem}, collectedOutputItems...)
 	responseCompleted := buildORResponse(responseID, createdAt, &now, "completed", input, finalOutputItems, &schema.ORUsage{
 		InputTokens:  noToolTokenUsage.Prompt,
 		OutputTokens: noToolTokenUsage.Completion,
@@ -2660,7 +2734,7 @@ func handleOpenResponsesStream(c echo.Context, responseID string, createdAt int6
 	// Store response for future reference (if enabled)
 	if shouldStore {
 		store := GetGlobalStore()
-		store.Store(responseID, input, responseCompleted)
+		store.StoreOwned(responseID, input, responseCompleted, ownerFromContext(c))
 	}
 
 	// Send [DONE]
@@ -2932,12 +3006,15 @@ func sendOpenResponsesError(c echo.Context, statusCode int, errorType, message, 
 	return c.JSON(statusCode, errorResp)
 }
 
-// convertORToolsToOpenAIFormat converts Open Responses tools to OpenAI format for the backend
-// Open Responses format: { type, name, description, parameters }
-// OpenAI format: { type, function: { name, description, parameters } }
+// convertORToolsToOpenAIFormat converts only tools that have an equivalent in
+// the OpenAI-compatible function-tool representation. Native Responses tools
+// such as web_search and namespace must not be rewritten as functions.
 func convertORToolsToOpenAIFormat(orTools []schema.ORFunctionTool) []functions.Tool {
 	result := make([]functions.Tool, 0, len(orTools))
 	for _, t := range orTools {
+		if t.Type != "function" {
+			continue
+		}
 		result = append(result, functions.Tool{
 			Type: "function",
 			Function: functions.Function{
@@ -2948,6 +3025,18 @@ func convertORToolsToOpenAIFormat(orTools []schema.ORFunctionTool) []functions.T
 		})
 	}
 	return result
+}
+
+// ownerFromContext returns the identity (user ID) of the authenticated
+// caller, or empty string when no authentication was performed (single-key /
+// no-auth deployments). It is the value stamped on a response at creation and
+// compared on read/cancel/resume to prevent one caller from accessing
+// another's response by guessing its ID.
+func ownerFromContext(c echo.Context) string {
+	if u := auth.GetUser(c); u != nil {
+		return u.ID
+	}
+	return ""
 }
 
 // GetResponseEndpoint returns a handler for GET /responses/:id
@@ -2972,6 +3061,12 @@ func GetResponseEndpoint() func(c echo.Context) error {
 		store := GetGlobalStore()
 		stored, err := store.Get(responseID)
 		if err != nil {
+			return sendOpenResponsesError(c, 404, "not_found", fmt.Sprintf("response not found: %s", responseID), "id")
+		}
+
+		// Enforce response ownership. Return 404 (not 403) on mismatch so the
+		// existence of another caller's response is not leaked.
+		if !accessAllowed(stored, ownerFromContext(c)) {
 			return sendOpenResponsesError(c, 404, "not_found", fmt.Sprintf("response not found: %s", responseID), "id")
 		}
 
@@ -3006,15 +3101,35 @@ func GetResponseEndpoint() func(c echo.Context) error {
 
 // handleStreamResume handles resuming a streaming response from a specific sequence number
 func handleStreamResume(c echo.Context, store *ResponseStore, responseID string, stored *StoredResponse, startingAfter int) error {
+	// The resume buffer is process-local by design (see ErrResponseNotLocal), so
+	// a resume that the load balancer routed to a replica which is not
+	// generating this response cannot be served here. Say that plainly: a
+	// truthful error lets the caller retry against the right replica, whereas
+	// replaying an empty buffer would look like a stream that simply ended.
+	if stored.Remote {
+		return sendOpenResponsesError(c, 409, "invalid_request_error",
+			fmt.Sprintf("response %s is being generated on another replica (%s) and its stream cannot be resumed here; poll GET /v1/responses/%s instead, or route the resume with session affinity", responseID, stored.OwnerReplica, responseID),
+			"stream")
+	}
+
+	// Fetch buffered events before committing to an SSE response so an
+	// offset-lost gap can be reported as a clean HTTP status rather than a
+	// silently truncated event stream.
+	events, err := store.GetEventsAfter(responseID, startingAfter)
+	if err != nil {
+		if errors.Is(err, ErrResponseNotLocal) {
+			return sendOpenResponsesError(c, 409, "invalid_request_error",
+				fmt.Sprintf("response %s is being generated on another replica and its stream cannot be resumed here", responseID), "stream")
+		}
+		if errors.Is(err, ErrOffsetLost) {
+			return sendOpenResponsesError(c, 409, "invalid_request_error", fmt.Sprintf("starting_after=%d is older than the oldest retained event; the resume buffer evicted those events and the stream cannot be resumed from that point", startingAfter), "starting_after")
+		}
+		return sendOpenResponsesError(c, 500, "server_error", fmt.Sprintf("failed to get events: %v", err), "")
+	}
+
 	c.Response().Header().Set("Content-Type", "text/event-stream")
 	c.Response().Header().Set("Cache-Control", "no-cache")
 	c.Response().Header().Set("Connection", "keep-alive")
-
-	// Get buffered events after the starting point
-	events, err := store.GetEventsAfter(responseID, startingAfter)
-	if err != nil {
-		return sendOpenResponsesError(c, 500, "server_error", fmt.Sprintf("failed to get events: %v", err), "")
-	}
 
 	// Send all buffered events
 	for _, event := range events {
@@ -3110,6 +3225,17 @@ func CancelResponseEndpoint() func(c echo.Context) error {
 		}
 
 		store := GetGlobalStore()
+
+		// Look up first so ownership can be checked before any mutation.
+		stored, err := store.Get(responseID)
+		if err != nil {
+			return sendOpenResponsesError(c, 404, "not_found", fmt.Sprintf("response not found: %s", responseID), "id")
+		}
+		// Return 404 (not 403) on owner mismatch so existence is not leaked.
+		if !accessAllowed(stored, ownerFromContext(c)) {
+			return sendOpenResponsesError(c, 404, "not_found", fmt.Sprintf("response not found: %s", responseID), "id")
+		}
+
 		response, err := store.Cancel(responseID)
 		if err != nil {
 			return sendOpenResponsesError(c, 404, "not_found", fmt.Sprintf("response not found: %s", responseID), "id")

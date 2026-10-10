@@ -3,9 +3,10 @@ package distributed_test
 import (
 	"context"
 	"encoding/json"
+	"time"
 
-	"github.com/mudler/LocalAI/core/services/messaging"
 	"github.com/mudler/LocalAI/core/services/nodes"
+	"github.com/mudler/LocalAI/core/services/workerctl"
 	"github.com/mudler/LocalAI/pkg/grpc/base"
 	pb "github.com/mudler/LocalAI/pkg/grpc/proto"
 
@@ -61,10 +62,16 @@ var _ = Describe("SmartRouter trackingKey", Label("Distributed"), func() {
 
 		// Mock backend.install handler — always replies success
 		infra.NC.Conn().Subscribe("nodes.*.backend.install", func(msg *nats.Msg) {
-			reply := messaging.BackendInstallReply{Success: true}
+			reply := workerctl.BackendInstallReply{Success: true}
 			data, _ := json.Marshal(reply)
 			msg.Respond(data)
 		})
+		_, err = infra.NC.Conn().Subscribe("nodes.*.models.running", func(msg *nats.Msg) {
+			data, _ := json.Marshal(workerctl.ModelsRunningReply{})
+			_ = msg.Respond(data)
+		})
+		Expect(err).NotTo(HaveOccurred())
+		FlushNATS(infra.NC)
 
 		// Start a mock gRPC backend using the same helper as full flow tests
 		llm := &trackingTestLLM{}
@@ -78,7 +85,7 @@ var _ = Describe("SmartRouter trackingKey", Label("Distributed"), func() {
 		Expect(registry.Register(context.Background(), node, true)).To(Succeed())
 		nodeID = node.ID
 
-		unloader := nodes.NewRemoteUnloaderAdapter(registry, infra.NC)
+		unloader := nodes.NewRemoteUnloaderAdapter(registry, infra.NC, 3*time.Minute, 15*time.Minute)
 		router = nodes.NewSmartRouter(registry, nodes.SmartRouterOptions{
 			Unloader: unloader,
 		})
@@ -91,7 +98,7 @@ var _ = Describe("SmartRouter trackingKey", Label("Distributed"), func() {
 	})
 
 	It("records model under modelID when modelID is provided", func() {
-		result, err := router.Route(infra.Ctx, "my-model-id", "path/to/model.gguf", "llama-cpp",
+		result, err := router.Route(infra.Ctx, "my-model-id", "path/to/model.gguf", "llama-cpp", "",
 			&pb.ModelOptions{ModelFile: "path/to/model.gguf"}, false)
 		Expect(err).ToNot(HaveOccurred())
 		defer result.Release()
@@ -104,7 +111,7 @@ var _ = Describe("SmartRouter trackingKey", Label("Distributed"), func() {
 	})
 
 	It("records model under modelName when modelID is empty (backward compat)", func() {
-		result, err := router.Route(infra.Ctx, "", "legacy/model.bin", "llama-cpp",
+		result, err := router.Route(infra.Ctx, "", "legacy/model.bin", "llama-cpp", "",
 			&pb.ModelOptions{ModelFile: "legacy/model.bin"}, false)
 		Expect(err).ToNot(HaveOccurred())
 		defer result.Release()
@@ -116,7 +123,7 @@ var _ = Describe("SmartRouter trackingKey", Label("Distributed"), func() {
 	})
 
 	It("FindNodesWithModel(modelID) finds node; FindNodesWithModel(modelName) does not", func() {
-		result, err := router.Route(infra.Ctx, "distinct-id", "distinct/path.gguf", "llama-cpp",
+		result, err := router.Route(infra.Ctx, "distinct-id", "distinct/path.gguf", "llama-cpp", "",
 			&pb.ModelOptions{ModelFile: "distinct/path.gguf"}, false)
 		Expect(err).ToNot(HaveOccurred())
 		defer result.Release()
@@ -134,7 +141,7 @@ var _ = Describe("SmartRouter trackingKey", Label("Distributed"), func() {
 
 	It("InFlight tracking increments and decrements via registry", func() {
 		// Route to establish model record
-		result, err := router.Route(infra.Ctx, "release-model", "release/path.gguf", "llama-cpp",
+		result, err := router.Route(infra.Ctx, "release-model", "release/path.gguf", "llama-cpp", "",
 			&pb.ModelOptions{ModelFile: "release/path.gguf"}, false)
 		Expect(err).ToNot(HaveOccurred())
 		defer result.Release()
@@ -150,7 +157,7 @@ var _ = Describe("SmartRouter trackingKey", Label("Distributed"), func() {
 		}
 
 		// Manually increment in-flight (simulates what InFlightTrackingClient.track() does during inference)
-		Expect(registry.IncrementInFlight(context.Background(), nodeID, "release-model")).To(Succeed())
+		Expect(registry.IncrementInFlight(context.Background(), nodeID, "release-model", 0)).To(Succeed())
 
 		// Check in-flight increased
 		models, err = registry.GetNodeModels(context.Background(), nodeID)
@@ -164,7 +171,7 @@ var _ = Describe("SmartRouter trackingKey", Label("Distributed"), func() {
 		Expect(inflight).To(Equal(baseline + 1))
 
 		// Decrement and check in-flight goes back to baseline
-		Expect(registry.DecrementInFlight(context.Background(), nodeID, "release-model")).To(Succeed())
+		Expect(registry.DecrementInFlight(context.Background(), nodeID, "release-model", 0)).To(Succeed())
 
 		models, err = registry.GetNodeModels(context.Background(), nodeID)
 		Expect(err).ToNot(HaveOccurred())
@@ -177,7 +184,7 @@ var _ = Describe("SmartRouter trackingKey", Label("Distributed"), func() {
 
 	It("clears stale model record when node is unreachable", func() {
 		// First route to establish the model record
-		result, err := router.Route(infra.Ctx, "stale-check", "stale/path.gguf", "llama-cpp",
+		result, err := router.Route(infra.Ctx, "stale-check", "stale/path.gguf", "llama-cpp", "",
 			&pb.ModelOptions{ModelFile: "stale/path.gguf"}, false)
 		Expect(err).ToNot(HaveOccurred())
 		result.Release()
@@ -194,7 +201,7 @@ var _ = Describe("SmartRouter trackingKey", Label("Distributed"), func() {
 		// Route again — should detect unreachable node and clear stale record
 		// (it will fall through to FindLeastLoadedNode + backend.install which succeeds,
 		// but the LoadModel gRPC call will fail since the server is down)
-		_, err = router.Route(infra.Ctx, "stale-check", "stale/path.gguf", "llama-cpp",
+		_, err = router.Route(infra.Ctx, "stale-check", "stale/path.gguf", "llama-cpp", "",
 			&pb.ModelOptions{ModelFile: "stale/path.gguf"}, false)
 		// Expect an error since the only node is down (LoadModel fails)
 		Expect(err).To(HaveOccurred())

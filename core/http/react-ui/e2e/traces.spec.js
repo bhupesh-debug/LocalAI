@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test'
+import { test, expect } from './coverage-fixtures.js'
 
 test.describe('Traces Settings', () => {
   test.beforeEach(async ({ page }) => {
@@ -30,20 +30,18 @@ test.describe('Traces Settings', () => {
     await settingsHeader.click()
     await expect(page.locator('text=Enable Tracing')).toBeVisible()
 
-    // The Toggle component is a <label> wrapping a hidden checkbox.
-    // Use .first() on the checkbox to target the Enable Tracing toggle
-    // (it appears before the Enable Backend Logging toggle in the DOM).
-    const checkbox = page.locator('input[type="checkbox"]').first()
+    // The switch is named for the setting it flips.
+    const checkbox = page.getByRole('switch', { name: 'Enable Tracing' })
 
     // Initially enabled (server starts with tracing on)
     await expect(checkbox).toBeChecked()
 
-    // Click the label (parent) to toggle off
-    await checkbox.locator('..').click()
+    // Click to toggle off
+    await checkbox.click()
     await expect(checkbox).not.toBeChecked()
 
     // Click again to re-enable
-    await checkbox.locator('..').click()
+    await checkbox.click()
     await expect(checkbox).toBeChecked()
   })
 
@@ -52,9 +50,20 @@ test.describe('Traces Settings', () => {
     await page.locator('button', { hasText: 'Tracing is' }).click()
     await expect(page.locator('text=Enable Tracing')).toBeVisible()
 
-    const maxItemsInput = page.locator('input[type="number"]')
+    // The Tracing panel has two numeric inputs (Max Items and Max Body Bytes).
+    // Disambiguate by placeholder so adding a third field later doesn't break this.
+    const maxItemsInput = page.getByPlaceholder('100')
     await maxItemsInput.fill('500')
     await expect(maxItemsInput).toHaveValue('500')
+  })
+
+  test('set max body bytes value', async ({ page }) => {
+    await page.locator('button', { hasText: 'Tracing is' }).click()
+    await expect(page.locator('text=Enable Tracing')).toBeVisible()
+
+    const maxBodyBytesInput = page.getByPlaceholder('65536')
+    await maxBodyBytesInput.fill('16384')
+    await expect(maxBodyBytesInput).toHaveValue('16384')
   })
 
   test('save shows toast', async ({ page }) => {
@@ -85,8 +94,8 @@ test.describe('Traces Settings', () => {
     await page.locator('button', { hasText: 'Tracing is' }).click()
     await expect(page.locator('text=Enable Tracing')).toBeVisible()
 
-    // Toggle tracing off (first checkbox is the Enable Tracing toggle)
-    await page.locator('input[type="checkbox"]').first().locator('..').click()
+    // Toggle tracing off
+    await page.getByRole('switch', { name: 'Enable Tracing' }).click()
 
     // Save
     await page.locator('button', { hasText: 'Save' }).click()

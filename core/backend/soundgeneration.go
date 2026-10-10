@@ -15,6 +15,7 @@ import (
 )
 
 func SoundGeneration(
+	ctx context.Context,
 	text string,
 	duration *float32,
 	temperature *float32,
@@ -29,6 +30,7 @@ func SoundGeneration(
 	language string,
 	timesignature string,
 	instrumental *bool,
+	params map[string]string,
 	loader *model.ModelLoader,
 	appConfig *config.ApplicationConfig,
 	modelConfig config.ModelConfig,
@@ -61,14 +63,20 @@ func SoundGeneration(
 	}
 
 	req := &proto.SoundGenerationRequest{
-		Text:        text,
-		Model:       modelConfig.Model,
-		Dst:         filePath,
-		Sample:      doSample,
-		Duration:    duration,
-		Temperature: temperature,
-		Src:         sourceFile,
-		SrcDivisor:  sourceDivisor,
+		Text: text,
+		// Model is rewritten to a worker-local path by the distributed file
+		// stager; ModelIdentity carries the untranslated value the backend
+		// compares against what it loaded (#10952). They start out equal here
+		// and must stay two separate fields.
+		ModelIdentity: modelConfig.Model,
+		Model:         modelConfig.Model,
+		Dst:           filePath,
+		Sample:        doSample,
+		Duration:      duration,
+		Temperature:   temperature,
+		Src:           sourceFile,
+		SrcDivisor:    sourceDivisor,
+		Params:        params,
 	}
 	if think != nil {
 		req.Think = think
@@ -95,13 +103,25 @@ func SoundGeneration(
 		req.Instrumental = instrumental
 	}
 
-	var startTime time.Time
-	if appConfig.EnableTracing {
-		trace.InitBackendTracingIfEnabled(appConfig.TracingMaxItems)
-		startTime = time.Now()
+	release, err := AcquireGlobalBackendSlot()
+	if err != nil {
+		return "", nil, err
 	}
+	defer release()
+	var startTime time.Time
+	var traceID string
+	if appConfig.EnableTracing {
+		trace.InitBackendTracingIfEnabled(appConfig.TracingMaxItems, appConfig.TracingMaxBodyBytes)
+		startTime = time.Now()
+		summary := trace.TruncateString(text, 200)
+		if summary == "" && caption != "" {
+			summary = trace.TruncateString(caption, 200)
+		}
+		traceID = trace.BeginBackendTrace(trace.BackendTrace{Timestamp: startTime, Type: trace.BackendTraceSoundGeneration, ModelName: modelConfig.Name, Backend: modelConfig.Backend, Summary: summary})
+	}
+	defer trace.CancelBackendTrace(traceID)
 
-	res, err := soundGenModel.SoundGeneration(context.Background(), req)
+	res, err := soundGenModel.SoundGeneration(ctx, req)
 
 	if appConfig.EnableTracing {
 		errStr := ""
@@ -129,6 +149,7 @@ func SoundGeneration(
 		}
 
 		trace.RecordBackendTrace(trace.BackendTrace{
+			ID:        traceID,
 			Timestamp: startTime,
 			Duration:  time.Since(startTime),
 			Type:      trace.BackendTraceSoundGeneration,

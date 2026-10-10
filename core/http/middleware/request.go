@@ -12,9 +12,11 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/core/schema"
+	"github.com/mudler/LocalAI/core/services/failover"
 	"github.com/mudler/LocalAI/core/services/galleryop"
 	"github.com/mudler/LocalAI/core/templates"
-	"github.com/mudler/LocalAI/pkg/functions"
+	"github.com/mudler/LocalAI/pkg/diagnostics"
+	"github.com/mudler/LocalAI/pkg/distributedhdr"
 	"github.com/mudler/LocalAI/pkg/model"
 	"github.com/mudler/LocalAI/pkg/utils"
 	"github.com/mudler/xlog"
@@ -29,6 +31,7 @@ type RequestExtractor struct {
 	modelConfigLoader *config.ModelConfigLoader
 	modelLoader       *model.ModelLoader
 	applicationConfig *config.ApplicationConfig
+	failover          *failover.Manager
 }
 
 func NewRequestExtractor(modelConfigLoader *config.ModelConfigLoader, modelLoader *model.ModelLoader, applicationConfig *config.ApplicationConfig) *RequestExtractor {
@@ -39,12 +42,28 @@ func NewRequestExtractor(modelConfigLoader *config.ModelConfigLoader, modelLoade
 	}
 }
 
+// getRequestContext returns the request context, adding optional diagnostics
+// once and retaining them on the request for subsequent middleware and retries.
+func (re *RequestExtractor) getRequestContext(c echo.Context) context.Context {
+	ctx := c.Request().Context()
+	if re.applicationConfig == nil || re.applicationConfig.DiagnosticsRecorder == nil {
+		return ctx
+	}
+	observed := re.applicationConfig.DiagnosticsRecorder.Request(ctx)
+	if observed != ctx {
+		c.SetRequest(c.Request().WithContext(observed))
+		c.Response().Header().Set(diagnostics.HeaderDiagnosticID, diagnostics.RequestID(observed))
+	}
+	return observed
+}
+
 const CONTEXT_LOCALS_KEY_MODEL_NAME = "MODEL_NAME"
 const CONTEXT_LOCALS_KEY_LOCALAI_REQUEST = "LOCALAI_REQUEST"
 const CONTEXT_LOCALS_KEY_MODEL_CONFIG = "MODEL_CONFIG"
 
 // TODO: Refactor to not return error if unchanged
 func (re *RequestExtractor) setModelNameFromRequest(c echo.Context) {
+	ctx := re.getRequestContext(c)
 	model, ok := c.Get(CONTEXT_LOCALS_KEY_MODEL_NAME).(string)
 	if ok && model != "" {
 		return
@@ -65,7 +84,9 @@ func (re *RequestExtractor) setModelNameFromRequest(c echo.Context) {
 		auth := c.Request().Header.Get("Authorization")
 		bearer := strings.TrimPrefix(auth, "Bearer ")
 		if bearer != "" && bearer != auth {
-			exists, err := galleryop.CheckIfModelExists(re.modelConfigLoader, re.modelLoader, bearer, galleryop.ALWAYS_INCLUDE)
+			end := diagnostics.Begin(ctx, diagnostics.PhaseBearerLookup)
+			exists, err := galleryop.CheckIfModelExistsContext(ctx, re.modelConfigLoader, re.modelLoader, bearer, galleryop.ALWAYS_INCLUDE)
+			end(diagnosticOutcome(ctx, err != nil), 0)
 			if err == nil && exists {
 				model = bearer
 			}
@@ -77,13 +98,16 @@ func (re *RequestExtractor) setModelNameFromRequest(c echo.Context) {
 
 func (re *RequestExtractor) BuildConstantDefaultModelNameMiddleware(defaultModelName string) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c echo.Context) (err error) {
+			finish := re.beginExtraction(c)
+			defer func() { finish(err) }()
 			re.setModelNameFromRequest(c)
 			localModelName, ok := c.Get(CONTEXT_LOCALS_KEY_MODEL_NAME).(string)
 			if !ok || localModelName == "" {
 				c.Set(CONTEXT_LOCALS_KEY_MODEL_NAME, defaultModelName)
 				xlog.Debug("context local model name not found, setting to default", "defaultModelName", defaultModelName)
 			}
+			finish(nil)
 			return next(c)
 		}
 	}
@@ -91,16 +115,23 @@ func (re *RequestExtractor) BuildConstantDefaultModelNameMiddleware(defaultModel
 
 func (re *RequestExtractor) BuildFilteredFirstAvailableDefaultModel(filterFn config.ModelConfigFilterFn) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c echo.Context) (err error) {
+			finish := re.beginExtraction(c)
+			defer func() { finish(err) }()
 			re.setModelNameFromRequest(c)
 			localModelName := c.Get(CONTEXT_LOCALS_KEY_MODEL_NAME).(string)
 			if localModelName != "" { // Don't overwrite existing values
+				finish(nil)
 				return next(c)
 			}
 
-			modelNames, err := galleryop.ListModels(re.modelConfigLoader, re.modelLoader, filterFn, galleryop.SKIP_IF_CONFIGURED)
+			ctx := c.Request().Context()
+			end := diagnostics.Begin(ctx, diagnostics.PhaseDefaultListing)
+			modelNames, err := galleryop.ListModelsContext(ctx, re.modelConfigLoader, re.modelLoader, filterFn, galleryop.SKIP_IF_CONFIGURED)
+			end(diagnosticOutcome(ctx, err != nil), len(modelNames))
 			if err != nil {
 				xlog.Error("non-fatal error calling ListModels during SetDefaultModelNameToFirstAvailable()", "error", err)
+				finish(err)
 				return next(c)
 			}
 
@@ -108,11 +139,13 @@ func (re *RequestExtractor) BuildFilteredFirstAvailableDefaultModel(filterFn con
 				xlog.Warn("SetDefaultModelNameToFirstAvailable used with no matching models installed")
 				// This is non-fatal - making it so was breaking the case of direct installation of raw models
 				// return errors.New("this endpoint requires at least one model to be installed")
+				finish(nil)
 				return next(c)
 			}
 
 			c.Set(CONTEXT_LOCALS_KEY_MODEL_NAME, modelNames[0])
 			xlog.Debug("context local model name not found, setting to the first model", "first model name", modelNames[0])
+			finish(nil)
 			return next(c)
 		}
 	}
@@ -121,14 +154,33 @@ func (re *RequestExtractor) BuildFilteredFirstAvailableDefaultModel(filterFn con
 // TODO: If context and cancel above belong on all methods, move that part of above into here!
 // Otherwise, it's in its own method below for now
 func (re *RequestExtractor) SetModelAndConfig(initializer func() schema.LocalAIRequest) echo.MiddlewareFunc {
+	return re.setModelAndConfig(initializer, nil)
+}
+
+// SetModelAndConfigWithDefault defers legacy model discovery until binding has
+// established that the request has no model. Binding stays inside each retry.
+func (re *RequestExtractor) SetModelAndConfigWithDefault(initializer func() schema.LocalAIRequest, filter config.ModelConfigFilterFn) echo.MiddlewareFunc {
+	fallback := re.BuildFilteredFirstAvailableDefaultModel(filter)(func(echo.Context) error { return nil })
+	return re.setModelAndConfig(initializer, fallback)
+}
+
+func (re *RequestExtractor) setModelAndConfig(initializer func() schema.LocalAIRequest, fallback echo.HandlerFunc) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		retry := re.failoverRetry(func(c echo.Context) (err error) {
+			finish := re.beginExtraction(c)
+			defer func() { finish(err) }()
 			input := initializer()
 			if input == nil {
 				return echo.NewHTTPError(http.StatusBadRequest, "unable to initialize body")
 			}
 			if err := c.Bind(input); err != nil {
 				return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("failed parsing request body: %v", err))
+			}
+
+			if input.ModelName(nil) == "" && fallback != nil {
+				if err := fallback(c); err != nil {
+					return err
+				}
 			}
 
 			// If this request doesn't have an associated model name, fetch it from earlier in the middleware chain
@@ -141,7 +193,16 @@ func (re *RequestExtractor) SetModelAndConfig(initializer func() schema.LocalAIR
 			}
 
 			modelName := input.ModelName(nil)
+			// Ollama-compat /api/tags appends ":latest" to untagged names.
+			// Strip it for lookup so the listed name works on /api/chat,
+			// /v1/chat/completions, and the other model-bearing endpoints.
+			if strings.HasSuffix(modelName, ":latest") {
+				modelName = strings.TrimSuffix(modelName, ":latest")
+			}
+			ctx := c.Request().Context()
+			endConfig := diagnostics.Begin(ctx, diagnostics.PhaseConfigLoadDefaults)
 			cfg, err := re.modelConfigLoader.LoadModelConfigFileByNameDefaultOptions(modelName, re.applicationConfig)
+			endConfig(diagnosticOutcome(ctx, err != nil), 0)
 
 			if err != nil {
 				xlog.Warn("Model Configuration File not found", "model", modelName, "error", err)
@@ -155,7 +216,9 @@ func (re *RequestExtractor) SetModelAndConfig(initializer func() schema.LocalAIR
 			// Skip the check for HuggingFace model IDs (contain "/") since backends
 			// like diffusers may download these on the fly.
 			if modelName != "" && !strings.Contains(modelName, "/") {
-				exists, existsErr := galleryop.CheckIfModelExists(re.modelConfigLoader, re.modelLoader, modelName, galleryop.ALWAYS_INCLUDE)
+				endLookup := diagnostics.Begin(ctx, diagnostics.PhaseBodyLookup)
+				exists, existsErr := galleryop.CheckIfModelExistsContext(ctx, re.modelConfigLoader, re.modelLoader, modelName, galleryop.ALWAYS_INCLUDE)
+				endLookup(diagnosticOutcome(ctx, existsErr != nil || !exists), 0)
 				if existsErr == nil && !exists {
 					return c.JSON(http.StatusNotFound, schema.ErrorResponse{
 						Error: &schema.APIError{
@@ -165,6 +228,47 @@ func (re *RequestExtractor) SetModelAndConfig(initializer func() schema.LocalAIR
 						},
 					})
 				}
+			}
+
+			// Resolve a model alias to its target before the disabled check and
+			// before storing MODEL_CONFIG, so every modality (chat, embeddings,
+			// tts, image, ...) inherits redirection. The response keeps echoing
+			// the alias name (input.ModelName is left unchanged); usage accounting
+			// records requested=alias / served=target.
+			if cfg != nil && cfg.IsAlias() {
+				endAlias := diagnostics.Begin(ctx, diagnostics.PhaseAliasResolution)
+				resolved, _, aliasErr := re.modelConfigLoader.ResolveAlias(cfg)
+				endAlias(diagnosticOutcome(ctx, aliasErr != nil), 0)
+				if aliasErr != nil {
+					return c.JSON(http.StatusBadRequest, schema.ErrorResponse{
+						Error: &schema.APIError{
+							Message: aliasErr.Error(),
+							Code:    http.StatusBadRequest,
+							Type:    "invalid_request_error",
+						},
+					})
+				}
+				c.Set(ContextKeyRequestedModel, modelName)
+				c.Set(ContextKeyServedModel, resolved.Name)
+				cfg = resolved
+			}
+
+			// A failover chain resolves to one of its targets, like an alias.
+			// failoverRetry re-runs this middleware for the next target.
+			if cfg != nil && cfg.IsFailover() {
+				resolved, fErr := re.resolveFailover(c, modelName, cfg)
+				if fErr != nil {
+					return c.JSON(http.StatusServiceUnavailable, schema.ErrorResponse{
+						Error: &schema.APIError{
+							Message: fErr.Error(),
+							Code:    http.StatusServiceUnavailable,
+							Type:    "failover_unavailable",
+						},
+					})
+				}
+				cfg = resolved
+			} else {
+				stopFailoverRecording(c)
 			}
 
 			// Check if the model is disabled
@@ -181,12 +285,21 @@ func (re *RequestExtractor) SetModelAndConfig(initializer func() schema.LocalAIR
 			c.Set(CONTEXT_LOCALS_KEY_LOCALAI_REQUEST, input)
 			c.Set(CONTEXT_LOCALS_KEY_MODEL_CONFIG, cfg)
 
+			finish(nil)
 			return next(c)
+		})
+		return func(c echo.Context) error {
+			// Retries restore the entry request, so attach its observation before
+			// failover captures it. Extraction spans remain per attempt above.
+			re.getRequestContext(c)
+			return retry(c)
 		}
 	}
 }
 
-func (re *RequestExtractor) SetOpenAIRequest(c echo.Context) error {
+func (re *RequestExtractor) SetOpenAIRequest(c echo.Context) (err error) {
+	finish := re.beginExtraction(c)
+	defer func() { finish(err) }()
 	input, ok := c.Get(CONTEXT_LOCALS_KEY_LOCALAI_REQUEST).(*schema.OpenAIRequest)
 	if !ok || input.Model == "" {
 		return echo.ErrBadRequest
@@ -206,7 +319,7 @@ func (re *RequestExtractor) SetOpenAIRequest(c echo.Context) error {
 
 	// Use the request context directly - Echo properly supports context cancellation!
 	// No need for workarounds like handleConnectionCancellation
-	reqCtx := c.Request().Context()
+	reqCtx := re.getRequestContext(c)
 	c1, cancel := context.WithCancel(re.applicationConfig.Context)
 
 	// Cancel when request context is cancelled (client disconnects)
@@ -221,11 +334,18 @@ func (re *RequestExtractor) SetOpenAIRequest(c echo.Context) error {
 
 	// Add the correlation ID to the new context
 	ctxWithCorrelationID := context.WithValue(c1, CorrelationIDKey, correlationID)
+	ctxWithCorrelationID = distributedhdr.Inherit(ctxWithCorrelationID, reqCtx)
+	ctxWithCorrelationID = diagnostics.Inherit(ctxWithCorrelationID, reqCtx)
 
 	input.Context = ctxWithCorrelationID
 	input.Cancel = cancel
 
-	err := mergeOpenAIRequestAndModelConfig(cfg, input)
+	// Router inputs must be classified before any candidate-specific media fetch.
+	if cfg.HasRouter() {
+		return nil
+	}
+
+	err = mergeOpenAIRequestAndModelConfig(cfg, input)
 	if err != nil {
 		return err
 	}
@@ -239,6 +359,28 @@ func (re *RequestExtractor) SetOpenAIRequest(c echo.Context) error {
 	c.Set(CONTEXT_LOCALS_KEY_MODEL_CONFIG, cfg)
 
 	return nil
+}
+
+// extractToolChoiceFunctionName parses a tool_choice map and returns the
+// specific function name. Accepts both the OpenAI-spec nested shape
+// ({type:function, function:{name:...}}) and the legacy/Anthropic-compat
+// flat shape ({type:function, name:...}); the nested form wins when both
+// are present. Returns "" for malformed input or when the shape names a
+// mode rather than a specific tool.
+func extractToolChoiceFunctionName(m map[string]any) string {
+	tcType, ok := m["type"].(string)
+	if !ok || tcType != "function" {
+		return ""
+	}
+	if fn, ok := m["function"].(map[string]any); ok {
+		if n, ok := fn["name"].(string); ok && n != "" {
+			return n
+		}
+	}
+	if n, ok := m["name"].(string); ok {
+		return n
+	}
+	return ""
 }
 
 func mergeOpenAIRequestAndModelConfig(config *config.ModelConfig, input *schema.OpenAIRequest) error {
@@ -287,6 +429,32 @@ func mergeOpenAIRequestAndModelConfig(config *config.ModelConfig, input *schema.
 		config.Temperature = input.Temperature
 	}
 
+	// Resolve the effective reasoning effort (request overrides the model config
+	// default), store it so gRPCPredictOpts forwards it to the backend as the
+	// reasoning_effort chat_template_kwarg (what gpt-oss / LFM2.5 read), and map
+	// it onto the enable_thinking toggle. "none" disables thinking (the #10072
+	// use case); a level enables it unless the config already disabled reasoning
+	// (an operator's explicit disable wins over a request asking to think).
+	config.ApplyReasoningEffort(input.ReasoningEffort)
+
+	// Forward the client's request metadata so chat-template kwargs set per-request
+	// (enable_thinking, reasoning_effort, preserve_thinking, ...) reach the backend
+	// and override the model's reasoning-config defaults. See gRPCPredictOpts.
+	if len(input.Metadata) > 0 {
+		config.RequestMetadata = input.Metadata
+	}
+
+	// Collapse the modern max_completion_tokens alias into the
+	// legacy Maxtokens field so downstream code reads exactly one.
+	// MaxCompletionTokens wins on conflict — it's the canonical
+	// name per OpenAI's deprecation guidance, and a client that
+	// took the trouble to send it intends that value. Clearing
+	// the sibling prevents both names from being emitted if input
+	// is re-marshaled (cloud-proxy passthrough).
+	if input.MaxCompletionTokens != nil {
+		input.Maxtokens = input.MaxCompletionTokens
+		input.MaxCompletionTokens = nil
+	}
 	if input.Maxtokens != nil {
 		config.Maxtokens = input.Maxtokens
 	}
@@ -320,17 +488,55 @@ func mergeOpenAIRequestAndModelConfig(config *config.ModelConfig, input *schema.
 	}
 
 	if input.ToolsChoice != nil {
-		var toolChoice functions.Tool
-
+		// OpenAI tool_choice has three valid shapes plus one tolerated
+		// non-spec form seen in the wild:
+		//
+		//   1. string mode:    "auto" | "none" | "required"
+		//   2. specific tool:  {"type":"function", "function":{"name":"..."}}  (current spec)
+		//   3. legacy:         {"type":"function", "name":"..."}                (older / Anthropic-compat)
+		//   4. double-encoded: "{\"type\":\"function\", ...}"                   (some clients serialize the object)
+		//
+		// The pre-#9559 code unmarshalled the string case through
+		// json.Unmarshal([]byte(content), &functions.Tool{}), which:
+		//   - failed for plain string modes (so "required" / "none" were
+		//     silently ignored and tools stayed enabled regardless), but
+		//   - happened to handle shape 4 by accident.
+		// It also could not parse shape 3 because functions.Tool has no
+		// flat top-level Name field.
+		//
+		// Mirror the parsing pattern from MergeOpenResponsesConfig (#9509),
+		// route results through the existing input.FunctionCall string/map
+		// dispatch downstream (see the switch on input.FunctionCall in this
+		// same function), and preserve the shape-4 fallback so non-spec
+		// clients don't silently break. Tracked in #9508; sibling fix in #9526.
 		switch content := input.ToolsChoice.(type) {
 		case string:
-			_ = json.Unmarshal([]byte(content), &toolChoice)
+			// "auto" is the default and needs no override. "none" and "required"
+			// both reach SetFunctionCallString via the input.FunctionCall string
+			// branch below; ShouldUseFunctions() then returns false for "none"
+			// (tools disabled) and true for "required" (mode engaged).
+			//
+			// If the string looks like a JSON object, try shape 4 first: parse
+			// it as a tool_choice map and use the resulting name. Falling back
+			// to mode-string handling when the parse yields no usable name keeps
+			// genuinely-malformed input from accidentally engaging a mode.
+			if content == "" || content == "auto" {
+				break
+			}
+			if strings.HasPrefix(strings.TrimSpace(content), "{") {
+				var nested map[string]any
+				if err := json.Unmarshal([]byte(content), &nested); err == nil {
+					if name := extractToolChoiceFunctionName(nested); name != "" {
+						input.FunctionCall = map[string]any{"name": name}
+						break
+					}
+				}
+			}
+			input.FunctionCall = content
 		case map[string]any:
-			dat, _ := json.Marshal(content)
-			_ = json.Unmarshal(dat, &toolChoice)
-		}
-		input.FunctionCall = map[string]any{
-			"name": toolChoice.Function.Name,
+			if name := extractToolChoiceFunctionName(content); name != "" {
+				input.FunctionCall = map[string]any{"name": name}
+			}
 		}
 	}
 
@@ -344,10 +550,17 @@ func mergeOpenAIRequestAndModelConfig(config *config.ModelConfig, input *schema.
 		switch content := m.Content.(type) {
 		case string:
 			input.Messages[i].StringContent = content
-		case []any:
-			dat, _ := json.Marshal(content)
-			c := []schema.Content{}
-			json.Unmarshal(dat, &c)
+		case []any, []schema.Content:
+			c, typed := content.([]schema.Content)
+			if !typed {
+				dat, err := json.Marshal(content)
+				if err != nil {
+					return fmt.Errorf("message content: %w", err)
+				}
+				if err := json.Unmarshal(dat, &c); err != nil {
+					return fmt.Errorf("message content: %w", err)
+				}
+			}
 
 			textContent := ""
 			// we will template this at the end
@@ -398,14 +611,23 @@ func mergeOpenAIRequestAndModelConfig(config *config.ModelConfig, input *schema.
 				}
 			}
 
-			input.Messages[i].StringContent, _ = templates.TemplateMultiModal(config.TemplateConfig.Multimodal, templates.MultiModalOptions{
-				TotalImages:     imgIndex,
-				TotalVideos:     vidIndex,
-				TotalAudios:     audioIndex,
-				ImagesInMessage: nrOfImgsInMessage,
-				VideosInMessage: nrOfVideosInMessage,
-				AudiosInMessage: nrOfAudiosInMessage,
-			}, textContent)
+			// When the backend handles templating itself (UseTokenizerTemplate),
+			// it also injects media markers server-side (see
+			// oaicompat_chat_params_parse in llama.cpp). Emitting our own markers
+			// here would double-mark them and downstream consumers ignore
+			// StringContent in that path anyway, so just pass through plain text.
+			if config.TemplateConfig.UseTokenizerTemplate {
+				input.Messages[i].StringContent = textContent
+			} else {
+				input.Messages[i].StringContent, _ = templates.TemplateMultiModal(config.TemplateConfig.Multimodal, templates.MultiModalOptions{
+					TotalImages:     imgIndex,
+					TotalVideos:     vidIndex,
+					TotalAudios:     audioIndex,
+					ImagesInMessage: nrOfImgsInMessage,
+					VideosInMessage: nrOfVideosInMessage,
+					AudiosInMessage: nrOfAudiosInMessage,
+				}, textContent)
+			}
 		}
 	}
 
@@ -474,6 +696,25 @@ func mergeOpenAIRequestAndModelConfig(config *config.ModelConfig, input *schema.
 		}
 	}
 
+	// Per-request Go-side pooling override for /v1/embeddings (LocalAI
+	// extension) — copy-if-set onto the per-request config like the Input
+	// handling above; the embeddings endpoint validates the merged values.
+	if input.Pooling != "" {
+		config.Pooling = input.Pooling
+		// The config's default half-life belongs to its own decayed_mean
+		// default. A request that overrides the scheme without sending its
+		// own half-life must not inherit it, or the merged pair (e.g.
+		// "mean" + 256) fails validation through no fault of the client.
+		// (literal because the `config` parameter shadows the package;
+		// this is config.PoolingDecayedMean)
+		if input.PoolingHalfLifeTokens == 0 && input.Pooling != "decayed_mean" {
+			config.PoolingHalfLifeTokens = 0
+		}
+	}
+	if input.PoolingHalfLifeTokens != 0 {
+		config.PoolingHalfLifeTokens = input.PoolingHalfLifeTokens
+	}
+
 	// Can be either a string or an object
 	switch fnc := input.FunctionCall.(type) {
 	case string:
@@ -511,13 +752,22 @@ func mergeOpenAIRequestAndModelConfig(config *config.ModelConfig, input *schema.
 		}
 	}
 
-	if valid, _ := config.Validate(); valid {
-		return nil
+	if valid, err := config.Validate(); !valid {
+		// The base config validated at load time, so a post-merge failure
+		// can only come from request-supplied fields: surface it as a 400
+		// with the underlying cause rather than an opaque 500.
+		xlog.Warn("post-merge validation failed",
+			"model", config.Name, "err", err,
+			"inputPooling", input.Pooling, "cfgPooling", config.Pooling,
+			"cfgHalfLife", config.PoolingHalfLifeTokens, "options", config.Options)
+		return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("unable to validate configuration after merging: %v", err))
 	}
-	return fmt.Errorf("unable to validate configuration after merging")
+	return nil
 }
 
-func (re *RequestExtractor) SetOpenResponsesRequest(c echo.Context) error {
+func (re *RequestExtractor) SetOpenResponsesRequest(c echo.Context) (err error) {
+	finish := re.beginExtraction(c)
+	defer func() { finish(err) }()
 	input, ok := c.Get(CONTEXT_LOCALS_KEY_LOCALAI_REQUEST).(*schema.OpenResponsesRequest)
 	if !ok || input.Model == "" {
 		return echo.ErrBadRequest
@@ -538,7 +788,7 @@ func (re *RequestExtractor) SetOpenResponsesRequest(c echo.Context) error {
 	c.Response().Header().Set("x-request-id", correlationID)
 
 	// Use the request context directly - Echo properly supports context cancellation!
-	reqCtx := c.Request().Context()
+	reqCtx := re.getRequestContext(c)
 	c1, cancel := context.WithCancel(re.applicationConfig.Context)
 
 	// Cancel when request context is cancelled (client disconnects)
@@ -553,11 +803,13 @@ func (re *RequestExtractor) SetOpenResponsesRequest(c echo.Context) error {
 
 	// Add the correlation ID to the new context
 	ctxWithCorrelationID := context.WithValue(c1, CorrelationIDKey, correlationID)
+	ctxWithCorrelationID = distributedhdr.Inherit(ctxWithCorrelationID, reqCtx)
+	ctxWithCorrelationID = diagnostics.Inherit(ctxWithCorrelationID, reqCtx)
 
 	input.Context = ctxWithCorrelationID
 	input.Cancel = cancel
 
-	err := MergeOpenResponsesConfig(cfg, input)
+	err = MergeOpenResponsesConfig(cfg, input)
 	if err != nil {
 		return err
 	}
@@ -605,17 +857,41 @@ func MergeOpenResponsesConfig(config *config.ModelConfig, input *schema.OpenResp
 			}
 			// "auto" is default - let model decide
 		case map[string]any:
-			// Specific tool: {type:"function", name:"..."}
+			// Specific tool. OpenAI spec nests the function name under "function":
+			//   {"type":"function", "function":{"name":"..."}}
+			// Legacy/Anthropic-compat form puts it at the top level:
+			//   {"type":"function", "name":"..."}
+			// The old code only handled the legacy shape AND used the wrong
+			// setter (SetFunctionCallString writes the mode field; the
+			// specific-function name lives in a separate field read by
+			// ShouldCallSpecificFunction / FunctionToCall). Net effect: a
+			// correctly-formed OpenAI tool_choice never engaged grammar-based
+			// forcing, the model got the tools but no selection hint, and
+			// streamed raw JSON as delta.content instead of delta.tool_calls.
 			if tcType, ok := tc["type"].(string); ok && tcType == "function" {
-				if name, ok := tc["name"].(string); ok {
-					config.SetFunctionCallString(name)
+				var name string
+				if fn, ok := tc["function"].(map[string]any); ok {
+					if n, ok := fn["name"].(string); ok {
+						name = n
+					}
+				}
+				if name == "" {
+					if n, ok := tc["name"].(string); ok {
+						name = n
+					}
+				}
+				if name != "" {
+					config.SetFunctionCallNameString(name)
 				}
 			}
 		}
 	}
 
-	if valid, _ := config.Validate(); valid {
-		return nil
+	if valid, err := config.Validate(); !valid {
+		// The base config validated at load time, so a post-merge failure
+		// can only come from request-supplied fields: surface it as a 400
+		// with the underlying cause rather than an opaque 500.
+		return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("unable to validate configuration after merging: %v", err))
 	}
-	return fmt.Errorf("unable to validate configuration after merging")
+	return nil
 }

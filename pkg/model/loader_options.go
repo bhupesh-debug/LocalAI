@@ -7,10 +7,12 @@ import (
 )
 
 type Options struct {
-	backendString string
-	model         string
-	modelID       string
-	context       context.Context
+	backendString  string
+	model          string
+	modelFile      string
+	modelID        string
+	configRevision string
+	context        context.Context
 
 	gRPCOptions *pb.ModelOptions
 
@@ -19,6 +21,21 @@ type Options struct {
 	grpcAttempts      int
 	grpcAttemptsDelay int
 	parallelRequests  bool
+
+	// modelSizeBytes is the estimated total weight size in bytes, pre-computed
+	// by the caller using the vram estimation scaffolding.  When non-zero it is
+	// registered with the watchdog so size-aware eviction can rank models.
+	modelSizeBytes int64
+
+	// envVars contains model-specific environment variables to pass to the backend process
+	envVars map[string]string
+}
+
+// WithConfigRevision binds a load to the semantic revision of the resolved
+// model configuration. The value is copied into Options and therefore remains
+// stable even if the configuration loader refreshes while a load is running.
+func WithConfigRevision(revision string) Option {
+	return func(o *Options) { o.configRevision = revision }
 }
 
 type Option func(*Options)
@@ -68,6 +85,12 @@ func WithModel(modelFile string) Option {
 	}
 }
 
+func WithModelFile(modelFile string) Option {
+	return func(o *Options) {
+		o.modelFile = modelFile
+	}
+}
+
 func WithLoadGRPCLoadModelOpts(opts *pb.ModelOptions) Option {
 	return func(o *Options) {
 		o.gRPCOptions = opts
@@ -83,6 +106,18 @@ func WithContext(ctx context.Context) Option {
 func WithModelID(id string) Option {
 	return func(o *Options) {
 		o.modelID = id
+	}
+}
+
+func WithModelSizeBytes(bytes int64) Option {
+	return func(o *Options) {
+		o.modelSizeBytes = bytes
+	}
+}
+
+func WithEnvVars(envVars map[string]string) Option {
+	return func(o *Options) {
+		o.envVars = envVars
 	}
 }
 

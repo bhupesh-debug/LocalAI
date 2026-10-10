@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -16,15 +15,18 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
+
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/core/http/middleware"
 	"github.com/mudler/LocalAI/core/schema"
 
 	"github.com/mudler/LocalAI/core/backend"
 
+	"github.com/mudler/xlog"
+
+	"github.com/mudler/LocalAI/pkg/httpclient"
 	model "github.com/mudler/LocalAI/pkg/model"
 	"github.com/mudler/LocalAI/pkg/utils"
-	"github.com/mudler/xlog"
 )
 
 func downloadFile(url string) (string, error) {
@@ -33,7 +35,7 @@ func downloadFile(url string) (string, error) {
 	}
 
 	// Get the data
-	resp, err := http.Get(url)
+	resp, err := httpclient.New(httpclient.WithFollowRedirects()).Get(url)
 	if err != nil {
 		return "", err
 	}
@@ -158,9 +160,12 @@ func ImageEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfi
 			for range n {
 				prompts := strings.Split(i, "|")
 				positive_prompt := prompts[0]
-				negative_prompt := ""
+				negative_prompt := strings.TrimSpace(input.NegativePrompt)
 				if len(prompts) > 1 {
-					negative_prompt = prompts[1]
+					if negative_prompt != "" {
+						negative_prompt += ", "
+					}
+					negative_prompt += strings.TrimSpace(prompts[1])
 				}
 
 				step := config.Step
@@ -198,7 +203,7 @@ func ImageEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfi
 					inputSrc = inputImages[0]
 				}
 
-				fn, err := backend.ImageGeneration(height, width, step, *config.Seed, positive_prompt, negative_prompt, inputSrc, output, ml, *config, appConfig, refImages)
+				fn, err := backend.ImageGeneration(c.Request().Context(), height, width, step, *config.Seed, positive_prompt, negative_prompt, inputSrc, output, ml, *config, appConfig, refImages)
 				if err != nil {
 					return err
 				}
@@ -233,7 +238,7 @@ func ImageEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfi
 			ID:      id,
 			Created: created,
 			Data:    result,
-			Usage: schema.OpenAIUsage{
+			Usage: &schema.OpenAIUsage{
 				PromptTokens:     0,
 				CompletionTokens: 0,
 				TotalTokens:      0,

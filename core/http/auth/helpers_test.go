@@ -5,10 +5,14 @@ package auth_test
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 
 	"github.com/labstack/echo/v4"
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/core/http/auth"
+	"github.com/mudler/LocalAI/core/http/routes"
+	"github.com/mudler/LocalAI/core/services/nodes"
+	"github.com/mudler/LocalAI/pkg/natsauth"
 	. "github.com/onsi/gomega"
 	"gorm.io/gorm"
 )
@@ -59,12 +63,23 @@ func ok(c echo.Context) error {
 func newAuthTestApp(db *gorm.DB, appConfig *config.ApplicationConfig) *echo.Echo {
 	e := echo.New()
 	e.Use(auth.Middleware(db, appConfig))
+	if db != nil {
+		e.Use(auth.RequireRouteFeature(db))
+	}
 
 	// API routes (require auth)
 	e.GET("/v1/models", ok)
 	e.POST("/v1/chat/completions", ok)
+	e.POST("/v1/moderations", ok)
+	e.POST("/moderations", ok)
+	e.POST("/v1/mcp/chat/completions", ok)
+	e.POST("/mcp/v1/chat/completions", ok)
+	e.POST("/mcp/chat/completions", ok)
 	e.GET("/api/settings", ok)
 	e.POST("/api/settings", ok)
+
+	// Failover chain reads and the event stream: standard auth, no admin gate.
+	e.GET("/api/failover", ok)
 
 	// Auth routes (exempt)
 	e.GET("/api/auth/status", ok)
@@ -77,14 +92,48 @@ func newAuthTestApp(db *gorm.DB, appConfig *config.ApplicationConfig) *echo.Echo
 	return e
 }
 
+// newCatchAllAuthTestApp makes the route itself irrelevant so middleware tests
+// can prove that newly registered routes are private by default.
+func newCatchAllAuthTestApp(db *gorm.DB, appConfig *config.ApplicationConfig) *echo.Echo {
+	e := echo.New()
+	e.Use(auth.Middleware(db, appConfig))
+	e.Any("/", ok)
+	e.Any("/*", ok)
+	return e
+}
+
+// newNodeSelfServiceTestApp uses the real node route registration so requests
+// that global auth delegates must still pass nodeTokenAuth before the handler.
+func newNodeSelfServiceTestApp(db *gorm.DB, appConfig *config.ApplicationConfig, registrationToken string) *echo.Echo {
+	registry, err := nodes.NewNodeRegistry(db)
+	Expect(err).ToNot(HaveOccurred())
+
+	e := echo.New()
+	e.Use(auth.Middleware(db, appConfig))
+	routes.RegisterNodeSelfServiceRoutes(
+		e,
+		registry,
+		registrationToken,
+		false,
+		nil,
+		"",
+		natsauth.Config{},
+	)
+	return e
+}
+
 // newAdminTestApp creates an Echo app with admin-protected routes.
 func newAdminTestApp(db *gorm.DB, appConfig *config.ApplicationConfig) *echo.Echo {
 	e := echo.New()
 	e.Use(auth.Middleware(db, appConfig))
+	if db != nil {
+		e.Use(auth.RequireRouteFeature(db))
+	}
 
 	// Regular routes
 	e.GET("/v1/models", ok)
 	e.POST("/v1/chat/completions", ok)
+	e.POST("/v1/moderations", ok)
 
 	// Admin-only routes
 	adminMw := auth.RequireAdmin()
@@ -92,6 +141,10 @@ func newAdminTestApp(db *gorm.DB, appConfig *config.ApplicationConfig) *echo.Ech
 	e.POST("/models/apply", ok, adminMw)
 	e.POST("/backends/apply", ok, adminMw)
 	e.GET("/api/agents", ok, adminMw)
+
+	// Failover chain pin/unpin (admin only)
+	e.POST("/api/failover/:chain/pin", ok, adminMw)
+	e.DELETE("/api/failover/:chain/pin", ok, adminMw)
 
 	// Trace/log endpoints (admin only)
 	e.GET("/api/traces", ok, adminMw)
@@ -120,7 +173,15 @@ func newAdminTestApp(db *gorm.DB, appConfig *config.ApplicationConfig) *echo.Ech
 
 // doRequest performs an HTTP request against the given Echo app and returns the recorder.
 func doRequest(e *echo.Echo, method, path string, opts ...func(*http.Request)) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(method, path, nil)
+	return doRequestWithBody(e, method, path, "", opts...)
+}
+
+func doRequestWithBody(
+	e *echo.Echo,
+	method, path, body string,
+	opts ...func(*http.Request),
+) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	for _, opt := range opts {
 		opt(req)

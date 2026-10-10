@@ -1,4 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
+import { useTranslation } from 'react-i18next'
+import Icon from './Icon'
 
 let toastId = 0
 
@@ -30,10 +32,10 @@ export function useToast() {
 }
 
 const iconMap = {
-  success: 'fa-circle-check',
-  error: 'fa-circle-exclamation',
-  warning: 'fa-triangle-exclamation',
-  info: 'fa-circle-info',
+  success: 'check-circle',
+  error: 'alert-circle',
+  warning: 'warning',
+  info: 'info',
 }
 
 const colorMap = {
@@ -54,6 +56,7 @@ export function ToastContainer({ toasts, removeToast }) {
 }
 
 function ToastItem({ toast, onRemove }) {
+  const { t } = useTranslation('common')
   const ref = useRef(null)
 
   useEffect(() => {
@@ -67,13 +70,17 @@ function ToastItem({ toast, onRemove }) {
 
   return (
     <div ref={ref} className={`toast ${colorMap[toast.type] || 'toast-info'} ${toast.exiting ? 'toast-exit' : ''}`}>
-      <i className={`fas ${iconMap[toast.type] || 'fa-circle-info'}`} />
+      <Icon name={iconMap[toast.type] || 'info'} />
       <span>{toast.message}</span>
       {toast.link && (
         <a href={toast.link.href} className="toast-link">{toast.link.text}</a>
       )}
-      <button onClick={() => onRemove(toast.id)} className="toast-close" aria-label="Dismiss notification">
-        <i className="fas fa-xmark" />
+      <button
+        onClick={() => onRemove(toast.id)}
+        className="toast-close"
+        aria-label={t('actions.close')}
+      >
+        <Icon name="close" />
       </button>
     </div>
   )

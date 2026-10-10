@@ -98,7 +98,13 @@ type PredictionOptions struct {
 	MinP        *float64 `json:"min_p,omitempty" yaml:"min_p,omitempty"`
 	Temperature *float64 `json:"temperature,omitempty" yaml:"temperature,omitempty"`
 	Maxtokens   *int     `json:"max_tokens,omitempty" yaml:"max_tokens,omitempty"`
-	Echo        bool     `json:"echo,omitempty" yaml:"echo,omitempty"`
+	// MaxCompletionTokens is the modern alias for max_tokens
+	// (OpenAI deprecated max_tokens; gpt-5 / o-series reject it).
+	// Accepted on the wire so up-to-date clients can use the new
+	// name; the request middleware collapses it into Maxtokens so
+	// internal code reads exactly one field.
+	MaxCompletionTokens *int `json:"max_completion_tokens,omitempty" yaml:"-"`
+	Echo                bool `json:"echo,omitempty" yaml:"echo,omitempty"`
 
 	// Custom parameters - not present in the OpenAI API
 	Batch         int     `json:"batch,omitempty" yaml:"batch,omitempty"`
@@ -136,4 +142,17 @@ type PredictionOptions struct {
 
 	// Embedding encoding format: "float" (default) or "base64" (OpenAI Node.js SDK default)
 	EncodingFormat string `json:"encoding_format,omitempty" yaml:"encoding_format,omitempty"`
+
+	// Pooling is a LocalAI extension for /v1/embeddings: how the backend's
+	// per-token vectors are reduced to a single embedding. "" or "backend"
+	// leaves pooling to the inference backend (the pre-existing behavior);
+	// "mean", "last" and "decayed_mean" pool Go-side from raw per-token
+	// vectors (the backend must run with the "pooling:none" option, which
+	// model configs get automatically when this is set).
+	Pooling string `json:"pooling,omitempty" yaml:"pooling,omitempty"`
+	// PoolingHalfLifeTokens is a LocalAI extension for /v1/embeddings: the
+	// half-life (in tokens) of the "decayed_mean" pooling scheme — a token's
+	// weight halves every this-many positions counting back from the end of
+	// the conversation. Defaults to 256 when unset.
+	PoolingHalfLifeTokens int `json:"pooling_half_life_tokens,omitempty" yaml:"pooling_half_life_tokens,omitempty"`
 }

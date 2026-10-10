@@ -1,7 +1,7 @@
 +++
 disableToc = false
 title = "Authentication & Authorization"
-weight = 26
+weight = 85
 url = '/features/authentication'
 +++
 
@@ -26,9 +26,58 @@ Clients provide the key via any of these methods:
 - `xi-api-key: <key>` header
 - `token` cookie
 
-Legacy API keys grant **full admin access** — there is no role separation. For multi-user deployments with role-based access, use the user authentication system instead.
+Legacy API keys grant **full admin access** - there is no role separation. For multi-user deployments with role-based access, use the user authentication system instead.
 
 API keys can also be managed at runtime through the [Runtime Settings]({{%relref "features/runtime-settings" %}}) interface.
+
+## Protected and anonymous HTTP routes
+
+When you configure database authentication or legacy API keys, LocalAI makes the HTTP surface **private by default**. An anonymous request succeeds only for an approved method and path or an explicit deployment override. If you configure neither authentication mode, the authentication middleware does not restrict requests.
+
+### Public discovery APIs
+
+The following discovery requests are available anonymously:
+
+- `GET /.well-known/localai.json`
+- `GET /api/instructions`
+- `GET /api/instructions/{name}`
+- Swagger `GET` requests at `/swagger` and under `/swagger/`
+
+These discovery APIs describe the server's API surface. The endpoints that they advertise still require credentials unless this section lists them as public or bootstrap routes.
+
+### Anonymous bootstrap routes
+
+LocalAI also permits the requests needed for health checks, credential acquisition, and the login UI. These routes do not make the rest of the API public.
+
+- Health checks: `GET /healthz` and `GET /readyz`.
+- Authentication status and token login: `GET /api/auth/status` and `POST /api/auth/token-login`.
+- Local registration and login: `POST /api/auth/register` and `POST /api/auth/login`.
+- GitHub OAuth: `GET /api/auth/github/login` and `GET /api/auth/github/callback`.
+- OIDC: `GET /api/auth/oidc/login` and `GET /api/auth/oidc/callback`.
+- CORS preflight requests: `OPTIONS` on every path. A cross-origin preflight cannot carry credentials by HTTP spec, so these requests are never gated on auth; the CORS middleware answers them, which grants no API access.
+- SPA shell routes: `GET /`, `HEAD /`, and `GET` requests at `/app`, `/browse`, `/login`, `/invite/*`, and `/explorer`. Subpaths under `/app/` and `/browse/` are also available through `GET`.
+- SPA assets: `GET /favicon.svg` and `GET` requests under `/assets/`, `/locales/`, and `/static/`.
+- Branding reads: `GET /api/branding` and `GET` requests under `/branding/asset/`. Branding mutations still require admin credentials.
+
+### Routes that require credentials
+
+Without an explicit deployment override, every other route requires credentials. This includes `GET /version`, all model and backend API routes, and all inference routes. MCP and moderation aliases are also private:
+
+- `POST /v1/mcp/chat/completions`, `POST /mcp/v1/chat/completions`, and `POST /mcp/chat/completions`
+- `POST /v1/moderations` and `POST /moderations`
+
+Generated output URLs also require credentials. This applies to every URL under `/generated-audio/`, `/generated-images/`, `/generated-videos/`, and `/generated-3d/`.
+
+### Explicit deployment overrides
+
+Embedded deployments can add path prefixes to `ApplicationConfig.PathWithoutAuth`. Each prefix bypasses global authentication for every HTTP method below that prefix. Route-specific authorization still applies when the route registers it. Keep these overrides as narrow as possible; the default list is empty.
+
+Two legacy flags provide a separate `GET`-only compatibility override when legacy API keys are configured:
+
+- `LOCALAI_DISABLE_API_KEY_REQUIREMENT_FOR_HTTP_GET=true` enables the override.
+- `LOCALAI_HTTP_GET_EXEMPTED_ENDPOINTS` sets the regular expressions for the exempt `GET` routes.
+
+The endpoint expressions have no effect unless you enable `LOCALAI_DISABLE_API_KEY_REQUIREMENT_FOR_HTTP_GET`. Review custom expressions carefully because they can expose protected reads.
 
 ## User Authentication System
 
@@ -39,7 +88,7 @@ The user authentication system provides:
 - **Session-based authentication** with secure cookies
 - **OAuth login** (GitHub) and **OIDC single sign-on** (Keycloak, Google, Okta, Authentik, etc.)
 - **Per-user API keys** for programmatic access
-- **Admin route gating** — management endpoints are restricted to admins
+- **Admin route gating** - management endpoints are restricted to admins
 - **Per-user usage tracking** with token consumption metrics
 
 ### Enabling Authentication
@@ -74,7 +123,7 @@ localai run
 | Environment Variable | Default | Description |
 |---|---|---|
 | `LOCALAI_AUTH` | `false` | Enable user authentication and authorization |
-| `LOCALAI_AUTH_DATABASE_URL` | `{DataPath}/database.db` | Database URL — `postgres://...` for PostgreSQL, or a file path for SQLite |
+| `LOCALAI_AUTH_DATABASE_URL` | `{DataPath}/database.db` | Database URL - `postgres://...` for PostgreSQL, or a file path for SQLite |
 | `GITHUB_CLIENT_ID` | | GitHub OAuth App Client ID (auto-enables auth when set) |
 | `GITHUB_CLIENT_SECRET` | | GitHub OAuth App Client Secret |
 | `LOCALAI_OIDC_ISSUER` | | OIDC issuer URL for auto-discovery (e.g. `https://accounts.google.com`) |
@@ -84,6 +133,8 @@ localai run
 | `LOCALAI_ADMIN_EMAIL` | | Email address to auto-promote to admin role on login |
 | `LOCALAI_REGISTRATION_MODE` | `approval` | Registration mode: `open`, `approval`, or `invite` |
 | `LOCALAI_DISABLE_LOCAL_AUTH` | `false` | Disable local email/password registration and login (for OAuth/OIDC-only deployments) |
+
+> **Note: network-backed storage.** File-based SQLite relies on POSIX file locking, which is unreliable over network filesystems (SMB/CIFS/NFS, e.g. Azure Files / Azure Container Apps shared volumes). On such storage the auth DB can fail to migrate with `database is locked`. Use PostgreSQL (`LOCALAI_AUTH_DATABASE_URL=postgres://...`) when the data directory lives on shared or network storage, or place `database.db` on a local volume.
 
 ### Disabling Local Authentication
 
@@ -109,7 +160,7 @@ When disabled:
 There are two roles:
 
 - **Admin**: Full access to all endpoints, including model management, backend configuration, system settings, traces, agents, and user management.
-- **User**: Access to inference endpoints only — chat completions, embeddings, image/video/audio generation, TTS, MCP chat, and their own usage statistics.
+- **User**: Access to inference endpoints only - chat completions, embeddings, image/video/audio generation, TTS, MCP chat, and their own usage statistics.
 
 The **first user** to sign in is automatically assigned the admin role. Additional users can be promoted to admin via the admin user management API or by setting `LOCALAI_ADMIN_EMAIL` to their email address.
 
@@ -123,7 +174,7 @@ The **first user** to sign in is automatically assigned the admin role. Addition
 
 ### Invite Links
 
-Admins can generate single-use, time-limited invite links from the **Users → Invites** tab in the web UI, or via the API:
+Admins can generate single-use, time-limited invite links from **Settings → Users and keys → Invites** in the web UI (choose 1, 7 or 30 days), or via the API:
 
 ```bash
 # Create an invite link (default: expires in 7 days)
@@ -139,12 +190,9 @@ curl http://localhost:8080/api/auth/admin/invites \
 # Revoke an unused invite
 curl -X DELETE http://localhost:8080/api/auth/admin/invites/<invite-id> \
   -H "Authorization: Bearer <admin-key>"
-
-# Check if an invite code is valid (public, no auth required)
-curl http://localhost:8080/api/auth/invite/<code>/check
 ```
 
-Share the invite URL (`/invite/<code>`) with the user. When they open it, the registration form is pre-filled with the invite code. Invite codes are single-use — once consumed, they cannot be reused. Expired or used invites are rejected.
+Share the invite URL (`/invite/<code>`) with the user. The link is shown once, when you create it: the invite list keeps only the first characters of the code, so a link you did not copy can only be revoked and made again. When the user opens it, the registration form is pre-filled with the invite code. LocalAI validates the code only when the user submits registration. Invite codes are single-use - once consumed, they cannot be reused. Expired or used invites are rejected.
 
 For GitHub OAuth, the invite code is passed as a query parameter to the login URL (`/api/auth/github/login?invite_code=<code>`) and stored in a cookie during the OAuth flow.
 
@@ -155,16 +203,17 @@ When authentication is enabled, the following endpoints require admin role:
 **Model & Backend Management:**
 - `GET /api/models`, `POST /api/models/install/*`, `POST /api/models/delete/*`
 - `GET /api/backends`, `POST /api/backends/install/*`, `POST /api/backends/delete/*`
-- `GET /api/operations`, `POST /api/operations/*/cancel`
+- `GET /api/operations`, `POST /api/operations/*/cancel`, `POST /api/operations/*/pause`, `POST /api/operations/*/dismiss`
+- `GET /api/operations/history`, `DELETE /api/operations/history`
 - `GET /models/available`, `GET /models/galleries`, `GET /models/jobs/*`
 - `GET /backends`, `GET /backends/available`, `GET /backends/galleries`
 
 **System & Monitoring:**
-- `GET /api/traces`, `POST /api/traces/clear`
-- `GET /api/backend-traces`, `POST /api/backend-traces/clear`
+- `GET /api/traces`, `GET /api/traces/summary`, `GET /api/traces/{id}`, `POST /api/traces/clear`
+- `GET /api/backend-traces`, `GET /api/backend-traces/{id}`, `POST /api/backend-traces/clear`
 - `GET /api/backend-logs/*`, `POST /api/backend-logs/*/clear`
 - `GET /api/resources`, `GET /api/settings`, `POST /api/settings`
-- `GET /system`, `GET /backend/monitor`, `POST /backend/shutdown`
+- `GET /system`, `GET /backend/monitor`, `POST /backend/shutdown`, `POST /backend/load`
 
 **P2P:**
 - `GET /api/p2p/*`
@@ -176,10 +225,10 @@ When authentication is enabled, the following endpoints require admin role:
 **User-Accessible Endpoints (all authenticated users):**
 - `POST /v1/chat/completions`, `POST /v1/embeddings`, `POST /v1/completions`
 - `POST /v1/images/generations`, `POST /v1/audio/*`, `POST /tts`, `POST /vad`, `POST /video`
-- `GET /v1/models`, `POST /v1/tokenize`, `POST /v1/detection`
+- `GET /v1/models`, `POST /v1/tokenize`, `POST /v1/detokenize`, `POST /v1/detection`
 - `POST /v1/mcp/chat/completions`, `POST /v1/messages`, `POST /v1/responses`
 - `POST /stores/*`, `GET /api/cors-proxy`
-- `GET /version`, `GET /api/features`, `GET /swagger/*`, `GET /metrics`
+- `GET /version`, `GET /api/features`, `GET /metrics`
 - `GET /api/auth/usage` (own usage data)
 
 ### Web UI Access Control
@@ -187,9 +236,22 @@ When authentication is enabled, the following endpoints require admin role:
 When auth is enabled, the React UI sidebar dynamically shows/hides sections based on the user's role:
 
 - **All users see**: Home, Chat, Images, Video, TTS, Sound, Talk, Usage, API docs link
-- **Admins also see**: Install Models, Agents section (Agents, Skills, Memory, MCP CI Jobs), System section (Backends, Traces, Swarm, System, Settings)
+- **Admins also see**: Models, the Build console (Agents, Skills, Memory, Jobs, Training, Recognition), and the Operate console (Backends, Activity, Nodes, Traffic, Settings, and Users and keys)
 
-Admin-only pages are also protected at the router level — navigating directly to an admin URL redirects non-admin users to the home page.
+Admin-only pages are also protected at the router level - navigating directly to an admin URL redirects non-admin users to the home page.
+
+### Sign-in, invite and account pages
+
+The sign-in screen offers only what `GET /api/auth/status` reports:
+
+- A GitHub or SSO button appears only when that provider is configured. With `LOCALAI_DISABLE_LOCAL_AUTH=true` there is no email form.
+- Email and password sign-in asks for one field at a time: the email, then the password. Both are sent in one call, so the server still never says whether an email exists.
+- Registration asks for the email, then the name, password and (when the registration mode allows one) an invite code. A sign-up that waits for approval returns to the sign-in screen with a notice that an admin must approve it.
+- On a server with no users yet, the first screen is "Create the admin account".
+- On a server protected only by legacy API keys, the screen asks for the key and nothing else.
+- An invite link (`/invite/<code>`) opens registration with the code filled in and read-only.
+
+The **Account** page has four tabs: Profile (name and picture address), Security (change a local password; for a GitHub or SSO account it says the password is managed by the provider), API keys, and Usage (your requests, tokens by model, and the limits an admin set on you, for the last 30 days). **Settings → Users and keys** has the people, the invites and your own API keys.
 
 ### GitHub OAuth Setup
 
@@ -226,7 +288,7 @@ LOCALAI_OIDC_ISSUER=https://authentik.example.com/application/o/localai/
 LOCALAI_OIDC_ISSUER=https://your-org.okta.com
 ```
 
-For OIDC, invite codes work the same way as GitHub OAuth — the invite code is passed as a query parameter to the login URL (`/api/auth/oidc/login?invite_code=<code>`) and stored in a cookie during the OAuth flow.
+For OIDC, invite codes work the same way as GitHub OAuth - the invite code is passed as a query parameter to the login URL (`/api/auth/oidc/login?invite_code=<code>`) and stored in a cookie during the OAuth flow.
 
 ### User API Keys
 
@@ -242,29 +304,62 @@ curl -X POST http://localhost:8080/api/auth/api-keys \
 
 User API keys inherit the creating user's role. Admin keys grant admin access; user keys grant user-level access.
 
+You can pause a key without deleting it, and resume it later. Only the key's owner can pause it. A paused key is rejected like an invalid key until it is resumed. Pause it until you resume it, or until a time in the future, after which it works again by itself:
+
+```bash
+# Pause until resumed
+curl -X PATCH http://localhost:8080/api/auth/api-keys/<key-id> \
+  -H "Cookie: session=<session-id>" \
+  -H "Content-Type: application/json" \
+  -d '{"disabled": true, "paused_until": null}'
+
+# Pause until a given time (RFC 3339, must be in the future)
+curl -X PATCH http://localhost:8080/api/auth/api-keys/<key-id> \
+  -H "Cookie: session=<session-id>" \
+  -H "Content-Type: application/json" \
+  -d '{"disabled": false, "paused_until": "2030-01-01T00:00:00Z"}'
+
+# Resume
+curl -X PATCH http://localhost:8080/api/auth/api-keys/<key-id> \
+  -H "Cookie: session=<session-id>" \
+  -H "Content-Type: application/json" \
+  -d '{"disabled": false, "paused_until": null}'
+```
+
+The key list returns `disabled` and, when set, `pausedUntil` for each key. The Account page in the web UI has a Pause and Resume button for each key.
+
+A key can be created with a lifetime: send `expiresIn` (`30d`, `90d` or `1y`) or `expiresAt` (RFC 3339). Without either, the server applies `LOCALAI_DEFAULT_API_KEY_EXPIRY` when it is set, and the key does not expire otherwise. The full key is returned once, in the response to the create call; the list returns only its prefix, the creation time, `lastUsed` and `expiresAt`.
+
+In the web UI, the **API keys** tab of the Account page and of **Settings → Users and keys** shows the signed-in person's own keys: a new key is shown once with a Copy button, and the lifetime list sends `expiresIn`. Revoking a key waits ten seconds in the browser before it sends the `DELETE`, and Undo inside that time sends nothing; leaving the page sends a revoke that is still waiting. LocalAI lists a person's keys only to that person, so an admin cannot list or revoke other users' keys, in the UI or through the API. The Usage page can group requests by API key for everyone.
+
 ### Auth API Endpoints
 
 | Method | Endpoint | Description | Auth Required |
 |---|---|---|---|
 | `GET` | `/api/auth/status` | Auth state, current user, providers | No |
-| `POST` | `/api/auth/logout` | End session | Yes |
-| `GET` | `/api/auth/me` | Current user info | Yes |
-| `POST` | `/api/auth/api-keys` | Create API key | Yes |
-| `GET` | `/api/auth/api-keys` | List user's API keys | Yes |
-| `DELETE` | `/api/auth/api-keys/:id` | Revoke API key | Yes |
-| `GET` | `/api/auth/usage` | User's own usage stats | Yes |
-| `GET` | `/api/auth/admin/users` | List all users | Admin |
-| `PUT` | `/api/auth/admin/users/:id/role` | Change user role | Admin |
-| `DELETE` | `/api/auth/admin/users/:id` | Delete user | Admin |
-| `GET` | `/api/auth/admin/usage` | All users' usage stats | Admin |
-| `POST` | `/api/auth/admin/invites` | Create invite link | Admin |
-| `GET` | `/api/auth/admin/invites` | List all invites | Admin |
-| `DELETE` | `/api/auth/admin/invites/:id` | Revoke unused invite | Admin |
-| `GET` | `/api/auth/invite/:code/check` | Check if invite code is valid | No |
+| `POST` | `/api/auth/token-login` | Exchange a user or legacy API key for a browser session | No |
+| `POST` | `/api/auth/register` | Register with email and password | No |
+| `POST` | `/api/auth/login` | Log in with email and password | No |
 | `GET` | `/api/auth/github/login` | Start GitHub OAuth | No |
 | `GET` | `/api/auth/github/callback` | GitHub OAuth callback (internal) | No |
 | `GET` | `/api/auth/oidc/login` | Start OIDC login | No |
 | `GET` | `/api/auth/oidc/callback` | OIDC callback (internal) | No |
+| `POST` | `/api/auth/logout` | End session | Yes |
+| `GET` | `/api/auth/me` | Current user info | Yes |
+| `POST` | `/api/auth/api-keys` | Create API key | Yes |
+| `GET` | `/api/auth/api-keys` | List user's API keys | Yes |
+| `PATCH` | `/api/auth/api-keys/:id` | Pause or resume API key | Yes |
+| `DELETE` | `/api/auth/api-keys/:id` | Revoke API key | Yes |
+| `GET` | `/api/auth/usage` | User's own usage stats | Yes |
+| `GET` | `/api/auth/usage/sources` | User's own per-API-key / per-source breakdown | Yes |
+| `GET` | `/api/auth/admin/users` | List all users | Admin |
+| `PUT` | `/api/auth/admin/users/:id/role` | Change user role | Admin |
+| `DELETE` | `/api/auth/admin/users/:id` | Delete user | Admin |
+| `GET` | `/api/auth/admin/usage` | All users' usage stats | Admin |
+| `GET` | `/api/auth/admin/usage/sources` | All users' per-API-key / per-source breakdown | Admin |
+| `POST` | `/api/auth/admin/invites` | Create invite link | Admin |
+| `GET` | `/api/auth/admin/invites` | List all invites | Admin |
+| `DELETE` | `/api/auth/admin/invites/:id` | Revoke unused invite | Admin |
 
 ## Usage Tracking
 
@@ -294,10 +389,10 @@ curl "http://localhost:8080/api/auth/admin/usage?period=month&user_id=<user-id>"
 ```
 
 **Period values:**
-- `day` — last 24 hours, bucketed by hour
-- `week` — last 7 days, bucketed by day
-- `month` — last 30 days, bucketed by day (default)
-- `all` — all time, bucketed by month
+- `day` - last 24 hours, bucketed by hour
+- `week` - last 7 days, bucketed by day
+- `month` - last 30 days, bucketed by day (default)
+- `all` - all time, bucketed by month
 
 **Response format:**
 
@@ -327,17 +422,86 @@ curl "http://localhost:8080/api/auth/admin/usage?period=month&user_id=<user-id>"
 ### Usage Dashboard
 
 The web UI Usage page provides:
-- **Period selector** — switch between day, week, month, and all-time views
-- **Summary cards** — total requests, prompt tokens, completion tokens, total tokens
-- **By Model table** — per-model breakdown with visual usage bars
-- **By User table** (admin only) — per-user breakdown across all models
+- **Period selector** - switch between day, week, month, and all-time views
+- **Summary cards** - total requests, prompt tokens, completion tokens, total tokens
+- **By Model table** - per-model breakdown with visual usage bars
+- **By User table** (admin only) - per-user breakdown across all models
+- **Sources tab** - per-API-key and per-source breakdown (described below)
+
+### Per-API-key Breakdown
+
+The **Sources** tab on the Usage page surfaces a third dimension of the same data: traffic broken down by API key and by request source. Three source classes are tracked:
+
+- **API key** - request authenticated with a named user API key (`Authorization: Bearer lai-...`, `x-api-key`, or `token` cookie). Each key shows up with its label (snapshotted at write time, so revoked keys still display the original name).
+- **Web UI** - request authenticated with a browser session cookie.
+- **Legacy** - request authenticated with an env-configured `LOCALAI_API_KEY`. Visible to admins only.
+
+The Sources tab is visible to every authenticated user. Non-admins see only their own keys plus their own Web UI traffic (legacy is filtered server-side). Admins see every key from every user.
+
+The tab is laid out as:
+
+- A **source mix ribbon** showing the percentage split across the three classes.
+- A **top-N + Other stacked time chart** (top 7 sources by total tokens; the rest roll up).
+- A **searchable, sortable table** of every key plus the Web UI and Legacy pseudo-rows. Click a row to filter the chart to that source.
+
+#### Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/auth/usage/sources` | Self | Caller's per-source breakdown. Excludes legacy. |
+| `GET` | `/api/auth/admin/usage/sources` | Admin | All users' per-source breakdown. Accepts `user_id` and `api_key_id` filters. Includes legacy. |
+
+Both endpoints accept the same `period` parameter (`day`, `week`, `month`, `all`) as `/api/auth/usage`.
+
+```bash
+# Your own per-source usage for the last week
+curl "http://localhost:8080/api/auth/usage/sources?period=week" \
+  -H "Authorization: Bearer <key>"
+
+# Admin: filter to a single API key across all users
+curl "http://localhost:8080/api/auth/admin/usage/sources?period=month&api_key_id=<key-id>" \
+  -H "Authorization: Bearer <admin-key>"
+```
+
+**Response shape:**
+
+```json
+{
+  "buckets": [
+    { "bucket": "2026-05-19", "source": "apikey",
+      "api_key_id": "uuid", "api_key_name": "ci-runner",
+      "total_tokens": 20000, "request_count": 142, "...": "..." },
+    { "bucket": "2026-05-19", "source": "web",
+      "total_tokens": 300, "request_count": 11, "...": "..." }
+  ],
+  "totals": {
+    "by_source": {
+      "apikey": { "tokens": 1234567, "requests": 8420 },
+      "web":    { "tokens":   92000, "requests":   211 }
+    },
+    "by_key": [
+      { "api_key_id": "uuid", "api_key_name": "ci-runner",
+        "tokens": 2100000, "requests": 8420,
+        "last_used": "2026-05-20T12:34:56Z" }
+    ],
+    "grand_total": { "tokens": 1334777, "requests": 8645 }
+  },
+  "truncated": false
+}
+```
+
+The `by_key` list is server-sorted by tokens descending and capped at 200 entries. When more keys would qualify, the response sets `"truncated": true` so the UI can show a notice.
+
+#### Migration of pre-feature data
+
+Usage rows recorded before this feature have no `source` column. On startup, `InitDB` backfills them as `legacy` when the synthetic `legacy-api-key` user_id was used, and `web` for everything else. The migration is idempotent; existing aggregations remain correct after the upgrade.
 
 ## Combining Auth Modes
 
 Legacy API keys and user authentication can be used simultaneously. When both are configured:
 
 1. User sessions and user API keys are checked first
-2. Legacy API keys are checked as fallback — they grant **admin-level access**
+2. Legacy API keys are checked as fallback - they grant **admin-level access**
 3. This allows a gradual migration from shared API keys to per-user accounts
 
 ## Build Requirements
@@ -352,4 +516,4 @@ GO_TAGS=auth make build
 go build -tags auth ./...
 ```
 
-The default Dockerfile includes `GO_TAGS="auth"`, so all Docker images ship with auth support. When building from source without the `auth` tag, setting `LOCALAI_AUTH=true` has no effect — the system operates without authentication.
+The default Dockerfile includes `GO_TAGS="auth"`, so all Docker images ship with auth support. When building from source without the `auth` tag, setting `LOCALAI_AUTH=true` has no effect - the system operates without authentication.

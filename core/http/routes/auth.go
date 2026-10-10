@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/mail"
@@ -190,6 +191,13 @@ func RegisterAuthRoutes(e *echo.Echo, app *application.Application) {
 	authRL := newRateLimiter(1*time.Minute, 5)
 	authRateLimitMw := rateLimitMiddleware(authRL)
 
+	// Separate, more permissive limiter for OAuth/OIDC callbacks. Corporate
+	// SSO often funnels many real users through one outbound IP, so the 5/min
+	// password-style cap is too tight here; 60/min still bounds a flood that
+	// would otherwise pin token-exchange traffic to the IdP.
+	oauthRL := newRateLimiter(1*time.Minute, 60)
+	oauthRateLimitMw := rateLimitMiddleware(oauthRL)
+
 	// Start background goroutine to periodically prune stale IP entries
 	go func() {
 		ticker := time.NewTicker(10 * time.Minute)
@@ -200,6 +208,7 @@ func RegisterAuthRoutes(e *echo.Echo, app *application.Application) {
 				return
 			case <-ticker.C:
 				authRL.cleanup()
+				oauthRL.cleanup()
 			}
 		}
 	}()
@@ -260,7 +269,7 @@ func RegisterAuthRoutes(e *echo.Echo, app *application.Application) {
 	// Set up OAuth manager when any OAuth/OIDC provider is configured
 	if appConfig.Auth.GitHubClientID != "" || appConfig.Auth.OIDCClientID != "" {
 		oauthMgr, err := auth.NewOAuthManager(
-			appConfig.Auth.BaseURL,
+			appConfig.ExternalBaseURL,
 			auth.OAuthParams{
 				GitHubClientID:     appConfig.Auth.GitHubClientID,
 				GitHubClientSecret: appConfig.Auth.GitHubClientSecret,
@@ -274,13 +283,13 @@ func RegisterAuthRoutes(e *echo.Echo, app *application.Application) {
 				e.GET("/api/auth/github/login", oauthMgr.LoginHandler(auth.ProviderGitHub))
 				e.GET("/api/auth/github/callback", oauthMgr.CallbackHandler(
 					auth.ProviderGitHub, db, appConfig.Auth.AdminEmail, appConfig.Auth.RegistrationMode, appConfig.Auth.APIKeyHMACSecret,
-				))
+				), oauthRateLimitMw)
 			}
 			if appConfig.Auth.OIDCClientID != "" {
 				e.GET("/api/auth/oidc/login", oauthMgr.LoginHandler(auth.ProviderOIDC))
 				e.GET("/api/auth/oidc/callback", oauthMgr.CallbackHandler(
 					auth.ProviderOIDC, db, appConfig.Auth.AdminEmail, appConfig.Auth.RegistrationMode, appConfig.Auth.APIKeyHMACSecret,
-				))
+				), oauthRateLimitMw)
 			}
 		}
 	}
@@ -292,10 +301,11 @@ func RegisterAuthRoutes(e *echo.Echo, app *application.Application) {
 		}
 
 		var body struct {
-			Email      string `json:"email"`
-			Password   string `json:"password"`
-			Name       string `json:"name"`
-			InviteCode string `json:"inviteCode"`
+			Email                   string `json:"email"`
+			Password                string `json:"password"`
+			Name                    string `json:"name"`
+			InviteCode              string `json:"inviteCode"`
+			AcknowledgeWeakPassword bool   `json:"acknowledge_weak_password"`
 		}
 		if err := c.Bind(&body); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request"})
@@ -311,8 +321,8 @@ func RegisterAuthRoutes(e *echo.Echo, app *application.Application) {
 		if _, err := mail.ParseAddress(body.Email); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid email address"})
 		}
-		if len(body.Password) < 8 {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
+		if err := auth.ValidatePasswordStrength(body.Password, auth.PasswordPolicy{AllowWeak: body.AcknowledgeWeakPassword}); err != nil {
+			return c.JSON(http.StatusBadRequest, auth.PasswordError(err))
 		}
 
 		hash, err := auth.HashPassword(body.Password)
@@ -579,8 +589,9 @@ func RegisterAuthRoutes(e *echo.Echo, app *application.Application) {
 		}
 
 		var body struct {
-			CurrentPassword string `json:"current_password"`
-			NewPassword     string `json:"new_password"`
+			CurrentPassword         string `json:"current_password"`
+			NewPassword             string `json:"new_password"`
+			AcknowledgeWeakPassword bool   `json:"acknowledge_weak_password"`
 		}
 		if err := c.Bind(&body); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request"})
@@ -590,8 +601,8 @@ func RegisterAuthRoutes(e *echo.Echo, app *application.Application) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "current and new passwords are required"})
 		}
 
-		if len(body.NewPassword) < 8 {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "new password must be at least 8 characters"})
+		if err := auth.ValidatePasswordStrength(body.NewPassword, auth.PasswordPolicy{AllowWeak: body.AcknowledgeWeakPassword}); err != nil {
+			return c.JSON(http.StatusBadRequest, auth.PasswordError(err))
 		}
 
 		// Verify current password
@@ -722,9 +733,13 @@ func RegisterAuthRoutes(e *echo.Echo, app *application.Application) {
 				"role":      k.Role,
 				"createdAt": k.CreatedAt,
 				"lastUsed":  k.LastUsed,
+				"disabled":  k.Disabled,
 			}
 			if k.ExpiresAt != nil {
 				entry["expiresAt"] = k.ExpiresAt
+			}
+			if k.PausedUntil != nil {
+				entry["pausedUntil"] = k.PausedUntil
 			}
 			result = append(result, entry)
 		}
@@ -745,6 +760,40 @@ func RegisterAuthRoutes(e *echo.Echo, app *application.Application) {
 		}
 
 		return c.JSON(http.StatusOK, map[string]string{"message": "API key revoked"})
+	})
+
+	// PATCH /api/auth/api-keys/:id - pause or resume an API key
+	e.PATCH("/api/auth/api-keys/:id", func(c echo.Context) error {
+		user := auth.GetUser(c)
+		if user == nil {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "not authenticated"})
+		}
+
+		var body struct {
+			Disabled    bool    `json:"disabled"`
+			PausedUntil *string `json:"paused_until"`
+		}
+		if err := c.Bind(&body); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		}
+
+		var pausedUntil *time.Time
+		if body.PausedUntil != nil && *body.PausedUntil != "" {
+			t, err := time.Parse(time.RFC3339, *body.PausedUntil)
+			if err != nil {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid paused_until format, use RFC3339"})
+			}
+			pausedUntil = &t
+		}
+
+		if err := auth.SetAPIKeyPause(db, c.Param("id"), user.ID, body.Disabled, pausedUntil); err != nil {
+			if errors.Is(err, auth.ErrPauseInPast) {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			}
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "API key not found"})
+		}
+
+		return c.JSON(http.StatusOK, map[string]string{"message": "API key updated"})
 	})
 
 	// Usage endpoints
@@ -776,6 +825,30 @@ func RegisterAuthRoutes(e *echo.Echo, app *application.Application) {
 		return c.JSON(http.StatusOK, map[string]any{
 			"usage":  buckets,
 			"totals": totals,
+		})
+	})
+
+	// GET /api/auth/usage/sources - caller's per-source breakdown (no legacy)
+	e.GET("/api/auth/usage/sources", func(c echo.Context) error {
+		user := auth.GetUser(c)
+		if user == nil {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "not authenticated"})
+		}
+
+		period := c.QueryParam("period")
+		if period == "" {
+			period = "month"
+		}
+
+		buckets, totals, err := auth.GetUserUsageBySource(db, user.ID, period)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get usage"})
+		}
+
+		return c.JSON(http.StatusOK, map[string]any{
+			"buckets":   buckets,
+			"totals":    totals,
+			"truncated": false,
 		})
 	})
 
@@ -900,14 +973,15 @@ func RegisterAuthRoutes(e *echo.Echo, app *application.Application) {
 		}
 
 		var body struct {
-			Password string `json:"password"`
+			Password                string `json:"password"`
+			AcknowledgeWeakPassword bool   `json:"acknowledge_weak_password"`
 		}
 		if err := c.Bind(&body); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request"})
 		}
 
-		if len(body.Password) < 8 {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
+		if err := auth.ValidatePasswordStrength(body.Password, auth.PasswordPolicy{AllowWeak: body.AcknowledgeWeakPassword}); err != nil {
+			return c.JSON(http.StatusBadRequest, auth.PasswordError(err))
 		}
 
 		hash, err := auth.HashPassword(body.Password)
@@ -933,13 +1007,11 @@ func RegisterAuthRoutes(e *echo.Echo, app *application.Application) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "cannot delete yourself"})
 		}
 
-		// Cascade: delete sessions and API keys
-		db.Where("user_id = ?", targetID).Delete(&auth.Session{})
-		db.Where("user_id = ?", targetID).Delete(&auth.UserAPIKey{})
-
-		result := db.Where("id = ?", targetID).Delete(&auth.User{})
-		if result.RowsAffected == 0 {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+		if err := auth.DeleteUserCascade(db, targetID); err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+			}
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete user: " + err.Error()})
 		}
 
 		return c.JSON(http.StatusOK, map[string]string{"message": "user deleted"})
@@ -1092,6 +1164,27 @@ func RegisterAuthRoutes(e *echo.Echo, app *application.Application) {
 		return c.JSON(http.StatusOK, map[string]any{
 			"usage":  buckets,
 			"totals": totals,
+		})
+	}, adminMw)
+
+	// GET /api/auth/admin/usage/sources - all users' per-source breakdown (admin only)
+	e.GET("/api/auth/admin/usage/sources", func(c echo.Context) error {
+		period := c.QueryParam("period")
+		if period == "" {
+			period = "month"
+		}
+		userID := c.QueryParam("user_id")
+		apiKeyID := c.QueryParam("api_key_id")
+
+		buckets, totals, truncated, err := auth.GetAllUsageBySource(db, period, userID, apiKeyID)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get usage"})
+		}
+
+		return c.JSON(http.StatusOK, map[string]any{
+			"buckets":   buckets,
+			"totals":    totals,
+			"truncated": truncated,
 		})
 	}, adminMw)
 

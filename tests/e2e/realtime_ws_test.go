@@ -1,15 +1,21 @@
 package e2e_test
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
+	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
+	laudio "github.com/mudler/LocalAI/pkg/audio"
+	"github.com/mudler/LocalAI/pkg/sound"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -72,6 +78,66 @@ func generatePCMBase64(freq float64, sampleRate, durationMs int) string {
 	return base64.StdEncoding.EncodeToString(pcm)
 }
 
+// padPCMBase64 prepends and appends the given milliseconds of silence to a
+// base64-encoded 16-bit LE PCM buffer. Used to give VAD a clear lead-in /
+// lead-out so Silero can reliably detect utterance boundaries.
+func padPCMBase64(pcmB64 string, sampleRate, leadingMs, trailingMs int) string {
+	raw, err := base64.StdEncoding.DecodeString(pcmB64)
+	ExpectWithOffset(1, err).ToNot(HaveOccurred())
+	lead := make([]byte, sampleRate*leadingMs/1000*2)
+	trail := make([]byte, sampleRate*trailingMs/1000*2)
+	padded := make([]byte, 0, len(lead)+len(raw)+len(trail))
+	padded = append(padded, lead...)
+	padded = append(padded, raw...)
+	padded = append(padded, trail...)
+	return base64.StdEncoding.EncodeToString(padded)
+}
+
+// ttsPCMBase64 drives the /v1/audio/speech endpoint to render `text` through
+// the given TTS model, strips the returned WAV header, resamples to the
+// requested sample rate if needed, and returns base64-encoded 16-bit LE PCM.
+// Fails the test on any transport / format error — there's no useful fallback.
+func ttsPCMBase64(model, text string, targetSampleRate int) string {
+	body, err := json.Marshal(map[string]any{
+		"model":  model,
+		"input":  text,
+		"format": "wav",
+	})
+	ExpectWithOffset(1, err).ToNot(HaveOccurred())
+
+	req, err := http.NewRequest(http.MethodPost, apiURL+"/audio/speech", bytes.NewReader(body))
+	ExpectWithOffset(1, err).ToNot(HaveOccurred())
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	ExpectWithOffset(1, err).ToNot(HaveOccurred())
+	defer resp.Body.Close()
+
+	wav, err := io.ReadAll(resp.Body)
+	ExpectWithOffset(1, err).ToNot(HaveOccurred())
+	ExpectWithOffset(1, resp.StatusCode).To(Equal(http.StatusOK),
+		"tts returned %d: %s", resp.StatusCode, string(wav))
+
+	pcm, srcRate := laudio.ParseWAV(wav)
+	ExpectWithOffset(1, srcRate).To(BeNumerically(">", 0),
+		"tts response is not a valid WAV (body=%d bytes)", len(wav))
+
+	if srcRate != targetSampleRate {
+		samples := sound.BytesToInt16sLE(pcm)
+		pcm = sound.Int16toBytesLE(sound.ResampleInt16(samples, srcRate, targetSampleRate))
+	}
+	return base64.StdEncoding.EncodeToString(pcm)
+}
+
+// isRealTTS returns true when REALTIME_TTS names a real backend-backed model,
+// as opposed to the default mock-tts. Used to gate test behavior that only
+// makes sense with a real TTS — e.g. driving the session with a real
+// utterance and asserting the transcription contains recognisable words.
+func isRealTTS() bool {
+	m := os.Getenv("REALTIME_TTS")
+	return m != "" && m != "mock-tts"
+}
+
 // pipelineModel returns the model name to use for realtime tests.
 func pipelineModel() string {
 	if m := os.Getenv("REALTIME_TEST_MODEL"); m != "" {
@@ -126,6 +192,169 @@ var _ = Describe("Realtime WebSocket API", Label("Realtime"), func() {
 		})
 	})
 
+	Context("Failover chain stage", Label("failover"), func() {
+		// userTurn adds a user text item, asks for a response and reads until
+		// response.done. It returns the user item id, the response.done event
+		// and the localai.model.failover events seen on the way.
+		userTurn := func(conn *websocket.Conn, text string) (string, map[string]any, []map[string]any) {
+			sendClientEvent(conn, map[string]any{
+				"type": "conversation.item.create",
+				"item": map[string]any{
+					"type":    "message",
+					"role":    "user",
+					"content": []map[string]any{{"type": "input_text", "text": text}},
+				},
+			})
+			added := drainUntil(conn, "conversation.item.added", 10*time.Second)
+			item, _ := added["item"].(map[string]any)
+			userID, _ := item["id"].(string)
+			ExpectWithOffset(1, userID).ToNot(BeEmpty())
+
+			sendClientEvent(conn, map[string]any{"type": "response.create"})
+			var failovers []map[string]any
+			deadline := time.Now().Add(60 * time.Second)
+			for time.Now().Before(deadline) {
+				evt := readServerEvent(conn, time.Until(deadline))
+				switch evt["type"] {
+				case "localai.model.failover":
+					failovers = append(failovers, evt)
+				case "error":
+					Fail(fmt.Sprintf("unexpected error event: %v", evt))
+				case "response.done":
+					return userID, evt, failovers
+				}
+			}
+			Fail("timed out waiting for response.done")
+			return "", nil, nil
+		}
+
+		retrieveItem := func(conn *websocket.Conn, id string) map[string]any {
+			sendClientEvent(conn, map[string]any{"type": "conversation.item.retrieve", "item_id": id})
+			evt := drainUntil(conn, "conversation.item.retrieved", 10*time.Second)
+			item, _ := evt["item"].(map[string]any)
+			return item
+		}
+
+		It("switches the LLM mid-session and keeps the conversation", func() {
+			conn := connectWS("rt-failover")
+			defer func() { _ = conn.Close() }()
+
+			Expect(readServerEvent(conn, 30*time.Second)["type"]).To(Equal("session.created"))
+			initial := drainUntil(conn, "localai.model.failover", 10*time.Second)
+			Expect(initial).To(HaveKeyWithValue("stage", "llm"))
+			Expect(initial).To(HaveKeyWithValue("chain", "chain-rt"))
+			Expect(initial).To(HaveKeyWithValue("reason", "initial"))
+			Expect(initial).To(HaveKeyWithValue("to", "fail-rt"))
+
+			sendClientEvent(conn, disableVADEvent())
+			drainUntil(conn, "session.updated", 10*time.Second)
+
+			firstID, done, failovers := userTurn(conn, "Hello, how are you?")
+			Expect(failovers).To(ContainElement(And(
+				HaveKeyWithValue("stage", "llm"),
+				HaveKeyWithValue("from", "fail-rt"),
+				HaveKeyWithValue("to", "mock-llm"),
+				HaveKeyWithValue("reason", "trip"),
+			)))
+			resp, _ := done["response"].(map[string]any)
+			Expect(resp).To(HaveKeyWithValue("status", "completed"))
+			output, _ := resp["output"].([]any)
+			Expect(output).ToNot(BeEmpty())
+			firstReply, _ := output[0].(map[string]any)
+			firstReplyID, _ := firstReply["id"].(string)
+			Expect(firstReplyID).ToNot(BeEmpty())
+
+			_, done, _ = userTurn(conn, "And now?")
+			resp, _ = done["response"].(map[string]any)
+			Expect(resp).To(HaveKeyWithValue("status", "completed"))
+
+			// The switch kept the session: the first turn is still in it.
+			Expect(retrieveItem(conn, firstID)).To(HaveKeyWithValue("id", firstID))
+			Expect(retrieveItem(conn, firstReplyID)).To(HaveKeyWithValue("id", firstReplyID))
+		})
+
+		It("serves the LLM stage from a remote LocalAI and switches to the local target when it fails", func() {
+			if localAIProxyPath == "" {
+				Skip("localai-proxy backend binary not built (make build-localai-proxy-backend)")
+			}
+			// The remote target reaches this server through a gate the spec
+			// can take down, as if the remote LocalAI lost its backends.
+			gate := newUpstreamGate(anthropicBaseURL)
+			DeferCleanup(gate.Close)
+			registerModelConfigs(
+				localAIProxyModel("lp-rt-llm", gate.URL(), "mock-llm", "chat"),
+				map[string]any{
+					"name": "chain-rt-lp",
+					"failover": map[string]any{
+						"targets": []map[string]any{{"model": "lp-rt-llm"}, {"model": "mock-llm"}},
+					},
+				},
+				map[string]any{
+					"name": "rt-lp",
+					"pipeline": map[string]any{
+						"vad":            "mock-vad",
+						"transcription":  "mock-stt",
+						"llm":            "chain-rt-lp",
+						"tts":            "mock-tts",
+						"disable_warmup": true,
+					},
+				},
+			)
+			Eventually(func() string { return chainActive("chain-rt-lp") }, 10*time.Second, 200*time.Millisecond).
+				Should(Equal("lp-rt-llm"))
+
+			conn := connectWS("rt-lp")
+			defer func() { _ = conn.Close() }()
+
+			Expect(readServerEvent(conn, 30*time.Second)["type"]).To(Equal("session.created"))
+			initial := drainUntil(conn, "localai.model.failover", 10*time.Second)
+			Expect(initial).To(HaveKeyWithValue("stage", "llm"))
+			Expect(initial).To(HaveKeyWithValue("chain", "chain-rt-lp"))
+			Expect(initial).To(HaveKeyWithValue("reason", "initial"))
+			Expect(initial).To(HaveKeyWithValue("to", "lp-rt-llm"))
+
+			sendClientEvent(conn, disableVADEvent())
+			drainUntil(conn, "session.updated", 10*time.Second)
+
+			// The first turn goes through the proxy to the remote mock-llm.
+			_, done, failovers := userTurn(conn, "Hello, how are you?")
+			Expect(failovers).To(BeEmpty())
+			resp, _ := done["response"].(map[string]any)
+			Expect(resp).To(HaveKeyWithValue("status", "completed"))
+			Expect(chainActive("chain-rt-lp")).To(Equal("lp-rt-llm"))
+
+			gate.SetDown(true)
+			_, done, failovers = userTurn(conn, "And now?")
+			Expect(failovers).To(ContainElement(And(
+				HaveKeyWithValue("stage", "llm"),
+				HaveKeyWithValue("from", "lp-rt-llm"),
+				HaveKeyWithValue("to", "mock-llm"),
+				HaveKeyWithValue("reason", "trip"),
+			)))
+			resp, _ = done["response"].(map[string]any)
+			Expect(resp).To(HaveKeyWithValue("status", "completed"))
+			Expect(chainActive("chain-rt-lp")).To(Equal("mock-llm"))
+		})
+
+		It("starts the session on the next target when the active one fails to warm up", func() {
+			conn := connectWS("rt-failover-warm")
+			defer func() { _ = conn.Close() }()
+
+			Expect(readServerEvent(conn, 30*time.Second)["type"]).To(Equal("session.created"))
+			initial := drainUntil(conn, "localai.model.failover", 10*time.Second)
+			Expect(initial).To(HaveKeyWithValue("chain", "chain-rt-warm"))
+			Expect(initial).To(HaveKeyWithValue("reason", "initial"))
+			Expect(initial).To(HaveKeyWithValue("to", "mock-llm"))
+
+			sendClientEvent(conn, disableVADEvent())
+			drainUntil(conn, "session.updated", 10*time.Second)
+
+			_, done, _ := userTurn(conn, "Hello?")
+			resp, _ := done["response"].(map[string]any)
+			Expect(resp).To(HaveKeyWithValue("status", "completed"))
+		})
+	})
+
 	Context("Manual audio commit", func() {
 		It("should produce a response with audio when audio is committed", func() {
 			conn := connectWS(pipelineModel())
@@ -139,8 +368,19 @@ var _ = Describe("Realtime WebSocket API", Label("Realtime"), func() {
 			sendClientEvent(conn, disableVADEvent())
 			drainUntil(conn, "session.updated", 10*time.Second)
 
-			// Append 1 second of 440Hz sine wave at 24kHz (the default remote sample rate)
-			audio := generatePCMBase64(440, 24000, 1000)
+			// Real TTS: synthesise an utterance the ASR should be able to
+			// recognise, and pad with silence so Silero-VAD has a clear
+			// lead-in/out. Fallback: 1s of 440Hz sine wave — the mock
+			// transcriber returns a static string anyway, so this only
+			// needs to exercise the pipeline plumbing.
+			const inputText = "The quick brown fox jumps over the lazy dog."
+			var audio string
+			if isRealTTS() {
+				audio = ttsPCMBase64(os.Getenv("REALTIME_TTS"), inputText, 24000)
+				audio = padPCMBase64(audio, 24000, 500, 500)
+			} else {
+				audio = generatePCMBase64(440, 24000, 1000)
+			}
 			sendClientEvent(conn, map[string]any{
 				"type":  "input_audio_buffer.append",
 				"audio": audio,
@@ -161,9 +401,30 @@ var _ = Describe("Realtime WebSocket API", Label("Realtime"), func() {
 			committed := drainUntil(conn, "input_audio_buffer.committed", 30*time.Second)
 			Expect(committed).ToNot(BeNil())
 
-			// Wait for the full response cycle to complete
-			done := drainUntil(conn, "response.done", 60*time.Second)
-			Expect(done).ToNot(BeNil())
+			// Drain the response cycle, capturing the input transcription
+			// event as it arrives so we can sanity-check it alongside the
+			// real-TTS path.
+			var transcript string
+			deadline := time.Now().Add(90 * time.Second)
+			for time.Now().Before(deadline) {
+				evt := readServerEvent(conn, time.Until(deadline))
+				if evt["type"] == "conversation.item.input_audio_transcription.completed" {
+					if t, ok := evt["transcript"].(string); ok {
+						transcript = t
+					}
+				}
+				if evt["type"] == "response.done" {
+					Expect(evt).ToNot(BeNil())
+					break
+				}
+			}
+
+			if isRealTTS() {
+				lower := strings.ToLower(transcript)
+				matched := strings.Contains(lower, "fox") || strings.Contains(lower, "dog")
+				Expect(matched).To(BeTrue(),
+					"expected real-TTS transcript to contain 'fox' or 'dog' (got %q)", transcript)
+			}
 		})
 	})
 

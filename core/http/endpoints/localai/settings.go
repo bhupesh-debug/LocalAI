@@ -4,16 +4,18 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/labstack/echo/v4"
 	"github.com/mudler/LocalAI/core/application"
 	"github.com/mudler/LocalAI/core/config"
+	"github.com/mudler/LocalAI/core/gallery"
 	"github.com/mudler/LocalAI/core/http/endpoints/openresponses"
 	"github.com/mudler/LocalAI/core/p2p"
 	"github.com/mudler/LocalAI/core/schema"
+	"github.com/mudler/LocalAI/pkg/vram"
+	"github.com/mudler/LocalAI/pkg/vrambudget"
 	"github.com/mudler/xlog"
 )
 
@@ -96,6 +98,18 @@ func UpdateSettingsEndpoint(app *application.Application) echo.HandlerFunc {
 			}
 		}
 
+		// Reject a malformed VRAM budget up front so a bad value never reaches
+		// the config (ApplyRuntimeSettings is fail-open and would silently skip
+		// installing the cap). An empty string is allowed: it clears the cap.
+		if settings.VRAMBudget != nil && *settings.VRAMBudget != "" {
+			if _, err := vrambudget.Parse(*settings.VRAMBudget); err != nil {
+				return c.JSON(http.StatusBadRequest, schema.SettingsResponse{
+					Success: false,
+					Error:   "Invalid vram_budget format: " + err.Error(),
+				})
+			}
+		}
+
 		// Generate P2P token before saving so the real token is persisted (not "0")
 		if settings.P2PToken != nil && *settings.P2PToken == "0" {
 			token := p2p.GenerateToken(60, 60)
@@ -110,16 +124,62 @@ func UpdateSettingsEndpoint(app *application.Application) echo.HandlerFunc {
 			})
 		}
 
-		settingsFile := filepath.Join(appConfig.DynamicConfigsDir, "runtime_settings.json")
-		settingsJSON, err := json.MarshalIndent(settings, "", "  ")
+		// Read whatever is already persisted: it is both the source of truth
+		// for branding asset filenames (below) and the base we merge this
+		// request onto before writing. A read failure must not let a Save
+		// silently discard the existing settings — surface it instead.
+		persisted, err := appConfig.ReadPersistedSettings()
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, schema.SettingsResponse{
 				Success: false,
-				Error:   "Failed to marshal settings: " + err.Error(),
+				Error:   "Failed to read existing settings: " + err.Error(),
 			})
 		}
 
-		if err := os.WriteFile(settingsFile, settingsJSON, 0600); err != nil {
+		// Branding asset filenames are owned exclusively by
+		// /api/branding/asset/{kind} (upload/delete). The Settings page also
+		// round-trips them via GET /api/settings, but its local state is stale
+		// once an asset has been uploaded — clicking Save would otherwise
+		// clobber the uploaded basename with the empty string the UI loaded
+		// at page open. Replace whatever the body sent for these three fields
+		// with the values currently on disk so /api/settings can never
+		// regress them.
+		settings.LogoFile = persisted.LogoFile
+		settings.LogoHorizontalFile = persisted.LogoHorizontalFile
+		settings.FaviconFile = persisted.FaviconFile
+
+		// The UI reads ApiKeys from GET /api/settings, which already returns the
+		// merged env+runtime list. When the user clicks Save, the same merged
+		// list comes back in the POST body. Strip the env-supplied keys from
+		// the incoming list before we persist or re-merge, otherwise each save
+		// duplicates the env keys on top of the previous merge (#9071).
+		if settings.ApiKeys != nil {
+			envKeys := startupConfig.ApiKeys
+			envSet := make(map[string]struct{}, len(envKeys))
+			for _, k := range envKeys {
+				envSet[k] = struct{}{}
+			}
+			runtimeOnly := make([]string, 0, len(*settings.ApiKeys))
+			for _, k := range *settings.ApiKeys {
+				if _, fromEnv := envSet[k]; fromEnv {
+					continue
+				}
+				runtimeOnly = append(runtimeOnly, k)
+			}
+			settings.ApiKeys = &runtimeOnly
+		}
+
+		// Persist as a partial update: overlay only the fields this request set
+		// onto the settings already on disk. Focused admin pages POST just the
+		// keys they own (the Middleware proxy tab sends only mitm_listen; the
+		// detector table only pii_default_detectors), so writing the request
+		// body verbatim would null every unrelated setting (the no-omitempty
+		// api_keys / pii_default_detectors fields even round-trip as JSON
+		// null). The full Settings page still round-trips every field, so its
+		// Save is unchanged.
+		toPersist := persisted
+		toPersist.MergeNonNil(settings)
+		if err := appConfig.WritePersistedSettings(toPersist); err != nil {
 			return c.JSON(http.StatusInternalServerError, schema.SettingsResponse{
 				Success: false,
 				Error:   "Failed to write settings file: " + err.Error(),
@@ -127,13 +187,20 @@ func UpdateSettingsEndpoint(app *application.Application) echo.HandlerFunc {
 		}
 
 		// Apply settings using centralized method
+		prevGalleries, prevBackendGalleries := appConfig.Galleries, appConfig.BackendGalleries
 		watchdogChanged := appConfig.ApplyRuntimeSettings(&settings)
+		gallery.ResetGalleryModelCacheIfChanged(prevGalleries, prevBackendGalleries, appConfig)
+		if settings.VRAMPersistentCache != nil || settings.AutoloadGalleries != nil {
+			if appConfig.VRAMPersistentCache && appConfig.AutoloadGalleries {
+				vram.ConfigurePersistentCache(filepath.Join(appConfig.SystemState.Model.ModelsPath, "..", "cache", "vram"), 24*time.Hour)
+			} else {
+				vram.DisablePersistentCache()
+			}
+		}
 
 		// Handle API keys specially (merge with startup keys)
 		if settings.ApiKeys != nil {
-			envKeys := startupConfig.ApiKeys
-			runtimeKeys := *settings.ApiKeys
-			appConfig.ApiKeys = append(envKeys, runtimeKeys...)
+			appConfig.ApiKeys = config.MergeAPIKeys(startupConfig.ApiKeys, *settings.ApiKeys)
 		}
 
 		// Update backend logging dynamically
@@ -186,9 +253,18 @@ func UpdateSettingsEndpoint(app *application.Application) echo.HandlerFunc {
 		// Check if agent job retention changed
 		agentJobChanged := settings.AgentJobRetentionDays != nil
 
-		// Restart watchdog if settings changed
+		// Restart watchdog if settings changed.
+		//
+		// The live start/stop decision derives from the post-apply config
+		// (WatchdogShouldRun) rather than the raw watchdog_enabled request
+		// field: the React master toggle only ever writes the idle/busy flags,
+		// so keying off watchdog_enabled left the live watchdog stopped on a
+		// cold enable until the next restart (#9125). WatchdogShouldRun mirrors
+		// the gating in startWatchdog, so a cold enable starts it immediately
+		// and a full disable (both checks off, no LRU / memory reclaimer) stops
+		// it.
 		if watchdogChanged {
-			if settings.WatchdogEnabled != nil && !*settings.WatchdogEnabled {
+			if !appConfig.WatchdogShouldRun() {
 				if err := app.StopWatchdog(); err != nil {
 					xlog.Error("Failed to stop watchdog", "error", err)
 					return c.JSON(http.StatusInternalServerError, schema.SettingsResponse{
@@ -214,6 +290,23 @@ func UpdateSettingsEndpoint(app *application.Application) echo.HandlerFunc {
 				return c.JSON(http.StatusInternalServerError, schema.SettingsResponse{
 					Success: false,
 					Error:   "Settings saved but failed to restart agent job service: " + err.Error(),
+				})
+			}
+		}
+
+		// Rebuild the MITM listener when its address OR the instance-wide
+		// default detectors change. The per-host detector map is resolved once
+		// at listener start (startMITMLocked → ResolvePIIPolicy), so a
+		// default-detector change is otherwise invisible to cloud-proxy traffic
+		// until the next restart — an admin toggling a default detector would
+		// see no redaction. RestartMITM is a no-op when the listener is
+		// disabled (empty address).
+		if settings.MITMListen != nil || settings.PIIDefaultDetectors != nil {
+			if err := app.RestartMITM(); err != nil {
+				xlog.Error("Failed to restart MITM proxy", "error", err)
+				return c.JSON(http.StatusInternalServerError, schema.SettingsResponse{
+					Success: false,
+					Error:   "Settings saved but failed to restart MITM proxy: " + err.Error(),
 				})
 			}
 		}

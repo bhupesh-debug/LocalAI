@@ -19,6 +19,7 @@ import grpc
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'common'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'common'))
 from grpc_auth import get_auth_interceptors
+from temp_utils import cleanup_paths
 
 import tempfile
 
@@ -36,6 +37,20 @@ def is_int(s):
         return True
     except ValueError:
         return False
+
+def coerce_param_value(value):
+    """Coerce a TTSRequest.params value (string on the wire) to the type the
+    Chatterbox generate() kwargs expect (float/int/bool), matching how static
+    YAML options are coerced at load time. Non-string values pass through."""
+    if not isinstance(value, str):
+        return value
+    if is_float(value):
+        return float(value)
+    if is_int(value):
+        return int(value)
+    if value.lower() in ["true", "false"]:
+        return value.lower() == "true"
+    return value
 
 def split_text_at_word_boundary(text, max_length=250):
     """
@@ -101,11 +116,6 @@ def merge_audio_files(audio_files, output_path, sample_rate):
     # Save the merged audio
     ta.save(output_path, merged_waveform, sample_rate)
     
-    # Clean up temporary files
-    for audio_file in audio_files:
-        if os.path.exists(audio_file):
-            os.remove(audio_file)
-
 _ONE_DAY_IN_SECONDS = 60 * 60 * 24
 
 # If MAX_WORKERS are specified in the environment use it, otherwise default to 1
@@ -185,11 +195,23 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
 
             if "language" in self.options:
                 kwargs["language_id"] = self.options["language"]
-            if self.AudioPath is not None:
+            if request.voice and os.path.isfile(request.voice):
+                kwargs["audio_prompt_path"] = request.voice
+            elif self.AudioPath is not None:
                 kwargs["audio_prompt_path"] = self.AudioPath
 
             # add options to kwargs
             kwargs.update(self.options)
+
+            # Merge per-request params (TTSRequest.params), overriding the static
+            # YAML options. This exposes Chatterbox generation knobs (e.g.
+            # exaggeration, cfg_weight, temperature) per request. Values arrive as
+            # strings on the wire and are coerced to float/int/bool.
+            if hasattr(request, "params") and request.params:
+                for key, value in request.params.items():
+                    if key == "ref_text":
+                        continue
+                    kwargs[key] = coerce_param_value(value)
 
             # Check if text exceeds 250 characters
             # (chatterbox does not support long text)
@@ -200,19 +222,20 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 text_chunks = split_text_at_word_boundary(request.text, max_length=250)
                 print(f"Splitting text into chunks of 250 characters: {len(text_chunks)}", file=sys.stderr)
                 # Generate audio for each chunk
-                temp_audio_files = []
-                for i, chunk in enumerate(text_chunks):
-                    # Generate audio for this chunk
-                    wav = self.model.generate(chunk, **kwargs)
-                    
-                    # Create temporary file for this chunk
-                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
-                    temp_file.close()
-                    ta.save(temp_file.name, wav, self.model.sr)
-                    temp_audio_files.append(temp_file.name)
-                
-                # Merge all audio files
-                merge_audio_files(temp_audio_files, request.dst, self.model.sr)
+                with cleanup_paths() as temp_audio_files:
+                    for i, chunk in enumerate(text_chunks):
+                        # Generate audio for this chunk
+                        wav = self.model.generate(chunk, **kwargs)
+
+                        # Register ownership before saving so a partial write is
+                        # removed too when generation or encoding fails.
+                        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+                        temp_file.close()
+                        temp_audio_files.append(temp_file.name)
+                        ta.save(temp_file.name, wav, self.model.sr)
+
+                    # Merge all audio files
+                    merge_audio_files(temp_audio_files, request.dst, self.model.sr)
             else:
                 # Generate audio using ChatterboxTTS for short text
                 wav = self.model.generate(request.text, **kwargs)

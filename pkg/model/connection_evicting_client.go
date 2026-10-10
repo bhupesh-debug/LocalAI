@@ -72,6 +72,18 @@ func (c *ConnectionEvictingClient) GenerateVideo(ctx context.Context, in *pb.Gen
 	return result, err
 }
 
+func (c *ConnectionEvictingClient) Animate3D(ctx context.Context, in *pb.Animate3DRequest, opts ...ggrpc.CallOption) (*pb.Result, error) {
+	result, err := c.Backend.Animate3D(ctx, in, opts...)
+	c.checkErr(err)
+	return result, err
+}
+
+func (c *ConnectionEvictingClient) Generate3D(ctx context.Context, in *pb.Generate3DRequest, opts ...ggrpc.CallOption) (*pb.Result, error) {
+	result, err := c.Backend.Generate3D(ctx, in, opts...)
+	c.checkErr(err)
+	return result, err
+}
+
 func (c *ConnectionEvictingClient) TTS(ctx context.Context, in *pb.TTSRequest, opts ...ggrpc.CallOption) (*pb.Result, error) {
 	result, err := c.Backend.TTS(ctx, in, opts...)
 	c.checkErr(err)
@@ -108,8 +120,26 @@ func (c *ConnectionEvictingClient) Detect(ctx context.Context, in *pb.DetectOpti
 	return result, err
 }
 
+func (c *ConnectionEvictingClient) Depth(ctx context.Context, in *pb.DepthRequest, opts ...ggrpc.CallOption) (*pb.DepthResponse, error) {
+	result, err := c.Backend.Depth(ctx, in, opts...)
+	c.checkErr(err)
+	return result, err
+}
+
 func (c *ConnectionEvictingClient) Rerank(ctx context.Context, in *pb.RerankRequest, opts ...ggrpc.CallOption) (*pb.RerankResult, error) {
 	result, err := c.Backend.Rerank(ctx, in, opts...)
+	c.checkErr(err)
+	return result, err
+}
+
+func (c *ConnectionEvictingClient) TokenClassify(ctx context.Context, in *pb.TokenClassifyRequest, opts ...ggrpc.CallOption) (*pb.TokenClassifyResponse, error) {
+	result, err := c.Backend.TokenClassify(ctx, in, opts...)
+	c.checkErr(err)
+	return result, err
+}
+
+func (c *ConnectionEvictingClient) Score(ctx context.Context, in *pb.ScoreRequest, opts ...ggrpc.CallOption) (*pb.ScoreResponse, error) {
+	result, err := c.Backend.Score(ctx, in, opts...)
 	c.checkErr(err)
 	return result, err
 }

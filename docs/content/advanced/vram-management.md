@@ -5,10 +5,13 @@ weight = 22
 url = '/advanced/vram-management'
 +++
 
+![VRAM management: least-recently-used eviction and concurrency-group anti-affinity keep hot models warm](/images/diagrams/vram-eviction.png)
+
 When running multiple models in LocalAI, especially on systems with limited GPU memory (VRAM), you may encounter situations where loading a new model fails because there isn't enough available VRAM. LocalAI provides several mechanisms to automatically manage model memory allocation and prevent VRAM exhaustion:
 
 1. **Max Active Backends (LRU Eviction)**: Limit the number of loaded models, evicting the least recently used when the limit is reached
-2. **Watchdog Mechanisms**: Automatically unload idle or stuck models based on configurable timeouts
+2. **Concurrency Groups**: Per-model anti-affinity rules that prevent specific models from coexisting on the same node
+3. **Watchdog Mechanisms**: Automatically unload idle or stuck models based on configurable timeouts
 
 ## The Problem
 
@@ -136,6 +139,94 @@ LOCALAI_SINGLE_ACTIVE_BACKEND=true ./local-ai
 - When you only need one model active at a time
 - Simple deployments where model switching is acceptable
 
+## Solution 1b: Concurrency Groups (per-model anti-affinity)
+
+`--max-active-backends` is a global count - three loaded models is fine, but it
+doesn't know that two of them are 120B and shouldn't share a GPU.
+**Concurrency groups** give per-model rules: any two models that share a group
+name are mutually exclusive on the same node. Loading one evicts the others.
+Models with no groups behave exactly as before.
+
+This addresses [issue #9659](https://github.com/mudler/LocalAI/issues/9659):
+
+> allow my zed prediction model to run alongside anything but don't allow my
+> two 120b models to run alongside each other
+
+### Configuration
+
+Declare groups per model in the YAML config - no CLI flag, no env var:
+
+```yaml
+# llama-120b-a.yaml
+name: llama-120b-a
+backend: llama-cpp
+parameters:
+  model: llama-120b-a.gguf
+concurrency_groups: ["vram-heavy"]
+```
+
+```yaml
+# llama-120b-b.yaml
+name: llama-120b-b
+backend: llama-cpp
+parameters:
+  model: llama-120b-b.gguf
+concurrency_groups: ["vram-heavy"]
+```
+
+```yaml
+# zed-predict.yaml - no groups, runs alongside anything
+name: zed-predict
+backend: llama-cpp
+parameters:
+  model: zed-predict.gguf
+```
+
+With this configuration:
+
+1. Request `zed-predict` → loads.
+2. Request `llama-120b-a` → loads alongside `zed-predict`.
+3. Request `llama-120b-b` → `llama-120b-a` is evicted (shared group
+   `vram-heavy`); `zed-predict` stays loaded.
+
+A model can declare multiple groups; two models conflict if they share **any**
+group name. Group names are arbitrary strings - pick names that make sense for
+your hardware (`vram-heavy`, `gpu-1`, `large-context`, ...).
+
+### Interaction with other knobs
+
+- **`--max-active-backends`**: groups are checked *before* the LRU cap. Group
+  evictions may already make room; LRU then enforces the global count.
+- **`pinned: true`**: a pinned model is never evicted, including by a group
+  conflict. The new request is loaded with a warning logged - pinning two
+  models in the same group is a configuration mismatch.
+- **`--force-eviction-when-busy`**: same retry semantics as LRU. A busy
+  conflict is skipped and retried (`--lru-eviction-max-retries`,
+  `--lru-eviction-retry-interval`); after retries exhaust, the load proceeds
+  with a warning.
+
+### Distributed mode
+
+`concurrency_groups` is enforced **per node**, not cluster-wide - VRAM is a
+node-local resource, so two heavy models on different nodes is fine. The
+distributed scheduler additionally uses the rule as a placement hint: when
+choosing where to load a new model, it prefers nodes that don't already host a
+same-group model, falling back to eviction only if every candidate has a
+conflict.
+
+`pinned: true` also holds cluster-wide: the distributed scheduler's LRU
+eviction (used to free capacity for a new model) and the replica reconciler's
+idle scale-down both exclude pinned models, matching what the per-node
+watchdog already guarantees. Deliberate teardown - an admin unload, deleting
+the model, draining a node - still applies to pinned models. Note that if
+every idle model on the cluster is pinned, a new model's load waits for
+capacity instead of evicting one.
+
+`concurrency_groups` composes with `NodeSelector` (which decides *which
+nodes* a model is eligible for) - the two filters apply in sequence. Use
+`NodeSelector` to target hardware classes; use `concurrency_groups` to keep
+specific models from co-residing on whichever node hosts them.
+
 ## Solution 2: Watchdog Mechanisms
 
 For more flexible memory management, LocalAI provides watchdog mechanisms that automatically unload models based on their activity state. This allows multiple models to be loaded simultaneously, but automatically frees memory when models become inactive or stuck.
@@ -163,6 +254,11 @@ Via web UI: Navigate to Settings → Watchdog Settings and enable "Watchdog Idle
 
 The busy watchdog monitors models that have been processing requests for an unusually long time and terminates them if they exceed a threshold. This is useful for detecting and recovering from stuck or hung backends.
 
+For parallel backends, the timeout is measured from the start of the oldest
+request that is still in flight. Sustained overlapping traffic does not by
+itself make a backend stale: when the oldest request completes, the watchdog
+continues from the start time of the next-oldest request.
+
 #### Configuration
 
 Via environment variables or CLI:
@@ -175,6 +271,18 @@ LOCALAI_WATCHDOG_BUSY=true LOCALAI_WATCHDOG_BUSY_TIMEOUT=10m ./local-ai
 ```
 
 Via web UI: Navigate to Settings → Watchdog Settings and enable "Watchdog Busy Enabled" with your desired timeout.
+
+#### Backend shutdown behavior
+
+Administrative and API-triggered model shutdown is graceful by default. It
+waits up to 30 seconds for in-flight requests to finish and returns a
+`model is still busy` error if the deadline expires. This bounded wait keeps a
+busy backend from blocking lifecycle operations for other models.
+
+Set `LOCALAI_FORCE_BACKEND_SHUTDOWN=true` when starting LocalAI to escalate a
+timed-out graceful shutdown to forced process termination. Forced shutdown can
+interrupt active requests and skips the backend `Free()` RPC; terminating the
+process releases its resources instead.
 
 ### Combined Configuration
 
@@ -277,6 +385,49 @@ This configuration:
 - Waits 2 seconds between retry attempts
 - Ensures busy models have time to complete their requests before eviction
 
+## VRAM Budget (Allocation Ceiling)
+
+By default LocalAI treats **all** detected GPU memory as available for model allocation. On a shared machine (a desktop you also game on, a box that runs other GPU workloads, or a multi-tenant server) you often want to reserve some headroom and let LocalAI use only part of the card. The **VRAM budget** sets a hard ceiling on how much VRAM LocalAI will consider allocatable.
+
+### Configuration
+
+Set the budget with a CLI flag or environment variable:
+
+```bash
+# Percentage of detected VRAM
+./local-ai --vram-budget=80%
+
+# Absolute amount (GB, GiB, MB, or raw bytes)
+./local-ai --vram-budget=12GB
+
+# Using environment variables
+LOCALAI_VRAM_BUDGET=80% ./local-ai
+LOCALAI_VRAM_BUDGET=12GB ./local-ai
+```
+
+Accepted formats:
+
+- A **percentage** such as `80%` (or the decimal `0.8`).
+- An **absolute amount** such as `12GB`, `12GiB`, `12000MB`, or a raw byte count.
+
+Leaving it empty or unset (the default) uses all detected VRAM, which is the historical behavior.
+
+### Semantics
+
+The budget is a **hard ceiling**, never a floor:
+
+- Everywhere LocalAI reads VRAM to decide model allocation (hardware defaults for batch size and parallelism, context auto-fit, GGUF fit warnings, and the watchdog), it uses `min(detected VRAM, budget)`.
+- The budget can only **lower** usable VRAM, never raise it above what the hardware physically has. An absolute value larger than physical VRAM is clamped to physical.
+- A percentage above `100%` is rejected as invalid.
+
+### Editing from the UI
+
+The budget is exposed in the **Settings** page under the **Performance** section as **VRAM Budget**, so you can change it without editing flags or restarting from scratch. It is live-editable and persists to the runtime settings.
+
+### Distributed mode
+
+The same `LOCALAI_VRAM_BUDGET` / `--vram-budget` applies to distributed worker nodes (`local-ai worker ...`), where it caps the VRAM the scheduler will use for per-node placement. Admins can also set a per-node budget live from the node UI (or the admin API); see [Distributed Mode]({{%relref "features/distributed-mode#per-node-vram-budget" %}}).
+
 ## Limitations and Considerations
 
 ### VRAM Usage Estimation
@@ -298,6 +449,8 @@ curl -X POST http://localhost:8080/backend/shutdown \
 
 To stop all models, you'll need to call the endpoint for each loaded model individually, or use the web UI to stop all models at once.
 
+Conversely, you can pre-load a model into memory ahead of its first request with `POST /backend/load` (the inverse of shutdown) - see [Backend Monitor]({{%relref "operations/backend-monitor" %}}).
+
 ### Best Practices
 
 1. **Monitor VRAM usage**: Use `nvidia-smi` (for NVIDIA GPUs) or similar tools to monitor actual VRAM usage
@@ -307,9 +460,57 @@ To stop all models, you'll need to call the endpoint for each loaded model indiv
 5. **Consider model size**: Ensure your VRAM can accommodate at least one of your largest models
 6. **Use quantization**: Smaller quantized models use less VRAM and allow more flexibility
 
+## VRAM estimates in the model gallery
+
+The model gallery shows an estimated VRAM footprint per model, at several
+context lengths, so you can see whether something will run before installing it.
+
+Working that out means reading the metadata of a model's weight files, which for
+a model you have not installed is a request to the host that serves them. It
+takes a second or two the first time, and the gallery needs one per row. LocalAI
+caches successful remote probes for 24 hours under the LocalAI data directory,
+and warms that cache in the background at startup so the gallery reads instantly
+rather than filling in its own numbers while you watch. The on-disk cache is
+reused after a restart, so frequent restarts do not download the same metadata
+again. Local model files are always inspected directly. The cache keeps at most
+4,096 entries and removes the oldest entries when it reaches that limit.
+Disable **Persist remote VRAM estimates** under **Settings > Galleries**, or set
+`LOCALAI_VRAM_PERSISTENT_CACHE=false`, to keep estimates in memory only. Setting
+`LOCALAI_AUTOLOAD_GALLERIES=false` also disables the startup warmer and the
+persistent cache.
+
+The same warm-up also describes each entry's **variants** - the alternative
+builds of the same weights that the picker offers - because that costs the same
+kind of probe and lands in the same cache. Without it, the first model you open
+pays for it again.
+
+The warm-up is bounded, and covers the entries at the top of the gallery: the
+ones you see first. Anything past it is estimated on first view and cached from
+then on.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LOCALAI_VRAM_WARM_LIMIT` | `300` | How many gallery entries to warm at startup, estimates and variants alike. Set to `0` to disable the warm-up entirely. |
+| `LOCALAI_VRAM_WARM_CONCURRENCY` | `4` | How many estimates to run at once. |
+
+The provided Docker Compose configurations set `LOCALAI_VRAM_WARM_LIMIT=0`
+as a defensive default, so container startup does not probe remote GGUF files.
+Remove that override or set it to a positive number to opt into background
+warming.
+
+```bash
+# Air-gapped, or you would rather not make the requests at all
+LOCALAI_VRAM_WARM_LIMIT=0 local-ai run
+
+# A slow or metered link: warm the same entries, more gently
+LOCALAI_VRAM_WARM_CONCURRENCY=1 local-ai run
+```
+
+The warm-up never blocks startup, and never fails it: an entry whose weight
+files cannot be reached is left cold and estimated later, if anyone asks.
+
 ## Related Documentation
 
 - See [Advanced Usage]({{%relref "advanced/advanced-usage" %}}) for other configuration options
 - See [GPU Acceleration]({{%relref "features/GPU-acceleration" %}}) for GPU setup and configuration
 - See [Backend Flags]({{%relref "advanced/advanced-usage#backend-flags" %}}) for all available backend configuration options
-

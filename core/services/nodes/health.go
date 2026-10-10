@@ -7,10 +7,29 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/core/services/advisorylock"
 	"github.com/mudler/xlog"
 	"gorm.io/gorm"
 )
+
+// perModelMissThreshold is the number of consecutive failed gRPC probes
+// against a model's backend before the model is removed from the registry.
+// A single failure can be transient (network blip, brief GC pause on the
+// worker, a long-running request hogging the gRPC server thread); requiring
+// N consecutive misses avoids deleting healthy rows over noise. At the
+// default 15s tick this means a model has to be unreachable for ~45s before
+// it gets reaped.
+const perModelMissThreshold = 3
+
+// modelKey identifies a specific (node, model, replica) tuple. We track miss
+// counts per tuple because the same model name can be loaded on multiple
+// replicas on the same node.
+type modelKey struct {
+	NodeID       string
+	ModelName    string
+	ReplicaIndex int
+}
 
 // HealthMonitor periodically checks the health of registered backend nodes.
 type HealthMonitor struct {
@@ -21,6 +40,8 @@ type HealthMonitor struct {
 	autoOffline         bool                 // mark stale nodes as offline (preserves approval status)
 	clientFactory       BackendClientFactory // creates gRPC backend clients
 	perModelHealthCheck bool                 // check each model's backend process individually
+	missesMu            sync.Mutex
+	misses              map[modelKey]int // consecutive failed-probe counts; reset on success or model removal
 	cancel              context.CancelFunc
 	cancelMu            sync.Mutex
 }
@@ -31,7 +52,11 @@ type HealthMonitor struct {
 // If clientFactory is nil, a default factory using the given authToken is used.
 func NewHealthMonitor(registry NodeHealthStore, db *gorm.DB, checkInterval, staleThreshold time.Duration, authToken string, perModelHealthCheck bool, clientFactory ...BackendClientFactory) *HealthMonitor {
 	checkInterval = cmp.Or(checkInterval, 15*time.Second)
-	staleThreshold = cmp.Or(staleThreshold, 60*time.Second)
+	// Heartbeat checkpointing lets last_heartbeat sit up to one checkpoint
+	// interval behind by design, so a hardcoded 60s fallback here would mark
+	// every healthy, beating node offline. Track the shared default instead,
+	// which is derived from that interval.
+	staleThreshold = cmp.Or(staleThreshold, config.DefaultStaleNodeThreshold)
 	var factory BackendClientFactory
 	if len(clientFactory) > 0 && clientFactory[0] != nil {
 		factory = clientFactory[0]
@@ -46,6 +71,7 @@ func NewHealthMonitor(registry NodeHealthStore, db *gorm.DB, checkInterval, stal
 		autoOffline:         true,
 		clientFactory:       factory,
 		perModelHealthCheck: perModelHealthCheck,
+		misses:              make(map[modelKey]int),
 	}
 }
 
@@ -126,6 +152,12 @@ func (hm *HealthMonitor) doCheckAll(ctx context.Context) {
 		// Workers (both backend and agent) send HTTP heartbeats to the frontend.
 		// If the heartbeat is stale, the worker is presumed down.
 		if time.Since(node.LastHeartbeat) > hm.staleThreshold {
+			// Skip nodes already marked offline/unhealthy — re-marking them
+			// every cycle floods the log with the same WARN+INFO pair for
+			// nodes the operator has intentionally taken down.
+			if node.Status == StatusOffline || node.Status == StatusUnhealthy {
+				continue
+			}
 			xlog.Warn("Node heartbeat stale", "node", node.Name, "lastHeartbeat", node.LastHeartbeat)
 			if hm.autoOffline {
 				xlog.Info("Marking stale node offline", "node", node.Name)
@@ -146,26 +178,56 @@ func (hm *HealthMonitor) doCheckAll(ctx context.Context) {
 			}
 		}
 
-		// Per-model backend health check (opt-in): probe each model's gRPC address
-		// and remove stale model records. This does NOT affect the node's status —
-		// a crashed backend process is a model-level issue, not a node-level one.
+		// Per-model backend health check: probe each model's gRPC address and
+		// remove stale model records. This does NOT affect the node's status —
+		// a crashed backend process is a model-level issue, not a node-level
+		// one. A model is only removed after perModelMissThreshold consecutive
+		// failed probes so a single network/GC blip doesn't force a reload.
 		if hm.perModelHealthCheck {
 			models, _ := hm.registry.GetNodeModels(ctx, node.ID)
 			for _, m := range models {
 				if m.Address == "" || m.Address == node.Address {
 					continue
 				}
-				mClient := hm.clientFactory.NewClient(m.Address, false)
+				mClient := hm.clientFactory.NewClient(node.ID, m.Address, false)
 				mCheckCtx, mCancel := context.WithTimeout(ctx, 5*time.Second)
-				if ok, _ := mClient.HealthCheck(mCheckCtx); !ok {
-					xlog.Warn("Model backend unhealthy, removing from registry",
-						"node", node.ID, "model", m.ModelName, "address", m.Address)
-					hm.registry.RemoveNodeModel(ctx, node.ID, m.ModelName)
-				}
+				ok, _ := mClient.HealthCheck(mCheckCtx)
 				mCancel()
 				if closer, ok := mClient.(io.Closer); ok {
 					closer.Close()
 				}
+
+				key := modelKey{NodeID: node.ID, ModelName: m.ModelName, ReplicaIndex: m.ReplicaIndex}
+				hm.missesMu.Lock()
+				if ok {
+					// Probe succeeded — wipe any previous miss streak.
+					delete(hm.misses, key)
+					hm.missesMu.Unlock()
+					continue
+				}
+				hm.misses[key]++
+				misses := hm.misses[key]
+				hm.missesMu.Unlock()
+
+				if misses < perModelMissThreshold {
+					xlog.Debug("Model backend probe failed, awaiting threshold before removal",
+						"node", node.ID, "model", m.ModelName, "replica", m.ReplicaIndex,
+						"address", m.Address, "misses", misses, "threshold", perModelMissThreshold)
+					continue
+				}
+				xlog.Warn("Model backend unhealthy after consecutive misses, removing from registry",
+					"node", node.ID, "model", m.ModelName, "replica", m.ReplicaIndex,
+					"address", m.Address, "misses", misses)
+				if err := hm.registry.RemoveNodeModel(ctx, node.ID, m.ModelName, m.ReplicaIndex); err != nil {
+					xlog.Warn("Failed to remove unhealthy model from registry",
+						"node", node.ID, "model", m.ModelName, "replica", m.ReplicaIndex, "error", err)
+					// Leave the miss counter in place so the next tick retries
+					// the removal rather than starting the streak over.
+					continue
+				}
+				hm.missesMu.Lock()
+				delete(hm.misses, key)
+				hm.missesMu.Unlock()
 			}
 		}
 	}

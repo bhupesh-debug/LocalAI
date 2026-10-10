@@ -1,7 +1,7 @@
 +++
 disableToc = false
 title = "Troubleshooting"
-weight = 9
+weight = 6
 url = '/basics/troubleshooting/'
 icon = "build"
 +++
@@ -40,6 +40,15 @@ docker ps -a | grep local-ai
 # Test GPU access (NVIDIA)
 docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi
 ```
+
+## Request latency diagnostics
+
+Debug logging alone does not enable profiling or request phase timing.
+Use [Profiling and request diagnostics]({{% relref "features/diagnostics" %}}) for an opt-in, bounded investigation on one frontend.
+The guide distinguishes CPU execution, lock waits, discovery filesystem work, and the model router callback.
+It includes direct pod port-forward instructions and warnings about unauthenticated, sensitive profiles.
+Enable diagnostics only through a separately approved rollout; do not expose profiling through the public API.
+Report non-reproduction if matched requests do not reproduce the delay.
 
 ## Installation Issues
 
@@ -172,11 +181,36 @@ If your GPU is not in the default target list, open up an Issue. Supported targe
 docker run --device /dev/dri ...
 ```
 
-Use container images with `gpu-intel` in the tag. **Known issue:** SYCL hangs when `mmap: true` is set — disable it in your model config:
+Use container images with `gpu-intel` in the tag. **Known issue:** SYCL hangs when `mmap: true` is set - disable it in your model config:
 
 ```yaml
 mmap: false
 ```
+
+If the Intel diffusers backend exits while importing PyTorch with
+`libsycl.so.9: undefined symbol: urDeviceWaitExp, version LIBUR_LOADER_0.12`,
+the SYCL library has loaded an incompatible Unified Runtime loader. This happens
+before the gRPC server starts; later connection-refused errors are a consequence
+of that import failure.
+
+Update the separately installed Intel **diffusers backend** as well as the
+`gpu-intel` container image. Updating the parent image alone does not replace a
+backend retained in your backends directory. On Linux, the Python backend launcher
+prefers `venv/lib` when it contains `libsycl.so*`, ahead of the backend's packaged
+`lib` directory and inherited `LD_LIBRARY_PATH`. The venv still needs a compatible
+SYCL library, Unified Runtime loader and adapters; changing search order cannot
+repair an incomplete runtime installation.
+
+If the failure persists, include the container image digest, installed backend
+name and OCI digest, full import traceback, launch command, and any library mounts
+in your issue. From inside the affected container, record the inherited
+`LD_LIBRARY_PATH`, the installed backend path, and the `libsycl.so*`,
+`libur_loader.so*` and `libur_adapter_*` files in both `venv/lib` and `lib`.
+Use `readelf --dyn-syms --wide` and `readelf --version-info` on the SYCL library and
+loaders to compare their symbols and versions. Running the installed backend's
+`run.sh` with `LD_DEBUG=libs,versions` captures which loader is actually selected
+under its startup environment. An `import torch` check using the venv Python and
+the same library search path can isolate this failure without generating an image.
 
 **Overriding backend auto-detection:**
 
@@ -388,16 +422,25 @@ services:
       retries: 3
 ```
 
-### Models Not Persisted Between Restarts
+### Models or Settings Not Persisted Between Upgrades
 
-Mount a volume for your models directory:
+Container-local files are discarded when an upgrade recreates the container.
+Mount all of LocalAI's stateful paths:
 
 ```yaml
 services:
   local-ai:
     volumes:
-      - ./models:/build/models:cached
+      - ./models:/models
+      - ./backends:/backends
+      - ./configuration:/configuration
+      - ./data:/data
 ```
+
+The paths on the left can be any persistent host directories or named volumes.
+The container paths on the right must match exactly. See
+[Persistent Storage]({{% relref "getting-started/containers#persistent-storage" %}})
+for Docker, Podman, and UnRAID guidance.
 
 ## Network and P2P Issues
 
@@ -429,7 +472,7 @@ LOCALAI_P2P_DISABLE_DHT=true local-ai run
 ### P2P Limitations
 
 - Only a single model is currently supported for distributed inference
-- Workers must be detected before inference starts — you cannot add workers mid-inference
+- Workers must be detected before inference starts - you cannot add workers mid-inference
 - Workers mode supports llama-cpp compatible models only
 
 See the [Distributed Inferencing guide](/features/distributed-inferencing/) for full setup instructions.

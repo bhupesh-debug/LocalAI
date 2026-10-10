@@ -2,11 +2,13 @@ package mcp
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -14,9 +16,10 @@ import (
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/core/schema"
 	mcpRemote "github.com/mudler/LocalAI/core/services/mcp"
-	"github.com/mudler/LocalAI/core/services/messaging"
 
 	"github.com/mudler/LocalAI/pkg/functions"
+	"github.com/mudler/LocalAI/pkg/httpclient"
+	"github.com/mudler/LocalAI/pkg/mcptransport"
 	"github.com/mudler/LocalAI/pkg/signals"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -28,6 +31,7 @@ type NamedSession struct {
 	Name    string
 	Type    string // "remote" or "stdio"
 	Session *mcp.ClientSession
+	Error   string
 }
 
 // MCPToolInfo holds a discovered MCP tool along with its origin session.
@@ -45,6 +49,7 @@ type MCPServerInfo struct {
 	Tools     []string `json:"tools"`
 	Prompts   []string `json:"prompts,omitempty"`
 	Resources []string `json:"resources,omitempty"`
+	Error     string   `json:"error,omitempty"`
 }
 
 // MCPPromptInfo holds a discovered MCP prompt along with its origin session.
@@ -74,9 +79,10 @@ type sessionCache struct {
 }
 
 type namedSessionCache struct {
-	mu      sync.Mutex
-	cache   map[string][]NamedSession
-	cancels map[string]context.CancelFunc
+	mu           sync.Mutex
+	cache        map[string][]NamedSession
+	cancels      map[string]context.CancelFunc
+	configHashes map[string][sha256.Size]byte
 }
 
 var (
@@ -86,16 +92,44 @@ var (
 	}
 
 	namedCache = namedSessionCache{
-		cache:   make(map[string][]NamedSession),
-		cancels: make(map[string]context.CancelFunc),
+		cache:        make(map[string][]NamedSession),
+		cancels:      make(map[string]context.CancelFunc),
+		configHashes: make(map[string][sha256.Size]byte),
 	}
 
 	client = mcp.NewClient(&mcp.Implementation{Name: "LocalAI", Version: "v1.0.0"}, nil)
 )
 
-// MCPNATSClient is the interface for NATS request-reply operations needed by MCP routing.
-type MCPNATSClient interface {
-	Request(subject string, data []byte, timeout time.Duration) ([]byte, error)
+// AgentControl carries the frontend's MCP verbs to one agent worker. A decoded
+// reply is returned with a nil error even when its Error field is set: that is
+// the worker's own answer. nodes.ErrNoRoute (wrapped) means no agent worker
+// could be offered the request. A timeout, a transport fault or an unreadable
+// reply is an ordinary error and never ErrNoRoute.
+type AgentControl interface {
+	ExecuteMCPTool(ctx context.Context, req mcpRemote.MCPToolRequest) (*mcpRemote.MCPToolResponse, error)
+	DiscoverMCPTools(ctx context.Context, req mcpRemote.MCPDiscoveryRequest) (*mcpRemote.MCPDiscoveryResponse, error)
+}
+
+// MetadataKeyLocalAIAssistant is the request-metadata key the chat handler
+// inspects to decide whether to wire the in-process admin MCP server. UI
+// callers MUST use this constant rather than the raw string.
+const MetadataKeyLocalAIAssistant = "localai_assistant"
+
+// LocalAIAssistantFromMetadata reports whether the request opted into the
+// "LocalAI Assistant" chat modality (admin in-process MCP tool surface).
+// The MetadataKeyLocalAIAssistant key is consumed so it doesn't leak to
+// the backend. Truthy values: "1", "true", "yes" (case-insensitive).
+func LocalAIAssistantFromMetadata(metadata map[string]string) bool {
+	raw, ok := metadata[MetadataKeyLocalAIAssistant]
+	if !ok {
+		return false
+	}
+	delete(metadata, MetadataKeyLocalAIAssistant)
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
 }
 
 // MCPServersFromMetadata extracts the MCP server list from the metadata map
@@ -112,6 +146,44 @@ func MCPServersFromMetadata(metadata map[string]string) []string {
 		servers[i] = strings.TrimSpace(servers[i])
 	}
 	return servers
+}
+
+// connectMCP performs the MCP initialize handshake with a bounded timeout.
+//
+// Without this bound, an unreachable remote server (capped only by the 360s
+// httpClient timeout) or a stdio server whose handshake never completes blocks
+// the caller indefinitely. Because the session cache mutex is held across
+// connection setup, one stalled server also wedges every other MCP request for
+// the same model, which surfaces in the UI as the server widget "spinning
+// forever" (mudler/LocalAI#10880) - most visibly for cloud-proxy models, whose
+// chat path never warms the session cache in the background.
+//
+// The session, once established, stays bound to the shared ctx (it is cancelled
+// later via the cached cancel func on eviction/shutdown), so we cannot pass a
+// WithTimeout context to Connect: firing the timeout would tear a healthy
+// session down. Instead we run Connect on the shared ctx in a goroutine and stop
+// waiting after the timeout. We deliberately do NOT cancel here - the ctx is
+// shared with sibling servers that may already have connected. A genuinely
+// stalled goroutine holds only that shared ctx and is reaped when the model's
+// sessions are cancelled on eviction/shutdown.
+func connectMCP(ctx context.Context, transport mcp.Transport, timeout time.Duration) (*mcp.ClientSession, error) {
+	type result struct {
+		session *mcp.ClientSession
+		err     error
+	}
+	// Buffered so the goroutine can always send and exit, even after we stop
+	// waiting on the timeout branch.
+	done := make(chan result, 1)
+	go func() {
+		s, err := client.Connect(ctx, transport, nil)
+		done <- result{session: s, err: err}
+	}()
+	select {
+	case r := <-done:
+		return r.session, r.err
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("timed out after %s establishing MCP session (server unreachable?)", timeout)
+	}
 }
 
 func SessionsFromMCPConfig(
@@ -158,13 +230,12 @@ func SessionsFromMCPConfig(
 	for _, server := range remote.Servers {
 		xlog.Debug("[MCP remote server] Configuration", "server", server)
 		// Create HTTP client with custom roundtripper for bearer token injection
-		httpClient := &http.Client{
-			Timeout:   config.DefaultMCPToolTimeout,
-			Transport: newBearerTokenRoundTripper(server.Token, http.DefaultTransport),
-		}
+		httpClient := httpclient.New(
+			httpclient.WithTimeout(config.DefaultMCPToolTimeout),
+			httpclient.WithTransport(newBearerTokenRoundTripper(server.Token, httpclient.HardenedTransport())),
+		)
 
-		transport := &mcp.StreamableClientTransport{Endpoint: server.URL, HTTPClient: httpClient}
-		mcpSession, err := client.Connect(ctx, transport, nil)
+		mcpSession, err := mcptransport.Connect(ctx, client, server.URL, httpClient, config.DefaultMCPDiscoveryTimeout)
 		if err != nil {
 			xlog.Error("Failed to connect to MCP server", "error", err, "url", server.URL)
 			continue
@@ -182,7 +253,7 @@ func SessionsFromMCPConfig(
 			command.Env = append(command.Env, key+"="+value)
 		}
 		transport := &mcp.CommandTransport{Command: command}
-		mcpSession, err := client.Connect(ctx, transport, nil)
+		mcpSession, err := connectMCP(ctx, transport, config.DefaultMCPDiscoveryTimeout)
 		if err != nil {
 			xlog.Error("Failed to start MCP server", "error", err, "command", command)
 			continue
@@ -197,6 +268,24 @@ func SessionsFromMCPConfig(
 	return allSessions, nil
 }
 
+// closeNamedSessionsLocked removes one model's named sessions while the
+// named-cache mutex is held. Failed connection entries have no live session.
+func closeNamedSessionsLocked(name string, sessions []NamedSession) {
+	for _, ns := range sessions {
+		if ns.Session != nil {
+			if err := ns.Session.Close(); err != nil {
+				xlog.Debug("Failed to close MCP session", "server", ns.Name, "error", err)
+			}
+		}
+	}
+	if cancel, ok := namedCache.cancels[name]; ok {
+		cancel()
+	}
+	delete(namedCache.cache, name)
+	delete(namedCache.cancels, name)
+	delete(namedCache.configHashes, name)
+}
+
 // NamedSessionsFromMCPConfig returns sessions with their server names preserved.
 // If enabledServers is non-empty, only servers with matching names are returned.
 func NamedSessionsFromMCPConfig(
@@ -208,7 +297,18 @@ func NamedSessionsFromMCPConfig(
 	namedCache.mu.Lock()
 	defer namedCache.mu.Unlock()
 
+	configJSON, _ := json.Marshal(struct {
+		Remote config.MCPGenericConfig[config.MCPRemoteServers] `json:"remote"`
+		Stdio  config.MCPGenericConfig[config.MCPSTDIOServers]  `json:"stdio"`
+	}{Remote: remote, Stdio: stdio})
+	configHash := sha256.Sum256(configJSON)
+
 	allSessions, exists := namedCache.cache[name]
+	if exists && namedCache.configHashes[name] != configHash {
+		closeNamedSessionsLocked(name, allSessions)
+		exists = false
+		allSessions = nil
+	}
 
 	// If cached, verify sessions are still alive via Ping.
 	// Dead sessions (e.g. exited stdio containers) are evicted so they get recreated.
@@ -217,6 +317,10 @@ func NamedSessionsFromMCPConfig(
 		defer pingCancel()
 		alive := true
 		for _, ns := range allSessions {
+			if ns.Session == nil {
+				alive = false
+				break
+			}
 			if err := ns.Session.Ping(pingCtx, nil); err != nil {
 				xlog.Warn("MCP session dead, evicting cache", "server", ns.Name, "error", err)
 				alive = false
@@ -224,12 +328,7 @@ func NamedSessionsFromMCPConfig(
 			}
 		}
 		if !alive {
-			// Close dead sessions and recreate
-			if cancel, ok := namedCache.cancels[name]; ok {
-				cancel()
-			}
-			delete(namedCache.cache, name)
-			delete(namedCache.cancels, name)
+			closeNamedSessionsLocked(name, allSessions)
 			exists = false
 			allSessions = nil
 		}
@@ -240,15 +339,19 @@ func NamedSessionsFromMCPConfig(
 
 		for serverName, server := range remote.Servers {
 			xlog.Debug("[MCP remote server] Configuration", "name", serverName, "server", server)
-			httpClient := &http.Client{
-				Timeout:   config.DefaultMCPToolTimeout,
-				Transport: newBearerTokenRoundTripper(server.Token, http.DefaultTransport),
-			}
+			httpClient := httpclient.New(
+				httpclient.WithTimeout(config.DefaultMCPToolTimeout),
+				httpclient.WithTransport(newBearerTokenRoundTripper(server.Token, httpclient.HardenedTransport())),
+			)
 
-			transport := &mcp.StreamableClientTransport{Endpoint: server.URL, HTTPClient: httpClient}
-			mcpSession, err := client.Connect(ctx, transport, nil)
+			mcpSession, err := mcptransport.Connect(ctx, client, server.URL, httpClient, config.DefaultMCPDiscoveryTimeout)
 			if err != nil {
 				xlog.Error("Failed to connect to MCP server", "error", err, "name", serverName, "url", server.URL)
+				allSessions = append(allSessions, NamedSession{
+					Name:  serverName,
+					Type:  "remote",
+					Error: fmt.Sprintf("connection failed: %v", err),
+				})
 				continue
 			}
 			xlog.Debug("[MCP remote server] Connected", "name", serverName, "url", server.URL)
@@ -267,9 +370,14 @@ func NamedSessionsFromMCPConfig(
 				command.Env = append(command.Env, key+"="+value)
 			}
 			transport := &mcp.CommandTransport{Command: command}
-			mcpSession, err := client.Connect(ctx, transport, nil)
+			mcpSession, err := connectMCP(ctx, transport, config.DefaultMCPDiscoveryTimeout)
 			if err != nil {
 				xlog.Error("Failed to start MCP server", "error", err, "name", serverName, "command", command)
+				allSessions = append(allSessions, NamedSession{
+					Name:  serverName,
+					Type:  "stdio",
+					Error: fmt.Sprintf("startup failed: %v", err),
+				})
 				continue
 			}
 			xlog.Debug("[MCP stdio server] Connected", "name", serverName, "command", command)
@@ -282,6 +390,7 @@ func NamedSessionsFromMCPConfig(
 
 		namedCache.cache[name] = allSessions
 		namedCache.cancels[name] = cancel
+		namedCache.configHashes[name] = configHash
 	}
 
 	if len(enabledServers) == 0 {
@@ -308,6 +417,9 @@ func DiscoverMCPTools(ctx context.Context, sessions []NamedSession) ([]MCPToolIn
 	var result []MCPToolInfo
 
 	for _, ns := range sessions {
+		if ns.Session == nil {
+			continue
+		}
 		toolsResult, err := ns.Session.ListTools(ctx, nil)
 		if err != nil {
 			xlog.Error("Failed to list tools from MCP server", "error", err, "server", ns.Name)
@@ -401,18 +513,18 @@ func ExecuteMCPToolCall(ctx context.Context, tools []MCPToolInfo, toolName strin
 	return string(combined), nil
 }
 
-// ExecuteMCPToolCallRemote routes an MCP tool execution request to an agent worker via NATS.
+// ExecuteMCPToolCallRemote routes an MCP tool execution request to an agent worker.
 // Used in distributed mode when the frontend doesn't hold MCP sessions locally.
 func ExecuteMCPToolCallRemote(
 	ctx context.Context,
-	natsClient MCPNATSClient,
+	agentControl AgentControl,
 	modelName string,
 	remote config.MCPGenericConfig[config.MCPRemoteServers],
 	stdio config.MCPGenericConfig[config.MCPSTDIOServers],
 	toolName, arguments string,
 ) (string, error) {
-	if natsClient == nil {
-		return "", fmt.Errorf("NATS client not configured for distributed MCP")
+	if agentControl == nil {
+		return "", fmt.Errorf("agent control not configured for distributed MCP")
 	}
 
 	var args map[string]any
@@ -429,16 +541,12 @@ func ExecuteMCPToolCallRemote(
 		RemoteServers: remote,
 		StdioServers:  stdio,
 	}
-	reqData, _ := json.Marshal(req)
 
-	replyData, err := natsClient.Request(messaging.SubjectMCPToolExecute, reqData, config.DefaultMCPToolTimeout)
+	ctx, cancel := context.WithTimeout(ctx, config.DefaultMCPToolTimeout)
+	defer cancel()
+	resp, err := agentControl.ExecuteMCPTool(ctx, req)
 	if err != nil {
-		return "", fmt.Errorf("NATS MCP tool request failed: %w", err)
-	}
-
-	var resp mcpRemote.MCPToolResponse
-	if err := json.Unmarshal(replyData, &resp); err != nil {
-		return "", fmt.Errorf("unmarshal MCP reply: %w", err)
+		return "", fmt.Errorf("remote MCP tool request failed: %w", err)
 	}
 	if resp.Error != "" {
 		return "", fmt.Errorf("remote MCP tool error: %s", resp.Error)
@@ -446,17 +554,17 @@ func ExecuteMCPToolCallRemote(
 	return resp.Result, nil
 }
 
-// DiscoverMCPToolsRemote routes an MCP discovery request to an agent worker via NATS.
+// DiscoverMCPToolsRemote routes an MCP discovery request to an agent worker.
 // Returns server info and tool function schemas from the remote worker.
 func DiscoverMCPToolsRemote(
 	ctx context.Context,
-	natsClient MCPNATSClient,
+	agentControl AgentControl,
 	modelName string,
 	remote config.MCPGenericConfig[config.MCPRemoteServers],
 	stdio config.MCPGenericConfig[config.MCPSTDIOServers],
 ) (*mcpRemote.MCPDiscoveryResponse, error) {
-	if natsClient == nil {
-		return nil, fmt.Errorf("NATS client not configured for distributed MCP")
+	if agentControl == nil {
+		return nil, fmt.Errorf("agent control not configured for distributed MCP")
 	}
 
 	req := mcpRemote.MCPDiscoveryRequest{
@@ -464,21 +572,17 @@ func DiscoverMCPToolsRemote(
 		RemoteServers: remote,
 		StdioServers:  stdio,
 	}
-	reqData, _ := json.Marshal(req)
 
-	replyData, err := natsClient.Request(messaging.SubjectMCPDiscovery, reqData, config.DefaultMCPDiscoveryTimeout)
+	ctx, cancel := context.WithTimeout(ctx, config.DefaultMCPDiscoveryTimeout)
+	defer cancel()
+	resp, err := agentControl.DiscoverMCPTools(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("NATS MCP discovery request failed: %w", err)
-	}
-
-	var resp mcpRemote.MCPDiscoveryResponse
-	if err := json.Unmarshal(replyData, &resp); err != nil {
-		return nil, fmt.Errorf("unmarshal MCP discovery reply: %w", err)
+		return nil, fmt.Errorf("remote MCP discovery request failed: %w", err)
 	}
 	if resp.Error != "" {
 		return nil, fmt.Errorf("remote MCP discovery error: %s", resp.Error)
 	}
-	return &resp, nil
+	return resp, nil
 }
 
 // ListMCPServers returns server info with tool, prompt, and resource names for each session.
@@ -486,12 +590,19 @@ func ListMCPServers(ctx context.Context, sessions []NamedSession) ([]MCPServerIn
 	var result []MCPServerInfo
 	for _, ns := range sessions {
 		info := MCPServerInfo{
-			Name: ns.Name,
-			Type: ns.Type,
+			Name:  ns.Name,
+			Type:  ns.Type,
+			Tools: []string{},
+			Error: ns.Error,
+		}
+		if ns.Session == nil {
+			result = append(result, info)
+			continue
 		}
 		toolsResult, err := ns.Session.ListTools(ctx, nil)
 		if err != nil {
 			xlog.Error("Failed to list tools from MCP server", "error", err, "server", ns.Name)
+			info.Error = fmt.Sprintf("failed to list tools: %v", err)
 		} else {
 			for _, tool := range toolsResult.Tools {
 				info.Tools = append(info.Tools, tool.Name)
@@ -518,6 +629,12 @@ func ListMCPServers(ctx context.Context, sessions []NamedSession) ([]MCPServerIn
 
 		result = append(result, info)
 	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Type != result[j].Type {
+			return result[i].Type < result[j].Type
+		}
+		return result[i].Name < result[j].Name
+	})
 	return result, nil
 }
 
@@ -538,6 +655,9 @@ func DiscoverMCPPrompts(ctx context.Context, sessions []NamedSession) ([]MCPProm
 	var result []MCPPromptInfo
 
 	for _, ns := range sessions {
+		if ns.Session == nil {
+			continue
+		}
 		promptsResult, err := ns.Session.ListPrompts(ctx, nil)
 		if err != nil {
 			xlog.Error("Failed to list prompts from MCP server", "error", err, "server", ns.Name)
@@ -591,6 +711,9 @@ func DiscoverMCPResources(ctx context.Context, sessions []NamedSession) ([]MCPRe
 	var result []MCPResourceInfo
 
 	for _, ns := range sessions {
+		if ns.Session == nil {
+			continue
+		}
 		resourcesResult, err := ns.Session.ListResources(ctx, nil)
 		if err != nil {
 			xlog.Error("Failed to list resources from MCP server", "error", err, "server", ns.Name)
@@ -704,7 +827,11 @@ func CloseMCPSessions(modelName string) {
 	namedCache.mu.Lock()
 	if sessions, ok := namedCache.cache[modelName]; ok {
 		for _, ns := range sessions {
-			ns.Session.Close()
+			if ns.Session != nil {
+				if err := ns.Session.Close(); err != nil {
+					xlog.Debug("Failed to close MCP session", "server", ns.Name, "error", err)
+				}
+			}
 		}
 		delete(namedCache.cache, modelName)
 	}
@@ -712,6 +839,7 @@ func CloseMCPSessions(modelName string) {
 		cancel()
 		delete(namedCache.cancels, modelName)
 	}
+	delete(namedCache.configHashes, modelName)
 	namedCache.mu.Unlock()
 
 	xlog.Debug("Closed MCP sessions for model", "model", modelName)
@@ -736,7 +864,11 @@ func CloseAllMCPSessions() {
 	namedCache.mu.Lock()
 	for name, sessions := range namedCache.cache {
 		for _, ns := range sessions {
-			ns.Session.Close()
+			if ns.Session != nil {
+				if err := ns.Session.Close(); err != nil {
+					xlog.Debug("Failed to close MCP session", "server", ns.Name, "error", err)
+				}
+			}
 		}
 		if cancel, ok := namedCache.cancels[name]; ok {
 			cancel()
@@ -744,6 +876,7 @@ func CloseAllMCPSessions() {
 	}
 	namedCache.cache = make(map[string][]NamedSession)
 	namedCache.cancels = make(map[string]context.CancelFunc)
+	namedCache.configHashes = make(map[string][sha256.Size]byte)
 	namedCache.mu.Unlock()
 
 	xlog.Debug("Closed all MCP sessions")

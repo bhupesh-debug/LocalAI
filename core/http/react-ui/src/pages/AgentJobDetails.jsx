@@ -1,120 +1,111 @@
 import { useState, useEffect, useRef } from 'react'
-import { useParams, useNavigate, useOutletContext } from 'react-router-dom'
+// eslint-disable-next-line no-unused-vars
+import { Link, useParams, useNavigate, useOutletContext } from 'react-router-dom'
+import { useTranslation } from 'react-i18next'
 import { agentJobsApi } from '../utils/api'
+import { copyToClipboard } from '../utils/clipboard'
+import { isActive, jobDurationMs } from '../utils/agentJobs'
+import { firstLine, formatDuration } from '../utils/agentRuns'
+// eslint-disable-next-line no-unused-vars
+import { JobMark, GappedPrompt } from '../components/agents/JobBits'
+import { dayWhen } from '../utils/agentJobText'
+// eslint-disable-next-line no-unused-vars
+import { Chip } from '../components/agents/AgentBits'
+// eslint-disable-next-line no-unused-vars
+import Prose from '../components/agents/Prose'
+// eslint-disable-next-line no-unused-vars
 import LoadingSpinner from '../components/LoadingSpinner'
+import Icon from '../components/Icon'
+import './chat.css'
+import './agents.css'
+import './agent-jobs.css'
 
-const traceColors = {
-  reasoning: { bg: 'rgba(99,102,241,0.1)', border: 'rgba(99,102,241,0.3)', icon: 'fa-brain', color: 'var(--color-primary)' },
-  tool_call: { bg: 'rgba(139,92,246,0.1)', border: 'rgba(139,92,246,0.3)', icon: 'fa-wrench', color: 'var(--color-accent)' },
-  tool_result: { bg: 'rgba(34,197,94,0.1)', border: 'rgba(34,197,94,0.3)', icon: 'fa-check', color: 'var(--color-success)' },
-  status: { bg: 'rgba(245,158,11,0.1)', border: 'rgba(245,158,11,0.3)', icon: 'fa-info-circle', color: 'var(--color-warning)' },
-  stream_reasoning: { bg: 'rgba(99,102,241,0.06)', border: 'rgba(99,102,241,0.2)', icon: 'fa-lightbulb', color: 'var(--color-primary)' },
-  stream_content: { bg: 'rgba(59,130,246,0.08)', border: 'rgba(59,130,246,0.25)', icon: 'fa-pen-nib', color: 'var(--color-info, #3b82f6)' },
-  stream_tool_call: { bg: 'rgba(139,92,246,0.06)', border: 'rgba(139,92,246,0.2)', icon: 'fa-bolt', color: 'var(--color-accent)' },
+const TRACE_ICON = {
+  reasoning: 'brain', tool_call: 'wrench', tool_result: 'check', status: 'info',
+  stream_reasoning: 'lightbulb', stream_content: 'pencil', stream_tool_call: 'bolt',
 }
 
-function TraceCard({ trace, index }) {
-  const [expanded, setExpanded] = useState(true)
-  const style = traceColors[trace.type] || traceColors.status
+function clock(ts) {
+  const d = new Date(ts)
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
 
+// One entry of what the server recorded: a row that opens into what it holds.
+// eslint-disable-next-line no-unused-vars
+function TraceRow({ trace, index }) {
+  const { t } = useTranslation('agents')
+  const [open, setOpen] = useState(false)
+  const args = trace.arguments == null ? '' : (typeof trace.arguments === 'string' ? trace.arguments : JSON.stringify(trace.arguments, null, 2))
+  const title = trace.tool_name || t(`jobs.job.traceType.${trace.type}`, { defaultValue: trace.type || '?' })
+  const sub = trace.tool_name ? t(`jobs.job.traceType.${trace.type}`, { defaultValue: trace.type || '' }) : firstLine(trace.content, 110)
+  const has = !!(trace.content || args)
   return (
-    <div style={{
-      background: style.bg, border: `1px solid ${style.border}`,
-      borderRadius: 'var(--radius-md)', marginBottom: 'var(--spacing-sm)', overflow: 'hidden',
-    }}>
-      <button
-        onClick={() => setExpanded(!expanded)}
-        style={{
-          width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-          padding: 'var(--spacing-sm) var(--spacing-md)', background: 'none', border: 'none',
-          cursor: 'pointer', color: 'var(--color-text-primary)', textAlign: 'left',
-        }}
-      >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--spacing-sm)' }}>
-          <span style={{
-            fontSize: '0.6875rem', fontWeight: 700, color: 'var(--color-text-muted)',
-            background: 'var(--color-bg-secondary)', borderRadius: 'var(--radius-sm)',
-            padding: '2px 6px', minWidth: 24, textAlign: 'center',
-          }}>
-            {index + 1}
-          </span>
-          <i className={`fas ${style.icon}`} style={{ color: style.color, fontSize: '0.875rem' }} />
-          <span className="badge" style={{ background: style.border, color: style.color, fontSize: '0.6875rem' }}>
-            {trace.type || 'unknown'}
-          </span>
-          {trace.tool_name && (
-            <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: '0.75rem', color: 'var(--color-text-secondary)' }}>
-              {trace.tool_name}
-            </span>
-          )}
-          {trace.timestamp && (
-            <span style={{ fontSize: '0.6875rem', color: 'var(--color-text-muted)' }}>
-              {new Date(trace.timestamp).toLocaleTimeString()}
-            </span>
-          )}
-        </div>
-        <i className={`fas fa-chevron-${expanded ? 'up' : 'down'}`} style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)' }} />
+    <li className="aj-trace" data-open={open || undefined} data-type={trace.type}>
+      <button type="button" className="aj-trace__head" aria-expanded={open} disabled={!has} onClick={() => setOpen(v => !v)}>
+        <span className="aj-trace__icon" aria-hidden="true"><Icon name={TRACE_ICON[trace.type] || 'info'} /></span>
+        <span className="aj-trace__what">
+          <span className="aj-trace__title">{trace.tool_name ? <code>{title}</code> : title}</span>
+          {sub && <small>{sub}</small>}
+        </span>
+        <span className="ag-time">{clock(trace.timestamp)}</span>
+        <Icon name="chevron-right" className="aj-trace__chev" />
+        <span className="dk-sr-only">{index + 1}</span>
       </button>
-      {expanded && (
-        <div style={{ padding: '0 var(--spacing-md) var(--spacing-sm)', fontSize: '0.8125rem' }}>
-          {trace.content && (
-            <pre style={{
-              whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0,
-              fontFamily: "'JetBrains Mono', monospace", fontSize: '0.75rem',
-              color: 'var(--color-text-secondary)', lineHeight: 1.6,
-            }}>
-              {trace.content}
-            </pre>
-          )}
-          {trace.arguments && (
-            <div style={{ marginTop: 'var(--spacing-xs)' }}>
-              <span style={{ fontSize: '0.6875rem', fontWeight: 600, color: 'var(--color-text-muted)' }}>Arguments:</span>
-              <pre style={{
-                whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: '4px 0 0',
-                fontFamily: "'JetBrains Mono', monospace", fontSize: '0.75rem',
-                color: 'var(--color-text-secondary)', lineHeight: 1.5,
-              }}>
-                {typeof trace.arguments === 'string' ? trace.arguments : JSON.stringify(trace.arguments, null, 2)}
-              </pre>
-            </div>
+      {open && (
+        <div className="aj-trace__body">
+          {trace.content && <pre className="ag-pre">{trace.content}</pre>}
+          {args && (
+            <>
+              <span className="ag-eyebrow">{t('jobs.job.arguments')}</span>
+              <pre className="ag-pre">{args}</pre>
+            </>
           )}
         </div>
       )}
-    </div>
+    </li>
   )
 }
 
 export default function AgentJobDetails() {
   const { id } = useParams()
+  return <JobDocument key={id} id={id} />
+}
+
+// eslint-disable-next-line no-unused-vars
+function JobDocument({ id }) {
+  const { t } = useTranslation('agents')
   const navigate = useNavigate()
   const { addToast } = useOutletContext()
   const [job, setJob] = useState(null)
   const [task, setTask] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [again, setAgain] = useState(false)
   const intervalRef = useRef(null)
+  const taskRef = useRef(null)
 
   useEffect(() => {
-    if (!id) return
+    if (!id) return undefined
 
     const fetchJob = async () => {
       try {
         const data = await agentJobsApi.getJob(id)
         setJob(data)
 
-        // Fetch associated task data
-        if (data?.task_id && !task) {
+        // The task the job belongs to, for its name and prompt.
+        if (data?.task_id && !taskRef.current) {
+          taskRef.current = true
           agentJobsApi.getTask(data.task_id).then(setTask).catch(() => {})
         }
 
-        // Stop polling when job is done
-        if (data && data.status !== 'running' && data.status !== 'pending') {
+        // Stop polling when the job is done
+        if (data && !isActive(data)) {
           if (intervalRef.current) {
             clearInterval(intervalRef.current)
             intervalRef.current = null
           }
         }
       } catch (err) {
-        addToast(`Failed to load job: ${err.message}`, 'error')
+        addToast(t('jobs.job.loadFailed', { message: err.message }), 'error')
       } finally {
         setLoading(false)
       }
@@ -123,279 +114,167 @@ export default function AgentJobDetails() {
     fetchJob()
     intervalRef.current = setInterval(fetchJob, 2000)
     return () => { if (intervalRef.current) clearInterval(intervalRef.current) }
-  }, [id, addToast])
+  }, [id, addToast, t])
 
-  const handleCancel = async () => {
+  const cancel = async () => {
     try {
       await agentJobsApi.cancelJob(id)
-      addToast('Job cancelled', 'success')
+      addToast(t('jobs.job.cancelled'), 'success')
     } catch (err) {
-      addToast(`Cancel failed: ${err.message}`, 'error')
+      addToast(t('jobs.job.cancelFailed', { message: err.message }), 'error')
     }
   }
 
-  const formatDate = (d) => d ? new Date(d).toLocaleString() : '-'
-
-  const statusBadge = (status) => {
-    const map = {
-      pending: { cls: 'badge-warning', icon: 'fa-clock' },
-      running: { cls: 'badge-info', icon: 'fa-spinner fa-spin' },
-      completed: { cls: 'badge-success', icon: 'fa-check' },
-      failed: { cls: 'badge-error', icon: 'fa-xmark' },
-      cancelled: { cls: '', icon: 'fa-ban' },
+  const runAgain = async () => {
+    setAgain(true)
+    try {
+      const res = await agentJobsApi.rerunJob(job)
+      addToast(t('jobs.job.again'), 'success')
+      if (res?.job_id) navigate(`/app/agent-jobs/jobs/${res.job_id}`)
+    } catch (err) {
+      addToast(t('jobs.job.againFailed', { message: err.message }), 'error')
+    } finally {
+      setAgain(false)
     }
-    const m = map[status] || { cls: '', icon: 'fa-question' }
+  }
+
+  const copyLink = async () => {
+    const ok = await copyToClipboard(`${window.location.origin}${window.location.pathname}`)
+    addToast(t(ok ? 'jobs.job.linkCopied' : 'jobs.job.linkNotCopied'), ok ? 'success' : 'error', 2000)
+  }
+
+  if (loading) return <div className="page page--medium loading-center"><LoadingSpinner size="lg" /></div>
+  if (!job) {
     return (
-      <span className={`badge ${m.cls}`} style={{ fontSize: '0.875rem', padding: '4px 12px' }}>
-        <i className={`fas ${m.icon}`} style={{ marginRight: 4 }} /> {status || 'unknown'}
-      </span>
+      <div className="page page--medium ag-page aj-page">
+        <div className="ag-home">
+          <Link className="ag-back" to="/app/agent-jobs"><Icon name="arrow-left" /> {t('jobs.job.back')}</Link>
+          <div className="ag-empty" data-testid="job-missing">
+            <h1 className="ag-title">{t('jobs.job.notFoundTitle')}</h1>
+            <p>{t('jobs.job.notFoundText')}</p>
+          </div>
+        </div>
+      </div>
     )
   }
 
-  // Render the prompt with parameters substituted
-  const renderPrompt = () => {
-    if (!task?.prompt || !job?.parameters) return null
-    let rendered = task.prompt
-    Object.entries(job.parameters).forEach(([key, value]) => {
-      rendered = rendered.replace(new RegExp(`\\{\\{\\s*\\.${key}\\s*\\}\\}`, 'g'), value)
-    })
-    return rendered
-  }
-
-  if (loading) return <div className="page" style={{ display: 'flex', justifyContent: 'center', padding: 'var(--spacing-xl)' }}><LoadingSpinner size="lg" /></div>
-  if (!job) return (
-    <div className="page">
-      <div className="empty-state">
-        <div className="empty-state-icon"><i className="fas fa-search" /></div>
-        <h2 className="empty-state-title">Job not found</h2>
-        <button className="btn btn-secondary" onClick={() => navigate('/app/agent-jobs')}><i className="fas fa-arrow-left" /> Back</button>
-      </div>
-    </div>
-  )
-
-  const renderedPrompt = renderPrompt()
+  const active = isActive(job)
+  const failed = job.status === 'failed'
+  const took = jobDurationMs(job)
+  const params = job.parameters && typeof job.parameters === 'object' ? job.parameters : {}
+  const paramCount = Object.keys(params).length
   const traces = Array.isArray(job.traces) ? job.traces : []
+  const taskName = task?.name || job.task_id
+  const title = taskName ? t('jobs.job.title', { task: taskName, when: dayWhen(job.created_at) }) : t('jobs.job.titleUnknown', { id: job.id.slice(0, 8) })
+  const who = job.triggered_by || 'manual'
+  const media = [['images', job.images], ['videos', job.videos], ['audios', job.audios], ['files', job.files]].filter(([, list]) => list?.length)
+  const resultText = typeof job.result === 'string' ? job.result : job.result ? JSON.stringify(job.result, null, 2) : ''
+  const errorText = typeof job.error === 'string' ? job.error : job.error ? JSON.stringify(job.error, null, 2) : ''
 
   return (
-    <div className="page" style={{ maxWidth: 900 }}>
-      <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div>
-          <h1 className="page-title">Job Details</h1>
-          <p className="page-subtitle">Live status and reasoning traces</p>
+    <div className="page page--medium ag-page aj-page" data-testid="job-page" data-status={job.status}>
+      <article className="aj-doc">
+        <div className="ag-bar">
+          <Link className="ag-back" to="/app/agent-jobs"><Icon name="arrow-left" /> {t('jobs.job.back')}</Link>
+          <div className="ag-bar__acts">
+            {active
+              ? <button type="button" className="dk-btn dk-btn--secondary dk-btn--sm" onClick={cancel}><Icon name="ban" /> {t('jobs.job.cancel')}</button>
+              : <button type="button" className="dk-btn dk-btn--secondary dk-btn--sm" disabled={again || !job.task_id} onClick={runAgain}><Icon name="refresh" /> {t('jobs.job.runAgain')}</button>}
+            {job.task_id && <Link className="dk-btn dk-btn--ghost dk-btn--sm" to={`/app/agent-jobs/tasks/${job.task_id}`}><Icon name="edit" /> {t('jobs.job.openTask')}</Link>}
+          </div>
         </div>
-        <div style={{ display: 'flex', gap: 'var(--spacing-sm)' }}>
-          {(job.status === 'running' || job.status === 'pending') && (
-            <button className="btn btn-danger" onClick={handleCancel}>
-              <i className="fas fa-stop" /> Cancel
-            </button>
+
+        <header>
+          <h1 className="ag-doc__title">{title}</h1>
+          <div className="ag-doc__meta">
+            <JobMark status={job.status} />
+            <span>{t('jobs.job.startedBy', { who: t(`jobs.trigger.${who}`, { defaultValue: who }) })}</span>
+            {took != null && <span>{t('jobs.job.tookFor', { time: formatDuration(took) })}</span>}
+            <span className="ag-mono">{job.id}</span>
+          </div>
+          <div className="ag-doc__chips">
+            <span className="ag-addr">
+              <span className="ag-addr__text">{window.location.pathname}</span>
+              <button type="button" className="ag-btn-quiet" onClick={copyLink}>{t('jobs.job.copyLink')}</button>
+            </span>
+            {task?.model && <Chip mono title={t('jobs.task.model')}>{task.model}</Chip>}
+          </div>
+        </header>
+
+        <section className="ag-sec" aria-labelledby="aj-j-task">
+          <div className="ag-sec__head"><h2 id="aj-j-task">{t('jobs.job.task')}</h2></div>
+          {task?.prompt ? (
+            <>
+              <GappedPrompt prompt={task.prompt} params={params} />
+              <p className="ag-note">{paramCount > 0 ? t('jobs.job.taskNoteParams', { count: paramCount }) : t('jobs.job.taskNote')}</p>
+            </>
+          ) : (
+            <p className="ag-note">{t('jobs.job.taskUnknown')}</p>
           )}
-          <button className="btn btn-secondary" onClick={() => navigate('/app/agent-jobs')}>
-            <i className="fas fa-arrow-left" /> Back
-          </button>
-        </div>
-      </div>
+          {paramCount > 0 && !task?.prompt && (
+            <div className="ag-chips">
+              {Object.entries(params).map(([k, v]) => <span key={k} className="ag-chip ag-chip--mono"><span className="ag-chip__text">{k}={String(v)}</span></span>)}
+            </div>
+          )}
+        </section>
 
-      {/* Status Card */}
-      <div className="card" style={{ marginBottom: 'var(--spacing-md)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 'var(--spacing-md)' }}>
-          <h3 style={{ fontWeight: 600 }}>
-            <i className="fas fa-circle-info" style={{ color: 'var(--color-primary)', marginRight: 'var(--spacing-xs)' }} />
-            Job Status
-          </h3>
-          {statusBadge(job.status)}
-        </div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 'var(--spacing-md)' }}>
-          <div>
-            <span className="form-label">Job ID</span>
-            <p style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: '0.8125rem', wordBreak: 'break-all' }}>{job.id}</p>
-          </div>
-          <div>
-            <span className="form-label">Task</span>
-            <p>
-              {job.task_id ? (
-                <a onClick={() => navigate(`/app/agent-jobs/tasks/${job.task_id}`)} style={{ cursor: 'pointer', color: 'var(--color-primary)' }}>
-                  {job.task_id}
-                </a>
-              ) : '-'}
-            </p>
-          </div>
-          <div>
-            <span className="form-label">Triggered By</span>
-            <p style={{ fontSize: '0.875rem' }}>{job.triggered_by || 'manual'}</p>
-          </div>
-          <div>
-            <span className="form-label">Created</span>
-            <p style={{ fontSize: '0.8125rem', color: 'var(--color-text-secondary)' }}>{formatDate(job.created_at)}</p>
-          </div>
-          <div>
-            <span className="form-label">Started</span>
-            <p style={{ fontSize: '0.8125rem', color: 'var(--color-text-secondary)' }}>{formatDate(job.started_at)}</p>
-          </div>
-          <div>
-            <span className="form-label">Completed</span>
-            <p style={{ fontSize: '0.8125rem', color: 'var(--color-text-secondary)' }}>{formatDate(job.completed_at)}</p>
-          </div>
-        </div>
-      </div>
+        <section className="ag-sec" aria-labelledby="aj-j-out">
+          <div className="ag-sec__head"><h2 id="aj-j-out">{t('jobs.job.outcome')}</h2></div>
+          {job.status === 'completed' && (resultText ? <Prose text={resultText} /> : <p className="ag-sec__text">{t('jobs.job.outcomeNone')}</p>)}
+          {failed && (
+            <div className="ag-fail" role="alert" data-testid="job-failed">
+              <h3><Icon name="warning" /> {t('jobs.job.failTitle')}</h3>
+              <p>{t('jobs.job.failText')}</p>
+              <p className="ag-fail__why">{errorText || t('jobs.job.failNoMessage')}</p>
+              <div className="ag-fail__acts">
+                <button type="button" className="dk-btn dk-btn--primary" disabled={again || !job.task_id} onClick={runAgain}><Icon name="refresh" /> {t('jobs.job.runAgainNow')}</button>
+                {job.task_id && <Link className="ag-link" to={`/app/agent-jobs/tasks/${job.task_id}`}>{t('jobs.job.openTask')}</Link>}
+              </div>
+            </div>
+          )}
+          {active && (
+            <div className="ag-working" data-testid="job-working">
+              <Icon name="spinner" spin />
+              <span>{job.status === 'pending' ? t('jobs.job.outcomeWaiting') : t('jobs.job.outcomeWorking')}</span>
+            </div>
+          )}
+          {job.status === 'cancelled' && <p className="ag-sec__text">{t('jobs.job.outcomeCancelled')}</p>}
+        </section>
 
-      {/* Prompt Template */}
-      {task?.prompt && (
-        <div className="card" style={{ marginBottom: 'var(--spacing-md)' }}>
-          <h3 style={{ fontWeight: 600, marginBottom: 'var(--spacing-sm)' }}>
-            <i className="fas fa-file-lines" style={{ color: 'var(--color-accent)', marginRight: 'var(--spacing-xs)' }} />
-            Agent Prompt Template
-          </h3>
-          <pre style={{
-            background: 'var(--color-bg-primary)', padding: 'var(--spacing-sm)',
-            borderRadius: 'var(--radius-md)', fontSize: '0.8125rem',
-            whiteSpace: 'pre-wrap', overflow: 'auto', maxHeight: 200,
-          }}>
-            {task.prompt}
-          </pre>
-        </div>
-      )}
+        {media.length > 0 && (
+          <section className="ag-sec" aria-labelledby="aj-j-media">
+            <div className="ag-sec__head"><h2 id="aj-j-media">{t('jobs.job.media')}</h2></div>
+            <div className="ag-chips">
+              {media.map(([kind, list]) => <span key={kind} className="ag-chip"><span className="ag-chip__text">{`${list.length} ${t(`jobs.run.${kind}`).toLowerCase()}`}</span></span>)}
+            </div>
+          </section>
+        )}
 
-      {/* Cron Parameters */}
-      {job.triggered_by === 'cron' && job.cron_parameters && Object.keys(job.cron_parameters).length > 0 && (
-        <div className="card" style={{ marginBottom: 'var(--spacing-md)' }}>
-          <h3 style={{ fontWeight: 600, marginBottom: 'var(--spacing-sm)' }}>
-            <i className="fas fa-clock" style={{ color: 'var(--color-warning)', marginRight: 'var(--spacing-xs)' }} />
-            Cron Parameters
-          </h3>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--spacing-xs)' }}>
-            {Object.entries(job.cron_parameters).map(([k, v]) => (
-              <span key={k} className="badge badge-info" style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: '0.75rem' }}>
-                {k}={v}
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Job Parameters */}
-      {job.parameters && Object.keys(job.parameters).length > 0 && (
-        <div className="card" style={{ marginBottom: 'var(--spacing-md)' }}>
-          <h3 style={{ fontWeight: 600, marginBottom: 'var(--spacing-sm)' }}>
-            <i className="fas fa-sliders-h" style={{ color: 'var(--color-primary)', marginRight: 'var(--spacing-xs)' }} />
-            Job Parameters
-          </h3>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--spacing-xs)' }}>
-            {Object.entries(job.parameters).map(([k, v]) => (
-              <span key={k} className="badge badge-info" style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: '0.75rem' }}>
-                {k}={v}
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Rendered Prompt */}
-      {renderedPrompt && renderedPrompt !== task?.prompt && (
-        <div className="card" style={{ marginBottom: 'var(--spacing-md)' }}>
-          <h3 style={{ fontWeight: 600, marginBottom: 'var(--spacing-sm)' }}>
-            <i className="fas fa-spell-check" style={{ color: 'var(--color-success)', marginRight: 'var(--spacing-xs)' }} />
-            Rendered Prompt
-          </h3>
-          <pre style={{
-            background: 'var(--color-bg-primary)', padding: 'var(--spacing-sm)',
-            borderRadius: 'var(--radius-md)', fontSize: '0.8125rem',
-            whiteSpace: 'pre-wrap', overflow: 'auto', maxHeight: 300,
-          }}>
-            {renderedPrompt}
-          </pre>
-        </div>
-      )}
-
-      {/* Result */}
-      {job.result && (
-        <div className="card" style={{ marginBottom: 'var(--spacing-md)' }}>
-          <h3 style={{ fontWeight: 600, marginBottom: 'var(--spacing-sm)' }}>
-            <i className="fas fa-check-circle" style={{ color: 'var(--color-success)', marginRight: 'var(--spacing-xs)' }} />
-            Result
-          </h3>
-          <pre style={{
-            background: 'var(--color-bg-primary)', padding: 'var(--spacing-sm)',
-            borderRadius: 'var(--radius-md)', fontSize: '0.8125rem',
-            whiteSpace: 'pre-wrap', overflow: 'auto', maxHeight: 500,
-          }}>
-            {typeof job.result === 'string' ? job.result : JSON.stringify(job.result, null, 2)}
-          </pre>
-        </div>
-      )}
-
-      {/* Error */}
-      {job.error && (
-        <div className="card" style={{ marginBottom: 'var(--spacing-md)', borderColor: 'var(--color-error)' }}>
-          <h3 style={{ fontWeight: 600, marginBottom: 'var(--spacing-sm)', color: 'var(--color-error)' }}>
-            <i className="fas fa-exclamation-triangle" style={{ marginRight: 'var(--spacing-xs)' }} />
-            Error
-          </h3>
-          <pre style={{
-            background: 'var(--color-error-light)', padding: 'var(--spacing-sm)',
-            borderRadius: 'var(--radius-md)', fontSize: '0.8125rem',
-            whiteSpace: 'pre-wrap', overflow: 'auto', color: 'var(--color-error)',
-          }}>
-            {typeof job.error === 'string' ? job.error : JSON.stringify(job.error, null, 2)}
-          </pre>
-        </div>
-      )}
-
-      {/* Execution Traces */}
-      {traces.length > 0 && (
-        <div className="card" style={{ marginBottom: 'var(--spacing-md)' }}>
-          <h3 style={{ fontWeight: 600, marginBottom: 'var(--spacing-md)' }}>
-            <i className="fas fa-wave-square" style={{ color: 'var(--color-accent)', marginRight: 'var(--spacing-xs)' }} />
-            Execution Traces ({traces.length} steps)
-          </h3>
-          {traces.map((trace, i) => (
-            <TraceCard key={i} trace={trace} index={i} />
-          ))}
-        </div>
-      )}
-
-      {/* Running indicator */}
-      {(job.status === 'running' || job.status === 'pending') && (
-        <div style={{
-          textAlign: 'center', padding: 'var(--spacing-md)',
-          color: 'var(--color-text-muted)', fontSize: '0.8125rem',
-        }}>
-          <i className="fas fa-spinner fa-spin" style={{ marginRight: 'var(--spacing-xs)' }} />
-          Polling for updates every 2 seconds...
-        </div>
-      )}
-
-      {/* Webhook Status */}
-      {(job.webhook_sent !== undefined || job.webhook_error) && (
-        <div className="card">
-          <h3 style={{ fontWeight: 600, marginBottom: 'var(--spacing-md)' }}>
-            <i className="fas fa-globe" style={{ color: 'var(--color-primary)', marginRight: 'var(--spacing-xs)' }} />
-            Webhook Status
-          </h3>
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: 'var(--spacing-sm)',
-            background: 'var(--color-bg-primary)', borderRadius: 'var(--radius-md)',
-            padding: 'var(--spacing-sm)',
-          }}>
+        {(job.webhook_sent || job.webhook_error) && (
+          <section className="ag-sec" aria-labelledby="aj-j-del">
+            <div className="ag-sec__head"><h2 id="aj-j-del">{t('jobs.job.delivery')}</h2></div>
             {job.webhook_sent ? (
-              <>
-                <span className="badge badge-success"><i className="fas fa-check" /> Delivered</span>
-                {job.webhook_sent_at && (
-                  <span style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
-                    at {formatDate(job.webhook_sent_at)}
-                  </span>
-                )}
-              </>
-            ) : job.webhook_error ? (
-              <>
-                <span className="badge badge-error"><i className="fas fa-xmark" /> Failed</span>
-                <span style={{ fontSize: '0.75rem', color: 'var(--color-error)' }}>{job.webhook_error}</span>
-              </>
+              <p className="aj-note aj-note--ok" data-testid="job-webhook"><Icon name="check" /> {job.webhook_sent_at ? t('jobs.job.deliverySentAt', { when: dayWhen(job.webhook_sent_at) }) : t('jobs.job.deliverySent')}</p>
             ) : (
-              <span className="badge badge-warning"><i className="fas fa-clock" /> Pending</span>
+              <p className="aj-note aj-note--warn" data-testid="job-webhook"><Icon name="warning" /> {t('jobs.job.deliveryFailed', { message: job.webhook_error })}</p>
             )}
-          </div>
-        </div>
-      )}
+          </section>
+        )}
+
+        <section className="ag-sec" aria-labelledby="aj-j-steps">
+          <div className="ag-sec__head"><h2 id="aj-j-steps">{t('jobs.job.trace')}</h2></div>
+          {traces.length === 0 ? (
+            <p className="ag-note">{t('jobs.job.noTrace')}</p>
+          ) : (
+            <>
+              <p className="ag-note">{t('jobs.job.traceNote', { count: traces.length })}</p>
+              <ol className="aj-traces" data-testid="job-traces">
+                {traces.map((trace, i) => <TraceRow key={i} trace={trace} index={i} />)}
+              </ol>
+            </>
+          )}
+        </section>
+      </article>
     </div>
   )
 }

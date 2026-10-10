@@ -5,15 +5,21 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 
+	"github.com/mudler/LocalAI/pkg/model"
+
+	corebackend "github.com/mudler/LocalAI/core/backend"
 	"github.com/mudler/LocalAI/core/http/auth"
 	"github.com/mudler/LocalAI/core/http/endpoints/localai"
 
@@ -22,9 +28,10 @@ import (
 
 	"github.com/mudler/LocalAI/core/application"
 	"github.com/mudler/LocalAI/core/schema"
+	"github.com/mudler/LocalAI/core/services/distributed"
 	"github.com/mudler/LocalAI/core/services/finetune"
 	"github.com/mudler/LocalAI/core/services/galleryop"
-	"github.com/mudler/LocalAI/core/services/monitoring"
+	"github.com/mudler/LocalAI/core/services/messaging"
 	"github.com/mudler/LocalAI/core/services/nodes"
 	"github.com/mudler/LocalAI/core/services/quantization"
 
@@ -42,6 +49,104 @@ var embedDirStatic embed.FS
 var reactUI embed.FS
 
 var quietPaths = []string{"/api/operations", "/api/resources", "/healthz", "/readyz"}
+
+// immutableAssetCacheControl is the Cache-Control served for content-hashed
+// build output. The filename changes whenever the content does, so a one-year
+// TTL plus `immutable` is safe and removes both the re-download and the
+// conditional revalidation round-trip.
+const immutableAssetCacheControl = "public, max-age=31536000, immutable"
+
+func defaultBodyLimitSkipper(c echo.Context) bool {
+	// Remeshing accepts generated GLBs that routinely exceed the default
+	// upload limit. The route has its own tighter, format-specific limit.
+	return c.Request().Method == http.MethodPost && c.Path() == "/3d/remesh"
+}
+
+// applyModelLoadCooldown maps a ModelLoadCooldownError anywhere in err's chain
+// to HTTP 503 with a Retry-After header (whole seconds, floor 1), so a client
+// polling a model whose load recently failed backs off instead of triggering a
+// fresh backend start. If err is not a cooldown error, code is returned as-is.
+func applyModelLoadCooldown(err error, code int, c echo.Context) int {
+	var coolErr *model.ModelLoadCooldownError
+	if !errors.As(err, &coolErr) {
+		return code
+	}
+	secs := int(math.Ceil(coolErr.RetryAfter.Seconds()))
+	if secs < 1 {
+		secs = 1
+	}
+	c.Response().Header().Set("Retry-After", strconv.Itoa(secs))
+	return http.StatusServiceUnavailable
+}
+
+func applyBackendAdmission(err error, code int, c echo.Context) int {
+	var capacityErr *corebackend.BackendAdmissionError
+	if !errors.As(err, &capacityErr) {
+		return code
+	}
+	c.Response().Header().Set("Retry-After", strconv.Itoa(int(capacityErr.RetryAfter.Seconds())))
+	return http.StatusTooManyRequests
+}
+
+// applyNoAvailableNodes maps scheduler "no available nodes" errors to 503.
+// When the cluster has no healthy node to serve a model — all are full, a
+// node selector excludes every candidate, or eviction could not free a slot —
+// the request is retryable, not a server bug. Without this the error fell
+// through to 500, which tells clients something is broken when they just
+// need to wait for a node.
+func applyNoAvailableNodes(err error, code int) int {
+	if errors.Is(err, nodes.ErrNoAvailableNodes) {
+		return http.StatusServiceUnavailable
+	}
+	return code
+}
+
+// respondModelLoading answers a request whose model is still cold-loading with
+// 503, a Retry-After header and the live `loading` object, reporting true when
+// it handled the error.
+//
+// The distinction from applyModelLoadCooldown matters: a cooldown means "the
+// last load FAILED, back off", this means "the load is progressing, here is how
+// far it got". Both used to look like the same anonymous error, so an operator
+// watching a 35 GB model stage normally onto a new worker saw only failures.
+func respondModelLoading(err error, c echo.Context) bool {
+	var loadErr *nodes.ModelLoadingError
+	if !errors.As(err, &loadErr) {
+		return false
+	}
+	setModelLoadingRetryAfter(loadErr, c)
+	status := loadErr.Status
+	if jerr := c.JSON(http.StatusServiceUnavailable, schema.ModelLoadingResponse{
+		Error: &schema.APIError{
+			Message: loadErr.Error(),
+			Code:    "model_loading",
+			Type:    "model_loading",
+		},
+		Loading: &status,
+	}); jerr != nil {
+		xlog.Debug("Failed to write model-loading response", "error", jerr)
+	}
+	return true
+}
+
+// applyModelLoading is the body-less half of respondModelLoading, for the
+// opaque-errors handler: status and Retry-After only.
+func applyModelLoading(err error, code int, c echo.Context) int {
+	var loadErr *nodes.ModelLoadingError
+	if !errors.As(err, &loadErr) {
+		return code
+	}
+	setModelLoadingRetryAfter(loadErr, c)
+	return http.StatusServiceUnavailable
+}
+
+func setModelLoadingRetryAfter(loadErr *nodes.ModelLoadingError, c echo.Context) {
+	secs := int(math.Ceil(loadErr.RetryAfter.Seconds()))
+	if secs < 1 {
+		secs = 1
+	}
+	c.Response().Header().Set("Retry-After", strconv.Itoa(secs))
+}
 
 // @title LocalAI API
 // @version 2.0.0
@@ -94,7 +199,10 @@ func API(application *application.Application) (*echo.Echo, error) {
 
 	// Set body limit
 	if application.ApplicationConfig().UploadLimitMB > 0 {
-		e.Use(middleware.BodyLimit(fmt.Sprintf("%dM", application.ApplicationConfig().UploadLimitMB)))
+		e.Use(middleware.BodyLimitWithConfig(middleware.BodyLimitConfig{
+			Limit:   fmt.Sprintf("%dM", application.ApplicationConfig().UploadLimitMB),
+			Skipper: defaultBodyLimitSkipper,
+		}))
 	}
 
 	// SPA fallback handler, set later when React UI is available
@@ -103,11 +211,17 @@ func API(application *application.Application) (*echo.Echo, error) {
 	// Set error handler
 	if !application.ApplicationConfig().OpaqueErrors {
 		e.HTTPErrorHandler = func(err error, c echo.Context) {
+			if respondModelLoading(err, c) {
+				return
+			}
 			code := http.StatusInternalServerError
 			var he *echo.HTTPError
 			if errors.As(err, &he) {
 				code = he.Code
 			}
+			code = applyModelLoadCooldown(err, code, c)
+			code = applyBackendAdmission(err, code, c)
+			code = applyNoAvailableNodes(err, code)
 
 			// Handle 404 errors: serve React SPA for HTML requests, JSON otherwise
 			if code == http.StatusNotFound {
@@ -124,8 +238,13 @@ func API(application *application.Application) (*echo.Echo, error) {
 			}
 
 			// Send custom error page
+			errType := ""
+			var capErr *corebackend.BackendAdmissionError
+			if errors.As(err, &capErr) {
+				errType = "rate_limit_error"
+			}
 			c.JSON(code, schema.ErrorResponse{
-				Error: &schema.APIError{Message: err.Error(), Code: code},
+				Error: &schema.APIError{Message: err.Error(), Code: code, Type: errType},
 			})
 		}
 	} else {
@@ -135,6 +254,12 @@ func API(application *application.Application) (*echo.Echo, error) {
 			if errors.As(err, &he) {
 				code = he.Code
 			}
+			code = applyModelLoadCooldown(err, code, c)
+			code = applyBackendAdmission(err, code, c)
+			// Opaque errors deliberately withhold the body, so a still-loading
+			// model gets the status and Retry-After but no progress detail.
+			code = applyModelLoading(err, code, c)
+			code = applyNoAvailableNodes(err, code)
 			c.NoContent(code)
 		}
 	}
@@ -149,6 +274,18 @@ func API(application *application.Application) (*echo.Echo, error) {
 	// Middleware - StripPathPrefix must be registered early as it uses Rewrite which runs before routing
 	e.Pre(httpMiddleware.StripPathPrefix())
 
+	// Stamp the configured external base URL into each request context so
+	// middleware.BaseURL can treat it as authoritative for self-referential
+	// links. Registered as Pre so it runs before routing and handlers.
+	if extBaseURL := application.ApplicationConfig().ExternalBaseURL; extBaseURL != "" {
+		e.Pre(func(next echo.HandlerFunc) echo.HandlerFunc {
+			return func(c echo.Context) error {
+				c.Set("_external_base_url", extBaseURL)
+				return next(c)
+			}
+		})
+	}
+
 	e.Pre(middleware.RemoveTrailingSlash())
 
 	if application.ApplicationConfig().MachineTag != "" {
@@ -160,12 +297,39 @@ func API(application *application.Application) (*echo.Echo, error) {
 		})
 	}
 
+	// Security headers (CSP, X-Content-Type-Options, X-Frame-Options,
+	// Referrer-Policy). Set early so every response — including 404s and
+	// errors — picks them up.
+	e.Use(httpMiddleware.SecurityHeaders())
+
+	// Gzip responses. Registered before the tracing and handler middlewares so
+	// the response writer it installs sits underneath them: the trace buffer
+	// keeps capturing plaintext while the wire carries the compressed bytes.
+	if !application.ApplicationConfig().DisableHTTPCompression {
+		e.Use(httpMiddleware.Compression(application.ApplicationConfig().HTTPCompressionMinLength))
+	}
+
 	// Custom logger middleware using xlog
 	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			req := c.Request()
 			res := c.Response()
 			err := next(c)
+
+			// Echo's central HTTPErrorHandler runs *after* this middleware
+			// returns, so res.Status still reads the default 200 here when a
+			// handler returned an error without writing a response. Mirror
+			// echo.DefaultHTTPErrorHandler's status derivation so the access
+			// log reflects the status the client actually receives — without
+			// this, every silent handler error logs as 200.
+			status := res.Status
+			if err != nil && !res.Committed {
+				status = http.StatusInternalServerError
+				var he *echo.HTTPError
+				if errors.As(err, &he) {
+					status = he.Code
+				}
+			}
 
 			// Fix for #7989: Reduce log verbosity of Web UI polling, resources API, and health checks
 			// These paths are logged at DEBUG level (hidden by default) instead of INFO.
@@ -177,10 +341,10 @@ func API(application *application.Application) (*echo.Echo, error) {
 				}
 			}
 
-			if isQuietPath && res.Status == 200 {
-				xlog.Debug("HTTP request", "method", req.Method, "path", req.URL.Path, "status", res.Status)
+			if isQuietPath && status == 200 {
+				xlog.Debug("HTTP request", "method", req.Method, "path", req.URL.Path, "status", status)
 			} else {
-				xlog.Info("HTTP request", "method", req.Method, "path", req.URL.Path, "status", res.Status)
+				xlog.Info("HTTP request", "method", req.Method, "path", req.URL.Path, "status", status)
 			}
 			return err
 		}
@@ -191,23 +355,22 @@ func API(application *application.Application) (*echo.Echo, error) {
 		e.Use(middleware.Recover())
 	}
 
-	// Metrics middleware
-	if !application.ApplicationConfig().DisableMetrics {
-		metricsService, err := monitoring.NewLocalAIMetricsService()
-		if err != nil {
-			return nil, err
-		}
-
-		if metricsService != nil {
-			e.Use(localai.LocalAIMetricsAPIMiddleware(metricsService))
-			e.Server.RegisterOnShutdown(func() {
-				metricsService.Shutdown()
-			})
-		}
+	// Metrics middleware. The metric service was created in
+	// application.start() so the OTel global provider is set before any
+	// counter is registered (the routing-module billing recorder relies
+	// on this). We reuse that instance here rather than calling
+	// monitoring.NewLocalAIMetricsService a second time, which would
+	// create a second provider, second prometheus exporter, and orphan
+	// whichever instance lost the SetMeterProvider race.
+	if metricsService := application.MetricsService(); metricsService != nil {
+		e.Use(localai.LocalAIMetricsAPIMiddleware(metricsService))
+		e.Server.RegisterOnShutdown(func() {
+			_ = metricsService.Shutdown()
+		})
 	}
 
 	// Health Checks should always be exempt from auth, so register these first
-	routes.HealthRoutes(e)
+	routes.HealthRoutes(e, application.Ready)
 
 	// Build auth middleware: use the new auth.Middleware when auth is enabled or
 	// as a unified replacement for the legacy key-auth middleware.
@@ -236,20 +399,27 @@ func API(application *application.Application) (*echo.Echo, error) {
 		audioPath := filepath.Join(application.ApplicationConfig().GeneratedContentDir, "audio")
 		imagePath := filepath.Join(application.ApplicationConfig().GeneratedContentDir, "images")
 		videoPath := filepath.Join(application.ApplicationConfig().GeneratedContentDir, "videos")
+		threeDPath := filepath.Join(application.ApplicationConfig().GeneratedContentDir, "3d")
 
 		os.MkdirAll(audioPath, 0750)
 		os.MkdirAll(imagePath, 0750)
 		os.MkdirAll(videoPath, 0750)
+		_ = os.MkdirAll(threeDPath, 0750)
+
+		// Go's built-in MIME table has no .glb entry and minimal containers
+		// ship no /etc/mime.types, so generated GLBs would otherwise be
+		// served as application/octet-stream.
+		_ = mime.AddExtensionType(".glb", "model/gltf-binary")
 
 		e.Static("/generated-audio", audioPath)
 		e.Static("/generated-images", imagePath)
 		e.Static("/generated-videos", videoPath)
+		e.Static("/generated-3d", threeDPath)
 	}
 
-	// Initialize usage recording when auth DB is available
-	if application.AuthDB() != nil {
-		httpMiddleware.InitUsageRecorder(application.AuthDB())
-	}
+	// Usage recording is initialised in application/startup.go and
+	// surfaced via application.StatsRecorder(); routes wire UsageMiddleware
+	// against that recorder regardless of auth state.
 
 	// Auth is applied to _all_ endpoints. Filtering out endpoints to bypass is
 	// the role of the exempt-path logic inside the middleware.
@@ -262,13 +432,19 @@ func API(application *application.Application) (*echo.Echo, error) {
 		e.Use(auth.RequireQuota(application.AuthDB()))
 	}
 
-	// CORS middleware
+	// CORS middleware. When CORS=true the operator must also specify the
+	// allowed origins; an empty allowlist would otherwise let Echo fall back
+	// to AllowOrigins=["*"], which is almost never what someone enabling
+	// "strict CORS" intended.
 	if application.ApplicationConfig().CORS {
-		corsConfig := middleware.CORSConfig{}
-		if application.ApplicationConfig().CORSAllowOrigins != "" {
-			corsConfig.AllowOrigins = strings.Split(application.ApplicationConfig().CORSAllowOrigins, ",")
+		if application.ApplicationConfig().CORSAllowOrigins == "" {
+			xlog.Warn("LOCALAI_CORS=true but LOCALAI_CORS_ALLOW_ORIGINS is empty; refusing to register a wildcard CORS policy. Set the allowlist or unset LOCALAI_CORS.")
+		} else {
+			corsConfig := middleware.CORSConfig{
+				AllowOrigins: strings.Split(application.ApplicationConfig().CORSAllowOrigins, ","),
+			}
+			e.Use(middleware.CORSWithConfig(corsConfig))
 		}
-		e.Use(middleware.CORSWithConfig(corsConfig))
 	} else {
 		e.Use(middleware.CORS())
 	}
@@ -281,34 +457,7 @@ func API(application *application.Application) (*echo.Echo, error) {
 	// could never read a token to send back.
 	if !application.ApplicationConfig().DisableCSRF {
 		xlog.Debug("Enabling CSRF middleware (Sec-Fetch-Site mode)")
-		e.Use(middleware.CSRFWithConfig(middleware.CSRFConfig{
-			Skipper: func(c echo.Context) bool {
-				// Skip CSRF for API clients using auth headers (may be cross-origin)
-				if c.Request().Header.Get("Authorization") != "" {
-					return true
-				}
-				if c.Request().Header.Get("x-api-key") != "" || c.Request().Header.Get("xi-api-key") != "" {
-					return true
-				}
-				// Skip when Sec-Fetch-Site header is absent (older browsers, reverse
-				// proxies that strip the header). The SameSite=Lax cookie attribute
-				// provides baseline CSRF protection for these clients.
-				if c.Request().Header.Get("Sec-Fetch-Site") == "" {
-					return true
-				}
-				return false
-			},
-			// Allow same-site requests (subdomains / different ports) in addition
-			// to same-origin which Echo already permits by default.
-			AllowSecFetchSiteFunc: func(c echo.Context) (bool, error) {
-				secFetchSite := c.Request().Header.Get("Sec-Fetch-Site")
-				if secFetchSite == "same-site" {
-					return true, nil
-				}
-				// cross-site: block
-				return false, nil
-			},
-		}))
+		e.Use(auth.CSRFMiddleware())
 	}
 
 	// Admin middleware: enforces admin role when auth is enabled, no-op otherwise
@@ -326,9 +475,18 @@ func API(application *application.Application) (*echo.Echo, error) {
 	mcpJobsMw := auth.RequireFeature(application.AuthDB(), auth.FeatureMCPJobs)
 
 	requestExtractor := httpMiddleware.NewRequestExtractor(application.ModelConfigLoader(), application.ModelLoader(), application.ApplicationConfig())
+	requestExtractor.SetFailoverManager(application.FailoverManager())
 
 	// Register auth routes (login, callback, API keys, user management)
 	routes.RegisterAuthRoutes(e, application)
+
+	// Register routing-module usage endpoints. Unlike /api/auth/usage
+	// these go through the StatsRecorder and work in no-auth single-user
+	// mode by attributing requests to the synthetic "local" user.
+	routes.RegisterUsageRoutes(e, application)
+	routes.RegisterPIIRoutes(e, application)
+	routes.RegisterSystemOneRoutes(e, application)
+	routes.RegisterMiddlewareRoutes(e, application)
 
 	routes.RegisterElevenLabsRoutes(e, requestExtractor, application.ModelConfigLoader(), application.ModelLoader(), application.ApplicationConfig())
 
@@ -336,6 +494,20 @@ func API(application *application.Application) (*echo.Echo, error) {
 	var opcache *galleryop.OpCache
 	if !application.ApplicationConfig().DisableWebUI {
 		opcache = galleryop.NewOpCache(application.GalleryService())
+		// In distributed mode, wire the NATS client + gallery store so this
+		// replica's OpCache stays in sync with peers — without this the
+		// /api/operations endpoint returns whatever this single replica
+		// happened to admit, and a load-balanced UI poll alternates between
+		// "operation visible" and "operation gone" between replicas.
+		if d := application.Distributed(); d != nil {
+			opcache.SetMessagingClient(d.Nats)
+			if d.DistStores != nil && d.DistStores.Gallery != nil {
+				opcache.SetGalleryStore(d.DistStores.Gallery)
+			}
+			if err := opcache.Start(application.ApplicationConfig().Context); err != nil {
+				xlog.Warn("OpCache distributed subscribe failed; running standalone", "error", err)
+			}
+		}
 	}
 
 	mcpMw := auth.RequireFeature(application.AuthDB(), auth.FeatureMCP)
@@ -343,40 +515,63 @@ func API(application *application.Application) (*echo.Echo, error) {
 	routes.RegisterAgentPoolRoutes(e, application, agentsMw, skillsMw, collectionsMw)
 	// Fine-tuning routes
 	fineTuningMw := auth.RequireFeature(application.AuthDB(), auth.FeatureFineTuning)
+	// In distributed mode pass the shared NATS client + PostgreSQL store so
+	// fine-tune jobs stay consistent across replicas (the SyncedMap broadcasts
+	// mutations and hydrates from the DB); standalone passes nil for both.
+	var ftNats messaging.MessagingClient
+	var ftStore *distributed.FineTuneStore
+	if d := application.Distributed(); d != nil {
+		ftNats = d.Nats
+		if d.DistStores != nil && d.DistStores.FineTune != nil {
+			ftStore = d.DistStores.FineTune
+		}
+	}
 	ftService := finetune.NewFineTuneService(
 		application.ApplicationConfig(),
 		application.ModelLoader(),
 		application.ModelConfigLoader(),
+		ftNats,
+		ftStore,
 	)
-	if d := application.Distributed(); d != nil {
-		ftService.SetNATSClient(d.Nats)
-		if d.DistStores != nil && d.DistStores.FineTune != nil {
-			ftService.SetFineTuneStore(d.DistStores.FineTune)
-		}
-	}
-	routes.RegisterFineTuningRoutes(e, ftService, application.ApplicationConfig(), fineTuningMw)
+	routes.RegisterFineTuningRoutes(e, ftService, application.ApplicationConfig(), application, fineTuningMw)
 
 	// Quantization routes
 	quantizationMw := auth.RequireFeature(application.AuthDB(), auth.FeatureQuantization)
+	// In distributed mode pass the shared NATS client + PostgreSQL store so
+	// quantization jobs stay consistent across replicas (the SyncedMap broadcasts
+	// mutations and hydrates from the DB); standalone passes nil for both.
+	var quantNats messaging.MessagingClient
+	var quantStore *distributed.QuantStore
+	if d := application.Distributed(); d != nil {
+		quantNats = d.Nats
+		if d.DistStores != nil && d.DistStores.Quant != nil {
+			quantStore = d.DistStores.Quant
+		}
+	}
 	qService := quantization.NewQuantizationService(
 		application.ApplicationConfig(),
 		application.ModelLoader(),
 		application.ModelConfigLoader(),
+		quantNats,
+		quantStore,
 	)
-	routes.RegisterQuantizationRoutes(e, qService, application.ApplicationConfig(), quantizationMw)
+	routes.RegisterQuantizationRoutes(e, qService, application.ApplicationConfig(), application, quantizationMw)
 
 	// Node management routes (distributed mode)
 	distCfg := application.ApplicationConfig().Distributed
 	var registry *nodes.NodeRegistry
 	var remoteUnloader nodes.NodeCommandSender
+	var workerHTTPDial nodes.WorkerNetDialerFor
 	if d := application.Distributed(); d != nil {
 		registry = d.Registry
+		workerHTTPDial = d.WorkerHTTPDial
 		if d.Router != nil {
 			remoteUnloader = d.Router.Unloader()
 		}
 	}
-	routes.RegisterNodeSelfServiceRoutes(e, registry, distCfg.RegistrationToken, distCfg.AutoApproveNodes, application.AuthDB(), application.ApplicationConfig().Auth.APIKeyHMACSecret)
-	routes.RegisterNodeAdminRoutes(e, registry, remoteUnloader, adminMiddleware, application.AuthDB(), application.ApplicationConfig().Auth.APIKeyHMACSecret, application.ApplicationConfig().Distributed.RegistrationToken)
+	natsCfg := distCfg.NatsAuthConfig()
+	routes.RegisterNodeSelfServiceRoutes(e, registry, distCfg.RegistrationToken, distCfg.AutoApproveNodes, application.AuthDB(), application.ApplicationConfig().Auth.APIKeyHMACSecret, natsCfg)
+	routes.RegisterNodeAdminRoutes(e, registry, remoteUnloader, application.GalleryService(), opcache, application.ApplicationConfig(), adminMiddleware, application.AuthDB(), application.ApplicationConfig().Auth.APIKeyHMACSecret, application.ApplicationConfig().Distributed.RegistrationToken, natsCfg, workerHTTPDial)
 
 	// Distributed SSE routes (job progress + agent events via NATS)
 	if d := application.Distributed(); d != nil {
@@ -409,11 +604,35 @@ func API(application *application.Application) (*echo.Echo, error) {
 				if err != nil {
 					return c.String(http.StatusNotFound, "React UI not built")
 				}
-				// Inject <base href> for reverse-proxy support
+				// index.html names the content-hashed bundles, so it must never
+				// be cached: a stale copy pins the browser to the previous
+				// deploy's assets.
+				c.Response().Header().Set("Cache-Control", "no-cache")
+				// Inject <base href> for reverse-proxy support; baseURL comes
+				// from attacker-controllable Host / X-Forwarded-Host headers.
 				baseURL := httpMiddleware.BaseURL(c)
 				if baseURL != "" {
-					baseTag := `<base href="` + baseURL + `" />`
+					baseTag := `<base href="` + httpMiddleware.SecureBaseHref(baseURL) + `" />`
 					indexHTML = []byte(strings.Replace(string(indexHTML), "<head>", "<head>\n  "+baseTag, 1))
+				}
+				// <base href> only changes how relative URLs resolve; path-absolute
+				// URLs (those starting with `/`) still resolve against the origin
+				// and would bypass the reverse-proxy prefix. Rewrite the internal
+				// path-absolute references emitted by the build so the browser
+				// requests them through the proxy under the prefix.
+				//
+				// HTML-escape the prefix before interpolating it into attributes:
+				// BasePathPrefix already gates X-Forwarded-Prefix via
+				// SafeForwardedPrefix, but the validator only blocks open-redirect
+				// shapes (// prefix, backslashes, control chars), not attribute
+				// breakout characters like `"`. Escaping makes this resilient
+				// even if the validator ever loosens.
+				if prefix := httpMiddleware.BasePathPrefix(c); prefix != "/" {
+					safePrefix := httpMiddleware.SecureBaseHref(prefix)
+					html := string(indexHTML)
+					html = strings.ReplaceAll(html, `="/assets/`, `="`+safePrefix+`assets/`)
+					html = strings.ReplaceAll(html, `="/favicon.svg"`, `="`+safePrefix+`favicon.svg"`)
+					indexHTML = []byte(html)
 				}
 				return c.HTMLBlob(http.StatusOK, indexHTML)
 			}
@@ -425,9 +644,11 @@ func API(application *application.Application) (*echo.Echo, error) {
 			e.GET("/app", serveIndex)
 			e.GET("/app/*", serveIndex)
 
-			// prefixRedirect performs a redirect that preserves X-Forwarded-Prefix for reverse-proxy support.
+			// prefixRedirect performs a redirect that preserves X-Forwarded-Prefix
+			// for reverse-proxy support. The prefix is forgeable on misconfigured
+			// proxy chains, so reject anything that isn't a same-origin path.
 			prefixRedirect := func(c echo.Context, target string) error {
-				if prefix := c.Request().Header.Get("X-Forwarded-Prefix"); prefix != "" {
+				if prefix, ok := httpMiddleware.SafeForwardedPrefix(c.Request().Header.Get("X-Forwarded-Prefix")); ok {
 					target = strings.TrimSuffix(prefix, "/") + target
 				}
 				return c.Redirect(http.StatusMovedPermanently, target)
@@ -447,29 +668,57 @@ func API(application *application.Application) (*echo.Echo, error) {
 				return prefixRedirect(c, "/app/"+p)
 			})
 
-			// Serve React static assets (JS, CSS, etc.)
-			serveReactAsset := func(c echo.Context) error {
-				p := "assets/" + c.Param("*")
-				f, err := reactFS.Open(p)
-				if err == nil {
-					defer f.Close()
-					stat, statErr := f.Stat()
-					if statErr == nil && !stat.IsDir() {
-						contentType := mime.TypeByExtension(filepath.Ext(p))
-						if contentType == "" {
-							contentType = echo.MIMEOctetStream
+			// Serve React static assets (JS, CSS, etc.) and i18n locale JSONs
+			// from the embedded React build. cacheControl is stamped on every
+			// hit so the browser can reuse the bytes instead of re-fetching
+			// ~1.8 MB of bundle on each navigation.
+			serveReactSubdir := func(subdir, cacheControl string) echo.HandlerFunc {
+				return func(c echo.Context) error {
+					p := subdir + "/" + c.Param("*")
+					f, err := reactFS.Open(p)
+					if err == nil {
+						defer f.Close()
+						stat, statErr := f.Stat()
+						if statErr == nil && !stat.IsDir() {
+							contentType := mime.TypeByExtension(filepath.Ext(p))
+							if contentType == "" {
+								contentType = echo.MIMEOctetStream
+							}
+							if cacheControl != "" {
+								c.Response().Header().Set("Cache-Control", cacheControl)
+							}
+							return c.Stream(http.StatusOK, contentType, f)
 						}
-						return c.Stream(http.StatusOK, contentType, f)
 					}
+					return echo.NewHTTPError(http.StatusNotFound)
 				}
-				return echo.NewHTTPError(http.StatusNotFound)
 			}
-			e.GET("/assets/*", serveReactAsset)
+			// Vite content-hashes everything under /assets (Manage-DrwQK63f.js),
+			// so a given URL can never change content: cache it for a year and
+			// skip revalidation entirely. Locale JSONs keep stable names, so
+			// they only get a short TTL.
+			e.GET("/assets/*", serveReactSubdir("assets", immutableAssetCacheControl))
+			e.GET("/locales/*", serveReactSubdir("locales", "public, max-age=300"))
 		}
 	}
 	routes.RegisterJINARoutes(e, requestExtractor, application.ModelConfigLoader(), application.ModelLoader(), application.ApplicationConfig())
 
 	// Note: 404 handling is done via HTTPErrorHandler above, no need for catch-all route
+
+	// HTTP server timeouts.
+	//
+	//   - ReadHeaderTimeout: bounds the slow-headers Slowloris case. 30s is
+	//     enough for a real client on a poor connection but cuts off a
+	//     drip-feeding attacker.
+	//   - IdleTimeout: bounds idle keep-alive connections.
+	//
+	// We deliberately leave ReadTimeout and WriteTimeout at 0:
+	//   - Request bodies can be multi-GB model/dataset uploads.
+	//   - Chat-completion and SSE responses can stream for many minutes.
+	// Operators who need stricter limits should front the server with a
+	// reverse proxy that terminates slow clients per-request.
+	e.Server.ReadHeaderTimeout = 30 * time.Second
+	e.Server.IdleTimeout = 120 * time.Second
 
 	// Log startup message
 	e.Server.RegisterOnShutdown(func() {

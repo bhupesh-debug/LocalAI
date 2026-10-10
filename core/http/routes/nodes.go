@@ -6,8 +6,11 @@ import (
 	"strings"
 
 	"github.com/labstack/echo/v4"
+	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/core/http/endpoints/localai"
+	"github.com/mudler/LocalAI/core/services/galleryop"
 	"github.com/mudler/LocalAI/core/services/nodes"
+	"github.com/mudler/LocalAI/pkg/natsauth"
 	"gorm.io/gorm"
 )
 
@@ -33,7 +36,7 @@ func nodeReadyMiddleware(registry *nodes.NodeRegistry) echo.MiddlewareFunc {
 // token but do not verify per-node identity. A compromised worker can heartbeat/drain/
 // deregister other nodes. Future: issue per-node JWT at registration, validate node
 // identity on subsequent requests (compare :id param with token subject).
-func RegisterNodeSelfServiceRoutes(e *echo.Echo, registry *nodes.NodeRegistry, registrationToken string, autoApprove bool, authDB *gorm.DB, hmacSecret string) {
+func RegisterNodeSelfServiceRoutes(e *echo.Echo, registry *nodes.NodeRegistry, registrationToken string, autoApprove bool, authDB *gorm.DB, hmacSecret string, natsCfg natsauth.Config) {
 	if registry == nil {
 		return
 	}
@@ -42,9 +45,9 @@ func RegisterNodeSelfServiceRoutes(e *echo.Echo, registry *nodes.NodeRegistry, r
 	tokenAuthMw := nodeTokenAuth(registrationToken)
 
 	node := e.Group("/api/node", readyMw, tokenAuthMw)
-	node.POST("/register", localai.RegisterNodeEndpoint(registry, registrationToken, autoApprove, authDB, hmacSecret))
+	node.POST("/register", localai.RegisterNodeEndpoint(registry, registrationToken, autoApprove, authDB, hmacSecret, natsCfg))
 	node.POST("/:id/heartbeat", localai.HeartbeatEndpoint(registry))
-	node.POST("/:id/drain", localai.DrainNodeEndpoint(registry))
+	node.POST("/:id/drain", localai.DrainNodeEndpoint(registry, nil))
 	node.POST("/:id/resume", localai.ResumeNodeEndpoint(registry))
 	node.POST("/:id/deregister", localai.DeactivateNodeEndpoint(registry))
 	node.GET("/:id/models", localai.GetNodeModelsEndpoint(registry))
@@ -53,7 +56,12 @@ func RegisterNodeSelfServiceRoutes(e *echo.Echo, registry *nodes.NodeRegistry, r
 
 // RegisterNodeAdminRoutes registers /api/nodes/ endpoints used by admins
 // (list, get, get models, drain, delete, approve, backend management). Protected by admin middleware.
-func RegisterNodeAdminRoutes(e *echo.Echo, registry *nodes.NodeRegistry, unloader nodes.NodeCommandSender, adminMw echo.MiddlewareFunc, authDB *gorm.DB, hmacSecret string, registrationToken string) {
+//
+// galleryService/opcache/appConfig are threaded in for the async node-scoped
+// backend install path (POST /:id/backends/install). That handler enqueues a
+// ManagementOp on the gallery channel rather than blocking on a NATS reply, so
+// the browser gets HTTP 202 + jobID immediately instead of waiting up to 3 minutes.
+func RegisterNodeAdminRoutes(e *echo.Echo, registry *nodes.NodeRegistry, unloader nodes.NodeCommandSender, galleryService *galleryop.GalleryService, opcache *galleryop.OpCache, appConfig *config.ApplicationConfig, adminMw echo.MiddlewareFunc, authDB *gorm.DB, hmacSecret string, registrationToken string, natsCfg natsauth.Config, workerHTTPDial nodes.WorkerNetDialerFor) {
 	if registry == nil {
 		return
 	}
@@ -63,6 +71,9 @@ func RegisterNodeAdminRoutes(e *echo.Echo, registry *nodes.NodeRegistry, unloade
 	admin := e.Group("/api/nodes", readyMw, adminMw)
 	admin.GET("", localai.ListNodesEndpoint(registry))
 
+	// Cluster-wide loaded models (registered before /:id to avoid route conflicts)
+	admin.GET("/models", localai.ListAllNodeModelsEndpoint(registry))
+
 	// Model scheduling (registered before /:id to avoid route conflicts)
 	admin.GET("/scheduling", localai.ListSchedulingEndpoint(registry))
 	admin.GET("/scheduling/:model", localai.GetSchedulingEndpoint(registry))
@@ -71,14 +82,18 @@ func RegisterNodeAdminRoutes(e *echo.Echo, registry *nodes.NodeRegistry, unloade
 
 	admin.GET("/:id", localai.GetNodeEndpoint(registry))
 	admin.GET("/:id/models", localai.GetNodeModelsEndpoint(registry))
-	admin.DELETE("/:id", localai.DeregisterNodeEndpoint(registry))
-	admin.POST("/:id/drain", localai.DrainNodeEndpoint(registry))
+	admin.DELETE("/:id", localai.DeregisterNodeEndpoint(registry, unloader))
+	admin.POST("/:id/drain", localai.DrainNodeEndpoint(registry, unloader))
 	admin.POST("/:id/resume", localai.ResumeNodeEndpoint(registry))
-	admin.POST("/:id/approve", localai.ApproveNodeEndpoint(registry, authDB, hmacSecret))
+	admin.POST("/:id/approve", localai.ApproveNodeEndpoint(registry, authDB, hmacSecret, natsCfg))
 
 	// Backend management on workers
-	admin.GET("/:id/backends", localai.ListBackendsOnNodeEndpoint(unloader))
-	admin.POST("/:id/backends/install", localai.InstallBackendOnNodeEndpoint(unloader))
+	admin.GET("/:id/backends", localai.ListBackendsOnNodeEndpoint(unloader, registry))
+	admin.POST("/:id/backends/install", localai.InstallBackendOnNodeEndpoint(unloader, galleryService, opcache, appConfig))
+	// Upgrade is a distinct route (not install) because the worker's
+	// backend.install handler short-circuits when the backend already exists
+	// on disk; only the Upgrade op path force-reinstalls.
+	admin.POST("/:id/backends/upgrade", localai.UpgradeBackendOnNodeEndpoint(galleryService, opcache, appConfig))
 	admin.POST("/:id/backends/delete", localai.DeleteBackendOnNodeEndpoint(unloader))
 
 	// Model management on workers
@@ -86,8 +101,8 @@ func RegisterNodeAdminRoutes(e *echo.Echo, registry *nodes.NodeRegistry, unloade
 	admin.POST("/:id/models/delete", localai.DeleteModelOnNodeEndpoint(unloader, registry))
 
 	// Backend log streaming (proxied from worker HTTP server)
-	admin.GET("/:id/backend-logs", localai.NodeBackendLogsListEndpoint(registry, registrationToken))
-	admin.GET("/:id/backend-logs/:modelId", localai.NodeBackendLogsLinesEndpoint(registry, registrationToken))
+	admin.GET("/:id/backend-logs", localai.NodeBackendLogsListEndpoint(registry, registrationToken, workerHTTPDial))
+	admin.GET("/:id/backend-logs/:modelId", localai.NodeBackendLogsLinesEndpoint(registry, registrationToken, workerHTTPDial))
 
 	// Label management
 	admin.GET("/:id/labels", localai.GetNodeLabelsEndpoint(registry))
@@ -95,8 +110,20 @@ func RegisterNodeAdminRoutes(e *echo.Echo, registry *nodes.NodeRegistry, unloade
 	admin.PATCH("/:id/labels", localai.MergeNodeLabelsEndpoint(registry))
 	admin.DELETE("/:id/labels/:key", localai.DeleteNodeLabelEndpoint(registry))
 
+	// Per-node replica capacity. PUT sets a sticky admin override that
+	// survives worker restarts. DELETE clears the override so the worker's
+	// CLI flag takes over again at the next re-registration.
+	admin.PUT("/:id/max-replicas-per-model", localai.UpdateMaxReplicasPerModelEndpoint(registry))
+	admin.DELETE("/:id/max-replicas-per-model", localai.ResetMaxReplicasPerModelEndpoint(registry))
+
+	// Per-node VRAM allocation budget. PUT sets a sticky admin override that
+	// survives worker restarts; DELETE clears it so the worker's reported
+	// budget takes over again at the next re-registration.
+	admin.PUT("/:id/vram-budget", localai.UpdateVRAMBudgetEndpoint(registry))
+	admin.DELETE("/:id/vram-budget", localai.ResetVRAMBudgetEndpoint(registry))
+
 	// WebSocket proxy for real-time log streaming from workers
-	e.GET("/ws/nodes/:id/backend-logs/:modelId", localai.NodeBackendLogsWSEndpoint(registry, registrationToken), readyMw, adminMw)
+	e.GET("/ws/nodes/:id/backend-logs/:modelId", localai.NodeBackendLogsWSEndpoint(registry, registrationToken, workerHTTPDial), readyMw, adminMw)
 }
 
 // nodeTokenAuth validates the registration token for node self-service endpoints.

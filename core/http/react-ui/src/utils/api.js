@@ -7,14 +7,21 @@ const userQ = (userId) => userId ? `?user_id=${enc(userId)}` : ''
 async function handleResponse(response) {
   if (!response.ok) {
     let errorMessage = `HTTP ${response.status}`
+    let errorBody = null
     try {
       const data = await response.json()
+      errorBody = data
       if (data?.error?.message) errorMessage = data.error.message
       else if (data?.error) errorMessage = data.error
     } catch (_e) {
       // response wasn't JSON
     }
-    throw new Error(errorMessage)
+    const err = new Error(errorMessage)
+    // Preserve the parsed body + status so handlers can pattern-match on
+    // structured responses (e.g. the import form's ambiguity picker).
+    err.status = response.status
+    err.body = errorBody
+    throw err
   }
   const contentType = response.headers.get('content-type')
   if (contentType && contentType.includes('application/json')) {
@@ -76,9 +83,25 @@ export async function streamChat(body, signal) {
 export const modelsApi = {
   list: (params) => fetchJSON(buildUrl(API_CONFIG.endpoints.models, params)),
   listV1: () => fetchJSON(API_CONFIG.endpoints.modelsList),
+  listNativeCapabilities: () => fetchJSON('/v1/models/capabilities'),
   listCapabilities: () => fetchJSON(API_CONFIG.endpoints.modelsCapabilities),
-  install: (id) => postJSON(API_CONFIG.endpoints.installModel(id), {}),
+  listAliases: () => fetchJSON(API_CONFIG.endpoints.modelsAliases),
+  // variant is optional. Omitting it lets the server auto-select the best
+  // build for this host, which is what the listing's auto_variant predicted.
+  install: (id, variant) => postJSON(
+    variant
+      ? `${API_CONFIG.endpoints.installModel(id)}?variant=${encodeURIComponent(variant)}`
+      : API_CONFIG.endpoints.installModel(id),
+    {}
+  ),
   delete: (id) => postJSON(API_CONFIG.endpoints.deleteModel(id), {}),
+  estimate: (id, contexts) => fetchJSON(
+    buildUrl(API_CONFIG.endpoints.modelEstimate(id),
+      contexts?.length ? { contexts: contexts.join(',') } : {})
+  ),
+  // Companion to estimate: the listing reports only has_variants, so the
+  // description is fetched per entry, on demand.
+  variants: (id) => fetchJSON(API_CONFIG.endpoints.modelVariants(id)),
   getConfig: (id) => postJSON(API_CONFIG.endpoints.modelConfig(id), {}),
   getConfigJson: (name) => fetchJSON(API_CONFIG.endpoints.modelConfigJson(name)),
   getJob: (uid) => fetchJSON(API_CONFIG.endpoints.modelJob(uid)),
@@ -95,6 +118,7 @@ export const modelsApi = {
     return handleResponse(response)
   },
   getJobStatus: (uid) => fetchJSON(API_CONFIG.endpoints.modelsJobStatus(uid)),
+  getStorage: () => fetchJSON(API_CONFIG.endpoints.modelsStorage),
   getEditConfig: (name) => fetchJSON(API_CONFIG.endpoints.modelEditGet(name)),
   editConfig: (name, body) => postJSON(API_CONFIG.endpoints.modelEdit(name), body),
   toggleState: (name, action) => fetchJSON(API_CONFIG.endpoints.modelToggleState(name, action), { method: 'PUT' }),
@@ -109,12 +133,14 @@ export const modelsApi = {
     method: 'PATCH',
     body: JSON.stringify(patch),
   }),
+  backendUsecases: () => fetchJSON('/api/backends/usecases'),
 }
 
 // Backends API
 export const backendsApi = {
   list: (params) => fetchJSON(buildUrl(API_CONFIG.endpoints.backends, params)),
   listInstalled: () => fetchJSON(API_CONFIG.endpoints.backendsInstalled),
+  listKnown: () => fetchJSON(API_CONFIG.endpoints.backendsKnown),
   install: (id) => postJSON(API_CONFIG.endpoints.installBackend(id), {}),
   delete: (id) => postJSON(API_CONFIG.endpoints.deleteBackend(id), {}),
   installExternal: (body) => postJSON(API_CONFIG.endpoints.installExternalBackend, body),
@@ -149,13 +175,36 @@ export const resourcesApi = {
 export const operationsApi = {
   list: () => fetchJSON(API_CONFIG.endpoints.operations),
   cancel: (jobID) => postJSON(API_CONFIG.endpoints.cancelOperation(jobID), {}),
+  pause: (jobID) => postJSON(API_CONFIG.endpoints.pauseOperation(jobID), {}),
   dismiss: (jobID) => postJSON(API_CONFIG.endpoints.dismissOperation(jobID), {}),
+  history: () => fetchJSON(API_CONFIG.endpoints.operationsHistory),
+  clearHistory: () => fetchJSON(API_CONFIG.endpoints.operationsHistory, { method: 'DELETE' }),
 }
 
 // Settings API
 export const settingsApi = {
   get: () => fetchJSON(API_CONFIG.endpoints.settings),
   save: (body) => postJSON(API_CONFIG.endpoints.settings, body),
+}
+
+// Branding / whitelabeling
+// /api/branding is public (no auth) — the login page reads it before the
+// user signs in. Asset uploads/deletes still require admin privileges.
+export const brandingApi = {
+  get: () => fetchJSON('/api/branding'),
+  uploadAsset: (kind, file) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return fetch(apiUrl(`/api/branding/asset/${enc(kind)}`), {
+      method: 'POST',
+      body: fd,
+      credentials: 'include',
+    }).then(handleResponse)
+  },
+  deleteAsset: (kind) => fetch(apiUrl(`/api/branding/asset/${enc(kind)}`), {
+    method: 'DELETE',
+    credentials: 'include',
+  }).then(handleResponse),
 }
 
 // Backend Logs API
@@ -166,11 +215,47 @@ export const backendLogsApi = {
 }
 
 // Traces API
+//
+// The list endpoints return a bounded page with the heavy request/response
+// bodies stripped; the total buffered count arrives in X-Total-Count and the
+// full record is fetched per trace when a row is expanded. Polling the
+// unbounded form used to move tens of megabytes every few seconds.
+export const DEFAULT_TRACE_PAGE_SIZE = 50
+
+async function fetchTracePage(endpoint, { limit = DEFAULT_TRACE_PAGE_SIZE, offset = 0, full = false } = {}) {
+  const response = await fetch(buildUrl(endpoint, { limit, offset, full: full ? 'true' : undefined }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+  const items = await handleResponse(response)
+  const list = Array.isArray(items) ? items : []
+  const total = parseInt(response.headers.get('X-Total-Count') || '', 10)
+  return { items: list, total: Number.isNaN(total) ? list.length : total }
+}
+
 export const tracesApi = {
-  get: () => fetchJSON(API_CONFIG.endpoints.traces),
+  get: (opts) => fetchTracePage(API_CONFIG.endpoints.traces, opts),
+  // Counted totals, so a dashboard does not fetch the whole list to size it.
+  // `hours` picks the window the server counts over (1 to 168).
+  summary: (hours) => fetchJSON(hours ? `${API_CONFIG.endpoints.tracesSummary}?hours=${hours}` : API_CONFIG.endpoints.tracesSummary),
+  getOne: (id) => fetchJSON(API_CONFIG.endpoints.trace(id)),
   clear: () => postJSON(API_CONFIG.endpoints.clearTraces, {}),
-  getBackend: () => fetchJSON(API_CONFIG.endpoints.backendTraces),
+  getBackend: (opts) => fetchTracePage(API_CONFIG.endpoints.backendTraces, opts),
+  getBackendOne: (id) => fetchJSON(API_CONFIG.endpoints.backendTrace(id)),
   clearBackend: () => postJSON(API_CONFIG.endpoints.clearBackendTraces, {}),
+}
+
+// Prometheus exposition text from /metrics (admin only). Returns the status and
+// the text, so a page can tell a route that is off (404) from one that refused
+// the caller (401, 403) and from a network failure (status 0).
+export const metricsApi = {
+  scrape: async () => {
+    try {
+      const response = await fetch(apiUrl('/metrics'))
+      return { status: response.status, text: response.ok ? await response.text() : '' }
+    } catch {
+      return { status: 0, text: '' }
+    }
+  },
 }
 
 // P2P API
@@ -197,10 +282,27 @@ export const agentJobsApi = {
   getJob: (id) => fetchJSON(API_CONFIG.endpoints.agentJob(id)),
   cancelJob: (id) => postJSON(API_CONFIG.endpoints.cancelAgentJob(id), {}),
   executeJob: (body) => postJSON(API_CONFIG.endpoints.executeAgentJob, body),
+  // Run a finished job's task again with the parameters and media it had. There
+  // is no retry call, so this is a new job.
+  rerunJob: (job) => postJSON(API_CONFIG.endpoints.executeAgentJob, {
+    task_id: job.task_id,
+    parameters: job.parameters || {},
+    ...(job.images?.length ? { images: job.images } : {}),
+    ...(job.videos?.length ? { videos: job.videos } : {}),
+    ...(job.audios?.length ? { audios: job.audios } : {}),
+    ...(job.files?.length ? { files: job.files } : {}),
+  }),
 }
 
 // Image generation
 export const imageApi = {
+  upscale: async ({ model, image, scale }) => {
+    const form = new FormData()
+    form.append('model', model)
+    form.append('image', image)
+    form.append('scale', String(scale))
+    return handleResponse(await fetch(apiUrl('/v1/images/upscale'), { method: 'POST', body: form }))
+  },
   generate: (body) => postJSON(API_CONFIG.endpoints.imageGenerations, body),
 }
 
@@ -209,12 +311,31 @@ export const videoApi = {
   generate: (body) => postJSON(API_CONFIG.endpoints.video, body),
 }
 
-async function postAudioBlob(endpoint, body) {
-  const response = await fetch(apiUrl(endpoint), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
+export const threeDApi = {
+  animate: (body) => postJSON(API_CONFIG.endpoints.threeDAnimate, body),
+  generate: (body) => postJSON(API_CONFIG.endpoints.threeDGenerations, body),
+  remesh: async (mesh, model, detail) => {
+    const form = new FormData()
+    form.append('model', model)
+    form.append('detail', String(detail))
+    form.append('mesh', mesh, 'source.glb')
+    const response = await fetch(apiUrl(API_CONFIG.endpoints.threeDRemesh), {
+      method: 'POST',
+      body: form,
+    })
+    await handleResponse(response)
+    return response.blob()
+  },
+}
+
+// parseAudioBlobResponse — shared response handling for audio-blob endpoints.
+// Throws on non-2xx (with the API error message when present); returns the
+// blob plus the parsed Content-Disposition filename mapped to the server's
+// /generated-audio/ path so the UI can persist it in history. The audio
+// transform endpoint also surfaces the persisted *input* paths via
+// X-Audio-Input-Url / X-Audio-Reference-Url headers so the UI can replay
+// past (input, reference, output) triples from history.
+async function parseAudioBlobResponse(response) {
   if (!response.ok) {
     const data = await response.json().catch(() => ({}))
     throw new Error(data?.error?.message || `HTTP ${response.status}`)
@@ -225,8 +346,24 @@ async function postAudioBlob(endpoint, body) {
     const match = disposition.match(/filename[^;=\n]*=["']?([^"';\n]*)["']?/)
     if (match && match[1]) serverUrl = '/generated-audio/' + match[1]
   }
+  const inputUrl = response.headers.get('x-audio-input-url') || null
+  const referenceUrl = response.headers.get('x-audio-reference-url') || null
   const blob = await response.blob()
-  return { blob, serverUrl }
+  return { blob, serverUrl, inputUrl, referenceUrl }
+}
+
+async function postAudioBlob(endpoint, body) {
+  const response = await fetch(apiUrl(endpoint), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  return parseAudioBlobResponse(response)
+}
+
+async function postMultipartAudioBlob(endpoint, formData) {
+  const response = await fetch(apiUrl(endpoint), { method: 'POST', body: formData })
+  return parseAudioBlobResponse(response)
 }
 
 // TTS
@@ -235,9 +372,44 @@ export const ttsApi = {
   generateV1: (body) => postAudioBlob(API_CONFIG.endpoints.audioSpeech, body),
 }
 
+// Reusable voice-cloning profiles. The browser uploads multipart PCM-WAV;
+// list/preview are available to TTS-authorized users while mutations are
+// enforced as admin-only by the server.
+export const voiceProfilesApi = {
+  list: () => fetchJSON('/api/voice-profiles'),
+  create: (formData) => fetch(apiUrl('/api/voice-profiles'), {
+    method: 'POST',
+    body: formData,
+  }).then(handleResponse),
+  delete: (id) => fetch(apiUrl(`/api/voice-profiles/${enc(id)}`), {
+    method: 'DELETE',
+  }).then(handleResponse),
+  audioUrl: (id) => apiUrl(`/api/voice-profiles/${enc(id)}/audio`),
+}
+
 // Sound generation
 export const soundApi = {
   generate: (body) => postAudioBlob(API_CONFIG.endpoints.soundGeneration, body),
+}
+
+// Audio transform (echo cancellation, noise suppression, voice conversion, etc.)
+export const audioTransformApi = {
+  process: ({ model, audioFile, referenceFile, format, sampleRate, params }) => {
+    const fd = new FormData()
+    fd.append('model', model)
+    fd.append('audio', audioFile, audioFile?.name || 'audio.wav')
+    if (referenceFile) fd.append('reference', referenceFile, referenceFile.name || 'reference.wav')
+    if (format) fd.append('response_format', format)
+    if (sampleRate) fd.append('sample_rate', String(sampleRate))
+    if (params) {
+      for (const [k, v] of Object.entries(params)) {
+        if (v == null || v === '') continue
+        fd.append(`params[${k}]`, String(v))
+      }
+    }
+    return postMultipartAudioBlob(API_CONFIG.endpoints.audioTransformations, fd)
+  },
+  streamUrl: () => apiUrl(API_CONFIG.endpoints.audioTransformStream).replace(/^http/, 'ws'),
 }
 
 // Audio transcription
@@ -251,6 +423,26 @@ export const audioApi = {
   },
 }
 
+// Face biometrics — backend spec: core/http/endpoints/localai/face_*.go
+export const faceApi = {
+  verify: (body) => postJSON(API_CONFIG.endpoints.faceVerify, body),
+  analyze: (body) => postJSON(API_CONFIG.endpoints.faceAnalyze, body),
+  embed: (body) => postJSON(API_CONFIG.endpoints.faceEmbed, body),
+  register: (body) => postJSON(API_CONFIG.endpoints.faceRegister, body),
+  identify: (body) => postJSON(API_CONFIG.endpoints.faceIdentify, body),
+  forget: (body) => postJSON(API_CONFIG.endpoints.faceForget, body),
+}
+
+// Voice biometrics — backend spec: core/http/endpoints/localai/voice_*.go
+export const voiceApi = {
+  verify: (body) => postJSON(API_CONFIG.endpoints.voiceVerify, body),
+  analyze: (body) => postJSON(API_CONFIG.endpoints.voiceAnalyze, body),
+  embed: (body) => postJSON(API_CONFIG.endpoints.voiceEmbed, body),
+  register: (body) => postJSON(API_CONFIG.endpoints.voiceRegister, body),
+  identify: (body) => postJSON(API_CONFIG.endpoints.voiceIdentify, body),
+  forget: (body) => postJSON(API_CONFIG.endpoints.voiceForget, body),
+}
+
 // Realtime / WebRTC
 export const realtimeApi = {
   call: (body) => postJSON(API_CONFIG.endpoints.realtimeCalls, body),
@@ -260,6 +452,9 @@ export const realtimeApi = {
 // Backend control
 export const backendControlApi = {
   shutdown: (body) => postJSON(API_CONFIG.endpoints.backendShutdown, body),
+  // Pre-load a model (or all of a realtime pipeline's sub-models) into memory.
+  // body: { model: "<name>" }. Inverse of shutdown.
+  load: (body) => postJSON(API_CONFIG.endpoints.backendLoad, body),
 }
 
 // System info
@@ -280,7 +475,7 @@ export const agentsApi = {
   status: (name, userId) => fetchJSON(`/api/agents/${enc(name)}/status${userQ(userId)}`),
   observables: (name, userId) => fetchJSON(`/api/agents/${enc(name)}/observables${userQ(userId)}`),
   clearObservables: (name, userId) => fetchJSON(`/api/agents/${enc(name)}/observables${userQ(userId)}`, { method: 'DELETE' }),
-  chat: (name, message, userId) => postJSON(`/api/agents/${enc(name)}/chat${userQ(userId)}`, { message }),
+  chat: (name, message, userId, history = []) => postJSON(`/api/agents/${enc(name)}/chat${userQ(userId)}`, { message, history }),
   export: (name, userId) => fetchJSON(`/api/agents/${enc(name)}/export${userQ(userId)}`),
   import: (formData) => fetch(apiUrl('/api/agents/import'), { method: 'POST', body: formData }).then(handleResponse),
   configMeta: () => fetchJSON('/api/agents/config/metadata'),
@@ -297,7 +492,10 @@ export const agentCollectionsApi = {
   reset: (name, userId) => postJSON(`/api/agents/collections/${enc(name)}/reset${userQ(userId)}`),
   deleteEntry: (name, entry, userId) => fetchJSON(`/api/agents/collections/${enc(name)}/entry/delete${userQ(userId)}`, { method: 'DELETE', body: JSON.stringify({ entry }), headers: { 'Content-Type': 'application/json' } }),
   sources: (name, userId) => fetchJSON(`/api/agents/collections/${enc(name)}/sources${userQ(userId)}`),
-  addSource: (name, url, interval, userId) => postJSON(`/api/agents/collections/${enc(name)}/sources${userQ(userId)}`, { url, update_interval: interval }),
+  addSource: (name, url, interval, userId) => postJSON(`/api/agents/collections/${enc(name)}/sources${userQ(userId)}`, {
+    url,
+    update_interval: interval === undefined ? undefined : Number(interval),
+  }),
   removeSource: (name, url, userId) => fetchJSON(`/api/agents/collections/${enc(name)}/sources${userQ(userId)}`, { method: 'DELETE', body: JSON.stringify({ url }), headers: { 'Content-Type': 'application/json' } }),
 }
 
@@ -331,6 +529,14 @@ export const usageApi = {
     if (userId) url += `&user_id=${encodeURIComponent(userId)}`
     return fetchJSON(url)
   },
+  getMySources: (period) =>
+    fetchJSON(`/api/auth/usage/sources?period=${period || 'month'}`),
+  getAdminSources: (period, userId, apiKeyId) => {
+    let url = `/api/auth/admin/usage/sources?period=${period || 'month'}`
+    if (userId) url += `&user_id=${encodeURIComponent(userId)}`
+    if (apiKeyId) url += `&api_key_id=${encodeURIComponent(apiKeyId)}`
+    return fetchJSON(url)
+  },
   getMyQuotas: () => fetchJSON('/api/auth/quota'),
 }
 
@@ -359,8 +565,10 @@ export const adminUsersApi = {
   deleteQuota: (id, quotaId) => fetchJSON(`/api/auth/admin/users/${encodeURIComponent(id)}/quotas/${encodeURIComponent(quotaId)}`, {
     method: 'DELETE',
   }),
-  resetPassword: (id, password) => fetchJSON(`/api/auth/admin/users/${encodeURIComponent(id)}/password`, {
-    method: 'PUT', body: JSON.stringify({ password }), headers: { 'Content-Type': 'application/json' },
+  resetPassword: (id, password, acknowledgeWeak = false) => fetchJSON(`/api/auth/admin/users/${encodeURIComponent(id)}/password`, {
+    method: 'PUT',
+    body: JSON.stringify({ password, acknowledge_weak_password: acknowledgeWeak }),
+    headers: { 'Content-Type': 'application/json' },
   }),
 }
 
@@ -373,8 +581,9 @@ export const profileApi = {
   updateProfile: (name, avatarUrl) => fetchJSON('/api/auth/profile', {
     method: 'PUT', body: JSON.stringify({ name, avatar_url: avatarUrl || '' }), headers: { 'Content-Type': 'application/json' },
   }),
-  changePassword: (currentPassword, newPassword) => fetchJSON('/api/auth/password', {
-    method: 'PUT', body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+  changePassword: (currentPassword, newPassword, acknowledgeWeak = false) => fetchJSON('/api/auth/password', {
+    method: 'PUT',
+    body: JSON.stringify({ current_password: currentPassword, new_password: newPassword, acknowledge_weak_password: acknowledgeWeak }),
     headers: { 'Content-Type': 'application/json' },
   }),
 }
@@ -389,8 +598,15 @@ export const adminInvitesApi = {
 // API Keys
 export const apiKeysApi = {
   list: () => fetchJSON('/api/auth/api-keys'),
-  create: (name) => postJSON('/api/auth/api-keys', { name }),
+  // expiresIn is "30d", "90d" or "1y"; without it the server applies its own default.
+  create: (name, expiresIn) => postJSON('/api/auth/api-keys', expiresIn ? { name, expiresIn } : { name }),
   revoke: (id) => fetchJSON(`/api/auth/api-keys/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  // pausedUntil is an RFC3339 string or null; disabled pauses until resumed.
+  setPause: (id, disabled, pausedUntil = null) => fetchJSON(`/api/auth/api-keys/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ disabled, paused_until: pausedUntil }),
+  }),
 }
 
 // Fine-tuning API
@@ -425,6 +641,16 @@ export const quantizationApi = {
   downloadUrl: (id) => apiUrl(`/api/quantization/jobs/${enc(id)}/download`),
 }
 
+// Failover chains API. Health is pushed over /api/failover/events (SSE);
+// list() seeds the view and backs the periodic resync.
+export const failoverApi = {
+  list: () => fetchJSON(API_CONFIG.endpoints.failoverChains),
+  get: (name) => fetchJSON(API_CONFIG.endpoints.failoverChain(name)),
+  pin: (name, target) => postJSON(API_CONFIG.endpoints.failoverPin(name), { target }),
+  unpin: (name) => fetchJSON(API_CONFIG.endpoints.failoverPin(name), { method: 'DELETE' }),
+  eventsUrl: () => API_CONFIG.endpoints.failoverEvents,
+}
+
 // Nodes API (distributed)
 export const nodesApi = {
   list: () => fetchJSON(API_CONFIG.endpoints.nodes),
@@ -435,7 +661,22 @@ export const nodesApi = {
   approve: (id) => postJSON(API_CONFIG.endpoints.nodeApprove(id), {}),
   getModels: (id) => fetchJSON(API_CONFIG.endpoints.nodeModels(id)),
   getBackends: (id) => fetchJSON(API_CONFIG.endpoints.nodeBackends(id)),
-  installBackend: (id, backend) => postJSON(API_CONFIG.endpoints.nodeBackendsInstall(id), { backend }),
+  // installBackend installs a gallery backend on a single node. opts can
+  // override the gallery path and supply a direct URI (OCI image / URL / file
+  // path) plus an optional name+alias, mirroring the standalone /backends/
+  // install-external surface but scoped to one node.
+  installBackend: (id, backend, opts = {}) => postJSON(API_CONFIG.endpoints.nodeBackendsInstall(id), {
+    backend,
+    ...(opts.uri ? { uri: opts.uri } : {}),
+    ...(opts.name ? { name: opts.name } : {}),
+    ...(opts.alias ? { alias: opts.alias } : {}),
+    ...(opts.backend_galleries ? { backend_galleries: opts.backend_galleries } : {}),
+  }),
+  // upgradeBackend force-reinstalls a gallery backend on a single node. This
+  // is a distinct endpoint from installBackend: the worker treats install as
+  // "ensure installed" and no-ops when the backend already exists on disk,
+  // so an upgrade dispatched through install would silently do nothing.
+  upgradeBackend: (id, backend) => postJSON(API_CONFIG.endpoints.nodeBackendsUpgrade(id), { backend }),
   deleteBackend: (id, backend) => postJSON(API_CONFIG.endpoints.nodeBackendsDelete(id), { backend }),
   getBackendLogs: (id) => fetchJSON(API_CONFIG.endpoints.nodeBackendLogs(id)),
   getBackendLogLines: (id, modelId) => fetchJSON(API_CONFIG.endpoints.nodeBackendLogsModel(id, modelId)),
@@ -443,7 +684,30 @@ export const nodesApi = {
   getLabels: (id) => fetchJSON(API_CONFIG.endpoints.nodeLabels(id)),
   mergeLabels: (id, labels) => fetchJSON(API_CONFIG.endpoints.nodeLabels(id), { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(labels) }),
   deleteLabel: (id, key) => fetchJSON(API_CONFIG.endpoints.nodeLabelKey(id, key), { method: 'DELETE' }),
+  // Set a sticky admin override for the per-node replica cap. The override
+  // is preserved across worker restarts; call resetMaxReplicasPerModel to
+  // hand control back to the worker's CLI flag.
+  updateMaxReplicasPerModel: (id, value) => fetchJSON(API_CONFIG.endpoints.nodeMaxReplicasPerModel(id), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ value }),
+  }),
+  resetMaxReplicasPerModel: (id) => fetchJSON(API_CONFIG.endpoints.nodeMaxReplicasPerModel(id), {
+    method: 'DELETE',
+  }),
+  // Set a sticky admin override for the per-node VRAM allocation budget. The
+  // value is a string ("80%" or "12GB"); resolution to a byte ceiling happens
+  // server-side. Call resetVramBudget to clear the override entirely.
+  updateVramBudget: (id, value) => fetchJSON(API_CONFIG.endpoints.nodeVramBudget(id), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ value }),
+  }),
+  resetVramBudget: (id) => fetchJSON(API_CONFIG.endpoints.nodeVramBudget(id), {
+    method: 'DELETE',
+  }),
   listScheduling: () => fetchJSON(API_CONFIG.endpoints.nodesScheduling),
+  allModels: () => fetchJSON(API_CONFIG.endpoints.nodesModels),
   setScheduling: (config) => postJSON(API_CONFIG.endpoints.nodesScheduling, config),
   deleteScheduling: (model) => fetchJSON(API_CONFIG.endpoints.nodesSchedulingModel(model), { method: 'DELETE' }),
 }
@@ -459,4 +723,19 @@ export function fileToBase64(file) {
     reader.onerror = reject
     reader.readAsDataURL(file)
   })
+}
+
+// Multipart requests must let the browser set the boundary.
+export const diarizationApi = {
+  run: async ({ file, model, profiles = false }) => {
+    const body = new FormData()
+    body.append('file', file)
+    body.append('model', model)
+    if (profiles) {
+      body.append('include_speaker_profiles', 'true')
+      body.append('include_text', 'true')
+      body.append('response_format', 'verbose_json')
+    }
+    return handleResponse(await fetch(apiUrl('/v1/audio/diarization'), { method: 'POST', body }))
+  },
 }

@@ -1,10 +1,12 @@
 +++
 disableToc = false
 title = "Setting Up Models"
-weight = 2
+weight = 3
 icon = "hub"
 description = "Learn how to install, configure, and manage models in LocalAI"
 +++
+
+![Model resolution: many sources converge on one resolve, auto-detect backend, load, and serve path](/images/diagrams/model-resolution.png)
 
 This section covers everything you need to know about installing and configuring models in LocalAI. You'll learn multiple methods to get models running.
 
@@ -17,15 +19,29 @@ This section covers everything you need to know about installing and configuring
 
 The Model Gallery is the simplest way to install models. It provides pre-configured models ready to use.
 
+GPU recommendations require a memory estimate within 95% of the detected model memory budget at a 4096-token context. If none of the sampled candidates fit, the recommendation section is hidden. You can still browse the gallery and check individual models at your intended context size. On the Models page the recommendations appear as a "Best for this machine" list in the pane beside the table while no model is selected. Once you have installed a model, the list shows only the best fit and offers the others behind "more that fit". The Home page also omits static GPU suggestions when no fitting recommendation is available.
+
 ### Via WebUI
 
 1. Open the LocalAI WebUI at `http://localhost:8080`
-2. Navigate to the "Models" tab
-3. Browse available models
+2. Navigate to **Models → Explore**
+3. Browse or search the available models
 4. Click "Install" on any model you want
-5. Wait for installation to complete
+5. Wait for installation to complete. Progress appears in the strip at the top
+   of the app, and **Operate → Activity** shows every install in flight, plus
+   what failed and what finished (see [Activity]({{% relref "operations/activity" %}}))
 
 For more details, refer to the [Gallery Documentation]({{% relref "features/model-gallery" %}}).
+
+The same Models page owns the complete lifecycle. Switch to **Installed** to
+search local configurations, filter them by running, idle, disabled, pinned,
+or distributed state, and open a model's runtime controls. Load and stop are on
+each row; edit, pin, disable, backend logs, and remove are in the row menu and in
+the details of the selected model. The current view, search, filter, and
+selection are stored in the URL so links and browser history preserve your place.
+The disk strip in the page header shows the free space on the models disk and
+opens a review of what can be removed to free more (see
+[Model gallery]({{% relref "features/model-gallery" %}})).
 
 ### Via CLI
 
@@ -58,39 +74,68 @@ Note: The galleries available in LocalAI can be customized to point to a differe
 
 Visit [models.localai.io](https://models.localai.io) to browse all available models in your browser.
 
+On a phone, the model page wraps build descriptions in the **Variants** table
+to keep the fit status and install buttons visible.
+
 ## Method 1.5: Import Models via WebUI
 
-The WebUI provides a powerful model import interface that supports both simple and advanced configuration:
+The WebUI import page (**Build → Import**) takes either a source to resolve or a
+configuration to write. Both live on the same page, behind the two tabs in its
+header. From a source, it is a short guided flow: source, review, import, done.
 
-### Simple Import Mode
+### From a source
 
 1. Open the LocalAI WebUI at `http://localhost:8080`
-2. Click "Import Model"
-3. Enter the model URI (e.g., `https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF`)
-4. Optionally configure preferences:
-   - Backend selection
-   - Model name
-   - Description
-   - Quantizations
-   - Embeddings support
-   - Custom preferences
-5. Click "Import Model" to start the import process
+2. Open **Build**, then **Import**
+3. Paste the source into the **Source** field (e.g. `https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF`), or start from one of the examples
+4. Review what the page says, then press Enter or click **Import**
 
-### Advanced Import Mode
+While you type, the page reads the spelling of the source (Hugging Face
+repository, direct URL, configuration file, OCI image, Ollama model, or a path
+on the host) and shows the request the form will send. It also runs the checks
+that can be made before the import starts: whether the name is already in use,
+whether the chosen backend is installed, and how much disk and memory are free.
+The server returns no preview of the model configuration, the size or the memory
+a model needs before the import starts, so the page does not show them. They
+appear once the import starts, next to the free memory and disk.
 
-For full control over model configuration:
+The **What you can paste** panel beside the field lists every accepted scheme:
+`huggingface://`, `hf://`, a full Hugging Face URL, any direct `https://` URL,
+`file://` and absolute paths on the host, `oci://`, `ocifile://`, and
+`ollama://`.
 
-1. In the WebUI, click "Import Model"
-2. Toggle to "Advanced Mode"
-3. Edit the YAML configuration directly in the code editor
-4. Use the "Validate" button to check your configuration
-5. Click "Create" or "Update" to save
+Expand **Advanced options** directly below the request preview to override settings before importing.
+The controls include backend, name, description, quantizations, MMProj quantizations,
+model type, embeddings support, the diffusers-specific fields, and arbitrary
+custom key-value preferences. The backend list can be narrowed by modality
+first. Fields that the selected backend cannot use are hidden, and anything you
+typed into them is kept in case you switch back.
 
-The advanced editor includes:
-- Syntax highlighting
-- YAML validation
-- Format and copy tools
-- Full configuration options
+The source format check does not contact the source or validate it as a model.
+An HTTPS URL can point to a web page rather than model weights.
+
+Leaving the backend on auto-detect lets LocalAI choose from the source.
+Selecting a backend sends an explicit backend preference in the previewed request. If more
+than one installed backend can serve the detected modality, the page says so
+and offers the candidates inline — picking one resubmits the import.
+
+Repositories under `mlx-community` are imported with the native MLX backend.
+LocalAI uses Hugging Face's pipeline metadata to select `mlx-vlm` for
+vision-language models and `mlx-audio` for text-to-speech models; other MLX
+repositories use `mlx`. An explicit backend selection in the import form always
+overrides this automatic routing.
+
+Once the import starts, the page reports the download size and the memory the
+model needs against what is free, then the current phase, the bytes transferred
+and a progress bar. When the model is ready, the page names it and links to a
+chat with it and to Models.
+
+### Writing YAML
+
+For full control over model configuration, switch to the **Write YAML** tab and
+edit the configuration directly, then click **Create**. The editor provides
+syntax highlighting and a copy button, and accepts the same configuration keys
+documented under [Advanced]({{% relref "advanced" %}}).
 
 This is especially useful for:
 - Custom model configurations
@@ -128,6 +173,10 @@ local-ai run ollama://gemma:2b
 ```bash
 local-ai run oci://localai/phi-2:latest
 ```
+
+{{% notice note %}}
+On every model download — Ollama and OCI registries, the model gallery, and plain HTTP(S) file URLs alike — LocalAI identifies itself with a `LocalAI/<version> (<os>; <arch>)` `User-Agent` header (for example `LocalAI/v3.2.1 (linux; amd64)`) so registry and gallery operators can attribute usage to LocalAI. Builds from source that carry no stamped version send `LocalAI (<os>; <arch>)` instead.
+{{% /notice %}}
 
 ### Run Models via URI
 
@@ -201,7 +250,7 @@ mkdir models
 
 cp your-model.gguf models/
 
-docker run -p 8080:8080 -v $PWD/models:/models -ti --rm quay.io/go-skynet/local-ai:latest --models-path /models --context-size 700 --threads 4
+docker run -p 8080:8080 -v $PWD/models:/models -ti --rm localai/localai:latest --models-path /models --context-size 700 --threads 4
 
 curl http://localhost:8080/v1/completions -H "Content-Type: application/json" -d '{
      "model": "your-model.gguf",
@@ -213,7 +262,7 @@ curl http://localhost:8080/v1/completions -H "Content-Type: application/json" -d
 {{% notice tip %}}
 **Other Docker Images**:
 
-For other Docker images, please refer to the table in [the container images section]({{% relref "getting-started/container-images" %}}).
+For other Docker images, please refer to the table in [the container images section]({{% relref "getting-started/containers" %}}).
  {{% /notice %}}
 
 ### Example:
@@ -225,7 +274,7 @@ wget https://huggingface.co/TheBloke/Luna-AI-Llama2-Uncensored-GGUF/resolve/main
 
 cp -rf prompt-templates/getting_started.tmpl models/luna-ai-llama2.tmpl
 
-docker run -p 8080:8080 -v $PWD/models:/models -ti --rm quay.io/go-skynet/local-ai:latest --models-path /models --context-size 700 --threads 4
+docker run -p 8080:8080 -v $PWD/models:/models -ti --rm localai/localai:latest --models-path /models --context-size 700 --threads 4
 
 curl http://localhost:8080/v1/models
 
@@ -237,7 +286,7 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
 ```
 
 {{% notice note %}}
-- If running on Apple Silicon (ARM), it is **not** recommended to run on Docker due to emulation. Follow the [build instructions]({{% relref "installation/build" %}}) to use Metal acceleration for full GPU support.
+- If running on Apple Silicon (ARM), it is **not** recommended to run on Docker due to emulation. Follow the [build instructions]({{% relref "getting-started/build" %}}) to use Metal acceleration for full GPU support.
 - If you are running on Apple x86_64, you can use Docker without additional gain from building it from source.
  {{% /notice %}}
 
@@ -273,7 +322,7 @@ Note: If you are on Windows, ensure the project is on the Linux filesystem to av
 {{% /tab %}}
 {{% tab title="Kubernetes" %}}
 
-For Kubernetes deployment, see the [Kubernetes installation guide]({{% relref "installation/kubernetes" %}}).
+For Kubernetes deployment, see the [Kubernetes installation guide]({{% relref "getting-started/kubernetes" %}}).
 
 {{% /tab %}}
 {{% tab title="From Binary" %}}
@@ -300,7 +349,7 @@ Press "Allow Anyway."
 {{% /tab %}}
 {{% tab title="From Source" %}}
 
-For instructions on building LocalAI from source, see the [Build from Source guide]({{% relref "installation/build" %}}).
+For instructions on building LocalAI from source, see the [Build from Source guide]({{% relref "getting-started/build" %}}).
 
 {{% /tab %}}
 {{< /tabs >}}
@@ -364,6 +413,8 @@ See the [Model Configuration]({{% relref "advanced/model-configuration" %}}) gui
 
 ### List Installed Models
 
+Ollama clients can list configured models with `GET /api/tags` and loaded models with `GET /api/ps`. Each entry includes `size` in bytes when LocalAI can resolve a non-empty primary weights file on disk. This is the size of that file, not the total size of a multi-file model or its memory use. Unknown sizes are omitted; `/api/ps` also omits `size_vram` because per-model VRAM use is not available.
+
 ```bash
 # Via API
 curl http://localhost:8080/v1/models
@@ -371,6 +422,34 @@ curl http://localhost:8080/v1/models
 # Via CLI
 local-ai models list
 ```
+
+### Disk Usage
+
+In the WebUI, the **Installed** tab of **Models** shows how much disk each
+installed configuration uses. The **Size** column holds the size on disk, and
+for a model that shares files with others it adds the shared part ("1.2 GB
+shared"). A file referenced by more than one configuration is counted once in
+the total under the table, which also gives the shared total. The inspector
+beside the table names the models a model shares files with, and a model page
+lists its files under **Usage and history**, with each file's size, the other
+models that use it, and whether it is missing. Removing a model frees only its
+exclusive files; the files it shares stay while another configuration uses
+them. A reference whose file is not on disk (a download that never finished, or
+a file removed by hand) is marked on the model and in the cleanup review.
+
+Only an admin can read the report. For anyone else, or if the read fails, the
+Size column shows the size of the files the gallery lists, and "size unknown"
+for a model the gallery does not list.
+
+The report behind these views is available directly (admin only):
+
+```bash
+curl http://localhost:8080/api/models/storage
+```
+
+It returns per-model sizes with the shared portion split out, the
+file-to-models relation, and missing references. Files in the models directory
+that no configuration references are not included.
 
 ### Remove Models
 

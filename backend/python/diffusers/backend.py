@@ -25,6 +25,8 @@ import grpc
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'common'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'common'))
 from grpc_auth import get_auth_interceptors
+from model_utils import resolve_model_reference
+from audio_utils import write_pcm_wav
 
 
 # Import dynamic loader for pipeline discovery
@@ -34,13 +36,26 @@ from diffusers_dynamic_loader import (
     get_available_pipelines,
     load_diffusers_pipeline,
 )
+from load_options import single_file_load_kwargs
 
 # Import specific items still needed for special cases and safety checker
 from diffusers import DiffusionPipeline, ControlNetModel
 from diffusers import FluxPipeline, FluxTransformer2DModel, AutoencoderKLWan
 from diffusers.pipelines.stable_diffusion import safety_checker
 from diffusers.utils import load_image, export_to_video
-from compel import Compel, ReturnedEmbeddingsType
+# TODO: re-enable compel as a hard dependency once it supports transformers >= 5.
+# Tracking upstream: https://github.com/damian0815/compel/pull/129
+# and https://github.com/damian0815/compel/issues/128
+# Until then compel pins transformers ~= 4.25, which forces the pip resolver into
+# multi-hour backtracking storms in CI when DEPS_REFRESH rotates the cache.
+# Keep the import optional and gate usage on the COMPEL env var (set COMPEL=1 to opt in).
+try:
+    from compel import Compel, ReturnedEmbeddingsType
+    COMPEL_AVAILABLE = True
+except ImportError:
+    Compel = None
+    ReturnedEmbeddingsType = None
+    COMPEL_AVAILABLE = False
 from optimum.quanto import freeze, qfloat8, quantize
 from transformers import T5EncoderModel
 from safetensors.torch import load_file
@@ -66,6 +81,9 @@ from diffusers import LTX2VideoTransformer3DModel, GGUFQuantizationConfig
 
 _ONE_DAY_IN_SECONDS = 60 * 60 * 24
 COMPEL = os.environ.get("COMPEL", "0") == "1"
+if COMPEL and not COMPEL_AVAILABLE:
+    print("WARNING: COMPEL is enabled but the compel module is not installed. Install it manually (`pip install compel`) or unset COMPEL. Falling back to standard prompt processing.", file=sys.stderr)
+    COMPEL = False
 SD_EMBED = os.environ.get("SD_EMBED", "0") == "1"
 # Warn if SD_EMBED is enabled but the module is not available
 if SD_EMBED and not SD_EMBED_AVAILABLE:
@@ -105,6 +123,21 @@ from diffusers.schedulers import (
     PNDMScheduler,
     UniPCMultistepScheduler,
 )
+
+def select_device(request_cuda, device_option, cuda_available, xpu, mps_available):
+    """Pick the pipeline device. An explicit `device:` model option wins;
+    otherwise CUDA is used whenever torch reports it available (ROCm
+    builds included) or the model config forces it with `cuda: true`,
+    keeping the pre-existing XPU/MPS overrides. CPU is the fallback, not
+    the default."""
+    if device_option:
+        return device_option
+    device = "cuda" if (request_cuda or cuda_available) else "cpu"
+    if xpu:
+        device = "xpu"
+    if mps_available:
+        device = "mps"
+    return device
 
 def is_float(s):
     """Check if a string can be converted to float."""
@@ -200,7 +233,7 @@ def get_scheduler(name: str, config: dict = {}):
 # Implement the BackendServicer class with the service methods
 class BackendServicer(backend_pb2_grpc.BackendServicer):
 
-    def _load_pipeline(self, request, modelFile, fromSingleFile, torchType, variant, device_map=None):
+    def _load_pipeline(self, request, model_ref, from_single_file, local_only, torchType, variant, device_map=None):
         """
         Load a diffusers pipeline dynamically using the dynamic loader.
 
@@ -210,8 +243,9 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
 
         Args:
             request: The gRPC request containing pipeline configuration
-            modelFile: Path to the model file (for single file loading)
-            fromSingleFile: Whether to use from_single_file() vs from_pretrained()
+            model_ref: Repository ID or local model file/directory
+            from_single_file: Whether to use from_single_file() vs from_pretrained()
+            local_only: Whether Hub-backed loaders must remain offline
             torchType: The torch dtype to use
             variant: Model variant (e.g., "fp16")
             device_map: Device mapping strategy (e.g., "auto" for multi-GPU)
@@ -236,7 +270,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             dtype = torch.bfloat16
             bfl_repo = os.environ.get("BFL_REPO", "ChuckMcSneed/FLUX.1-dev")
 
-            transformer = FluxTransformer2DModel.from_single_file(modelFile, torch_dtype=dtype, device_map=device_map)
+            transformer = FluxTransformer2DModel.from_single_file(model_ref, torch_dtype=dtype, device_map=device_map)
             quantize(transformer, weights=qfloat8)
             freeze(transformer)
             text_encoder_2 = T5EncoderModel.from_pretrained(bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype, device_map=device_map)
@@ -254,17 +288,19 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         # WanPipeline - requires special VAE with float32 dtype
         if pipeline_type == "WanPipeline":
             vae = AutoencoderKLWan.from_pretrained(
-                request.Model,
+                model_ref,
                 subfolder="vae",
                 torch_dtype=torch.float32,
-                device_map=device_map
+                device_map=device_map,
+                local_files_only=local_only,
             )
             pipe = load_diffusers_pipeline(
                 class_name="WanPipeline",
-                model_id=request.Model,
+                model_id=model_ref,
                 vae=vae,
                 torch_dtype=torchType,
-                device_map=device_map
+                device_map=device_map,
+                local_files_only=local_only,
             )
             self.txt2vid = True
             return pipe
@@ -272,17 +308,19 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         # WanImageToVideoPipeline - requires special VAE with float32 dtype
         if pipeline_type == "WanImageToVideoPipeline":
             vae = AutoencoderKLWan.from_pretrained(
-                request.Model,
+                model_ref,
                 subfolder="vae",
                 torch_dtype=torch.float32,
-                device_map=device_map
+                device_map=device_map,
+                local_files_only=local_only,
             )
             pipe = load_diffusers_pipeline(
                 class_name="WanImageToVideoPipeline",
-                model_id=request.Model,
+                model_id=model_ref,
                 vae=vae,
                 torch_dtype=torchType,
-                device_map=device_map
+                device_map=device_map,
+                local_files_only=local_only,
             )
             self.img2vid = True
             return pipe
@@ -291,10 +329,11 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         if pipeline_type == "SanaPipeline":
             pipe = load_diffusers_pipeline(
                 class_name="SanaPipeline",
-                model_id=request.Model,
+                model_id=model_ref,
                 variant="bf16",
                 torch_dtype=torch.bfloat16,
-                device_map=device_map
+                device_map=device_map,
+                local_files_only=local_only,
             )
             pipe.vae.to(torch.bfloat16)
             pipe.text_encoder.to(torch.bfloat16)
@@ -305,9 +344,10 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             self.txt2vid = True
             pipe = load_diffusers_pipeline(
                 class_name="DiffusionPipeline",
-                model_id=request.Model,
+                model_id=model_ref,
                 torch_dtype=torchType,
-                device_map=device_map
+                device_map=device_map,
+                local_files_only=local_only,
             )
             return pipe
 
@@ -316,10 +356,11 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             self.img2vid = True
             pipe = load_diffusers_pipeline(
                 class_name="StableVideoDiffusionPipeline",
-                model_id=request.Model,
+                model_id=model_ref,
                 torch_dtype=torchType,
                 variant=variant,
-                device_map=device_map
+                device_map=device_map,
+                local_files_only=local_only,
             )
             if not DISABLE_CPU_OFFLOAD:
                 pipe.enable_model_cpu_offload()
@@ -331,8 +372,8 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             self.ltx2_pipeline = True
             
             # Check if loading from single file (GGUF)
-            if fromSingleFile and LTX2VideoTransformer3DModel is not None:
-                _, single_file_ext = os.path.splitext(modelFile)
+            if from_single_file and LTX2VideoTransformer3DModel is not None:
+                _, single_file_ext = os.path.splitext(model_ref)
                 if single_file_ext == ".gguf":
                     # Load transformer from single GGUF file with quantization
                     transformer_kwargs = {}
@@ -340,7 +381,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                     transformer_kwargs["quantization_config"] = quantization_config
                     
                     transformer = LTX2VideoTransformer3DModel.from_single_file(
-                        modelFile,
+                        model_ref,
                         config=request.Model,  # Use request.Model as the config/model_id
                         subfolder="transformer",
                         device_map=device_map,
@@ -359,7 +400,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                     # Single file but not GGUF - use standard single file loading
                     pipe = load_diffusers_pipeline(
                         class_name="LTX2ImageToVideoPipeline",
-                        model_id=modelFile,
+                        model_id=model_ref,
                         from_single_file=True,
                         torch_dtype=torchType,
                         device_map=device_map,
@@ -368,10 +409,11 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 # Standard loading from pretrained
                 pipe = load_diffusers_pipeline(
                     class_name="LTX2ImageToVideoPipeline",
-                    model_id=request.Model,
+                    model_id=model_ref,
                     torch_dtype=torchType,
                     variant=variant,
-                    device_map=device_map
+                    device_map=device_map,
+                    local_files_only=local_only,
                 )
             
             if not DISABLE_CPU_OFFLOAD:
@@ -384,8 +426,8 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             self.ltx2_pipeline = True
             
             # Check if loading from single file (GGUF)
-            if fromSingleFile and LTX2VideoTransformer3DModel is not None:
-                _, single_file_ext = os.path.splitext(modelFile)
+            if from_single_file and LTX2VideoTransformer3DModel is not None:
+                _, single_file_ext = os.path.splitext(model_ref)
                 if single_file_ext == ".gguf":
                     # Load transformer from single GGUF file with quantization
                     transformer_kwargs = {}
@@ -393,7 +435,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                     transformer_kwargs["quantization_config"] = quantization_config
                     
                     transformer = LTX2VideoTransformer3DModel.from_single_file(
-                        modelFile,
+                        model_ref,
                         config=request.Model,  # Use request.Model as the config/model_id
                         subfolder="transformer",
                         device_map=device_map,
@@ -412,7 +454,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                     # Single file but not GGUF - use standard single file loading
                     pipe = load_diffusers_pipeline(
                         class_name="LTX2Pipeline",
-                        model_id=modelFile,
+                        model_id=model_ref,
                         from_single_file=True,
                         torch_dtype=torchType,
                         device_map=device_map,
@@ -421,10 +463,11 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 # Standard loading from pretrained
                 pipe = load_diffusers_pipeline(
                     class_name="LTX2Pipeline",
-                    model_id=request.Model,
+                    model_id=model_ref,
                     torch_dtype=torchType,
                     variant=variant,
-                    device_map=device_map
+                    device_map=device_map,
+                    local_files_only=local_only,
                 )
             
             if not DISABLE_CPU_OFFLOAD:
@@ -438,14 +481,18 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
 
         # Build kwargs for dynamic loading
         load_kwargs = {"torch_dtype": torchType}
+        load_kwargs.update(
+            single_file_load_kwargs(request.OriginalConfigFile, from_single_file)
+        )
 
         # Add variant if not loading from single file
-        if not fromSingleFile and variant:
+        if not from_single_file and variant:
             load_kwargs["variant"] = variant
 
         # Add use_safetensors for from_pretrained
-        if not fromSingleFile:
+        if not from_single_file:
             load_kwargs["use_safetensors"] = SAFETENSORS
+            load_kwargs["local_files_only"] = local_only
 
         # Add device_map for multi-GPU support (when TensorParallelSize > 1)
         if device_map:
@@ -458,8 +505,8 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         try:
             pipe = load_diffusers_pipeline(
                 class_name=effective_pipeline_type,
-                model_id=modelFile if fromSingleFile else request.Model,
-                from_single_file=fromSingleFile,
+                model_id=model_ref,
+                from_single_file=from_single_file,
                 **load_kwargs
             )
         except Exception as e:
@@ -524,8 +571,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
 
             print(f"Options: {self.options}", file=sys.stderr)
 
-            local = False
-            modelFile = request.Model
+            model_ref, local_only = resolve_model_reference(request)
 
             self.cfg_scale = 7
             self.PipelineType = request.PipelineType
@@ -540,13 +586,10 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             if request.CLIPSubfolder != "":
                 clipsubfolder = request.CLIPSubfolder
 
-            # Check if ModelFile exists
-            if request.ModelFile != "":
-                if os.path.exists(request.ModelFile):
-                    local = True
-                    modelFile = request.ModelFile
-
-            fromSingleFile = request.Model.startswith("http") or request.Model.startswith("/") or local
+            from_single_file = os.path.isfile(model_ref) or (
+                not local_only
+                and (request.Model.startswith("http") or request.Model.startswith("/"))
+            )
             self.img2vid = False
             self.txt2vid = False
             self.ltx2_pipeline = False
@@ -564,8 +607,9 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             # Special cases that require custom initialization are handled first
             self.pipe = self._load_pipeline(
                 request=request,
-                modelFile=modelFile,
-                fromSingleFile=fromSingleFile,
+                model_ref=model_ref,
+                from_single_file=from_single_file,
+                local_only=local_only,
                 torchType=torchType,
                 variant=variant,
                 device_map=device_map
@@ -603,12 +647,13 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 # modify LoraAdapter to be relative to modelFileBase
                 request.LoraAdapter = os.path.join(request.ModelPath, request.LoraAdapter)
 
-            device = "cpu" if not request.CUDA else "cuda"
-            if XPU:
-                device = "xpu"
-            mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-            if mps_available:
-                device = "mps"
+            device = select_device(
+                request.CUDA,
+                self.options.pop("device", None),
+                torch.cuda.is_available(),
+                XPU,
+                hasattr(torch.backends, "mps") and torch.backends.mps.is_available(),
+            )
             self.device = device
             if request.LoraAdapter:
                 # Check if its a local file and not a directory ( we load lora differently for a safetensor file )
@@ -776,12 +821,12 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             image = image.resize((1024, 576))
 
             generator = torch.manual_seed(request.seed)
-            frames = self.pipe(image, guidance_scale=self.cfg_scale, decode_chunk_size=CHUNK_SIZE, generator=generator).frames[0]
+            frames = self.pipe(image=image, guidance_scale=self.cfg_scale, decode_chunk_size=CHUNK_SIZE, generator=generator).frames[0]
             export_to_video(frames, request.dst, fps=FPS)
             return backend_pb2.Result(message="Media generated successfully", success=True)
 
         if self.txt2vid:
-            video_frames = self.pipe(prompt, guidance_scale=self.cfg_scale, num_inference_steps=steps, num_frames=int(FRAMES)).frames
+            video_frames = self.pipe(prompt=prompt, guidance_scale=self.cfg_scale, num_inference_steps=steps, num_frames=int(FRAMES)).frames
             export_to_video(video_frames, request.dst)
             return backend_pb2.Result(message="Media generated successfully", success=True)
 
@@ -844,15 +889,91 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         else:
             # pass the kwargs dictionary to the self.pipe method
             image = self.pipe(
-                prompt,
+                prompt=prompt,
                 guidance_scale=self.cfg_scale,
                 **kwargs
             ).images[0]
 
-        # save the result
-        image.save(request.dst)
+        # save the result. Save as PNG explicitly instead of letting Pillow
+        # infer the encoder from the extension: the core passes an absolute
+        # staging path ending in .tmp (e.g. /staging/localai-output-*.tmp),
+        # which Pillow can't map to a format and would raise
+        # "unknown file extension: .tmp". LocalAI serves generated images as
+        # PNG regardless of the temp path.
+        image.save(request.dst, format="PNG")
 
         return backend_pb2.Result(message="Media generated", success=True)
+
+    def SoundGeneration(self, request, context):
+        if not request.dst:
+            return backend_pb2.Result(success=False, message="request.dst is required")
+
+        prompt = request.text or request.caption
+        if not prompt:
+            return backend_pb2.Result(success=False, message="request.text is required")
+
+        try:
+            generation_options = dict(self.options)
+            if "num_inference_steps" in generation_options:
+                generation_options["num_inference_steps"] = int(
+                    generation_options["num_inference_steps"]
+                )
+            generation_options["prompt"] = prompt
+            if request.HasField("duration"):
+                generation_options["audio_length_in_s"] = request.duration
+            if request.HasField("temperature"):
+                generation_options["guidance_scale"] = request.temperature
+
+            generated = self.pipe(**generation_options)
+            if not hasattr(generated, "audios") or len(generated.audios) == 0:
+                return backend_pb2.Result(
+                    success=False,
+                    message="The diffusers pipeline returned no audio",
+                )
+
+            samples = generated.audios[0]
+            if hasattr(samples, "reshape"):
+                samples = samples.reshape(-1)
+            if hasattr(samples, "tolist"):
+                samples = samples.tolist()
+
+            sampling_rate = getattr(
+                getattr(getattr(self.pipe, "vae", None), "config", None),
+                "sampling_rate",
+                16000,
+            )
+            write_pcm_wav(request.dst, samples, sampling_rate)
+            return backend_pb2.Result(success=True, message="Sound generated successfully")
+        except Exception as err:
+            return backend_pb2.Result(success=False, message=f"SoundGeneration error: {err}")
+
+    def UpscaleImage(self, request, context):
+        try:
+            if not request.src:
+                return backend_pb2.Result(success=False, message="No source image provided")
+            if not request.dst:
+                return backend_pb2.Result(success=False, message="No destination path provided")
+
+            scale = request.scale if request.scale > 0 else 2
+            image = Image.open(request.src).convert("RGB")
+
+            # If the loaded pipeline supports upscaling (e.g. StableDiffusionUpscalePipeline),
+            # use it; otherwise fall back to high-quality Lanczos resize.
+            if self.pipe is not None and self.PipelineType in ("StableDiffusionUpscalePipeline", "StableDiffusionLatentUpscalePipeline"):
+                print(f"UpscaleImage: using diffusers upscale pipeline ({self.PipelineType})", file=sys.stderr)
+                upscaled = self.pipe(prompt="", image=image).images[0]
+            else:
+                # Fallback: high-quality Lanczos resize
+                print(f"UpscaleImage: no upscale pipeline loaded, using Lanczos resize (scale={scale})", file=sys.stderr)
+                new_w = image.width * scale
+                new_h = image.height * scale
+                upscaled = image.resize((new_w, new_h), Image.LANCZOS)
+
+            upscaled.save(request.dst)
+            return backend_pb2.Result(message="Image upscaled", success=True)
+        except Exception as e:
+            print(f"UpscaleImage error: {e}", file=sys.stderr)
+            return backend_pb2.Result(success=False, message=str(e))
 
     def GenerateVideo(self, request, context):
         try:

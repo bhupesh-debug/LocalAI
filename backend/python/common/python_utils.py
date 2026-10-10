@@ -37,6 +37,46 @@ def parse_options(options_list):
     return opts
 
 
+def attach_media_parts(messages_dicts, n_images=0, n_videos=0):
+    """Rebuild the last user message as content *parts* carrying media markers.
+
+    Backends that let the tokenizer do the templating hand plain string content
+    to ``apply_chat_template``, but a chat template only emits the model's own
+    media tokens (``<|vision_start|><|image_pad|><|vision_end|>`` for the
+    Qwen-VL family, and the equivalents elsewhere) when the content is a list
+    of parts. Without those markers the engine's multimodal processor finds
+    nothing to substitute and silently discards the pixels, even though they
+    were forwarded correctly out of band.
+
+    Returns a new list whose last user message has
+    ``[{"type": "image"} * n_images, {"type": "video"} * n_videos, text]`` as
+    its content, or ``None`` when there is nothing to attach - no media, no
+    user turn, or content that is already a list of parts - so the caller can
+    keep using the original string-content list.
+    """
+    if not n_images and not n_videos:
+        return None
+    idx = next(
+        (
+            i
+            for i in reversed(range(len(messages_dicts)))
+            if messages_dicts[i].get("role") == "user"
+        ),
+        None,
+    )
+    if idx is None:
+        return None
+    text = messages_dicts[idx].get("content") or ""
+    if not isinstance(text, str):
+        return None
+    parts = [{"type": "image"}] * n_images + [{"type": "video"}] * n_videos
+    if text:
+        parts.append({"type": "text", "text": text})
+    patched = list(messages_dicts)
+    patched[idx] = dict(patched[idx], content=parts)
+    return patched
+
+
 def messages_to_dicts(proto_messages):
     """Convert proto ``Message`` objects to dicts suitable for ``apply_chat_template``.
 
@@ -58,7 +98,18 @@ def messages_to_dicts(proto_messages):
             d["reasoning_content"] = msg.reasoning_content
         if msg.tool_calls:
             try:
-                d["tool_calls"] = json.loads(msg.tool_calls)
+                tool_calls = json.loads(msg.tool_calls)
+                # Chat templates (e.g. Qwen) iterate function.arguments as a
+                # mapping, but the OpenAI wire format carries it as a JSON
+                # string — decode it back so the template's .items() works.
+                for tc in tool_calls:
+                    fn = tc.get("function") if isinstance(tc, dict) else None
+                    if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                        try:
+                            fn["arguments"] = json.loads(fn["arguments"])
+                        except json.JSONDecodeError:
+                            pass
+                d["tool_calls"] = tool_calls
             except json.JSONDecodeError:
                 pass
         result.append(d)

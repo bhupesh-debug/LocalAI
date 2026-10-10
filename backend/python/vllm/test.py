@@ -121,6 +121,21 @@ class TestBackendServicer(unittest.TestCase):
         finally:
             self.tearDown()
 
+    def test_explicit_zero_temperature_and_seed_are_preserved(self):
+        """Temperature=0 is greedy decoding and 0 is a valid seed — neither is
+        an unset value. A dropped seed turns a reproducible request random."""
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from backend import BackendServicer
+
+        servicer = BackendServicer()
+        request = backend_pb2.PredictOptions(Prompt="hello", Temperature=0, Seed=0)
+        sampling_params = servicer._build_sampling_params(request)
+        self.assertEqual(sampling_params.temperature, 0)
+        self.assertEqual(sampling_params.seed, 0)
+        # Other protobuf-default scalar fields must remain filtered.
+        self.assertEqual(sampling_params.top_p, 0.9)
+
 
     def test_messages_to_dicts(self):
         """
@@ -167,6 +182,58 @@ class TestBackendServicer(unittest.TestCase):
         self.assertEqual(opts["reasoning_parser"], "deepseek_r1")
         self.assertEqual(opts["key_with_colons"], "a:b:c")
         self.assertNotIn("invalid_no_colon", opts)
+
+    def test_apply_engine_args_known_keys(self):
+        """
+        Tests _apply_engine_args overlays user-supplied JSON onto AsyncEngineArgs.
+        """
+        import sys, os, json as _json
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from backend import BackendServicer
+        from vllm.engine.arg_utils import AsyncEngineArgs
+
+        servicer = BackendServicer()
+        base = AsyncEngineArgs(model="facebook/opt-125m")
+        extras = _json.dumps({
+            "trust_remote_code": True,
+            "max_num_seqs": 32,
+        })
+        out = servicer._apply_engine_args(base, extras)
+        self.assertTrue(out.trust_remote_code)
+        self.assertEqual(out.max_num_seqs, 32)
+        # untouched fields preserved
+        self.assertEqual(out.model, "facebook/opt-125m")
+
+    def test_apply_engine_args_unknown_key_raises(self):
+        """
+        Tests _apply_engine_args rejects unknown keys with a helpful suggestion.
+        """
+        import sys, os, json as _json
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from backend import BackendServicer
+        from vllm.engine.arg_utils import AsyncEngineArgs
+
+        servicer = BackendServicer()
+        base = AsyncEngineArgs(model="facebook/opt-125m")
+        with self.assertRaises(ValueError) as ctx:
+            servicer._apply_engine_args(base, _json.dumps({"trustremotecode": True}))
+        self.assertIn("trustremotecode", str(ctx.exception))
+        # close-match hint for the typo
+        self.assertIn("trust_remote_code", str(ctx.exception))
+
+    def test_apply_engine_args_empty_passthrough(self):
+        """
+        Tests that empty engine_args returns the base unchanged.
+        """
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from backend import BackendServicer
+        from vllm.engine.arg_utils import AsyncEngineArgs
+
+        servicer = BackendServicer()
+        base = AsyncEngineArgs(model="facebook/opt-125m")
+        self.assertIs(servicer._apply_engine_args(base, ""), base)
+        self.assertIs(servicer._apply_engine_args(base, None), base)
 
     def test_tokenize_string(self):
         """
@@ -227,3 +294,373 @@ class TestBackendServicer(unittest.TestCase):
             self.fail("Embedding service failed")
         finally:
             self.tearDown()
+
+
+class TestStreamingToolParser(unittest.TestCase):
+    """
+    Server-less unit tests for the streaming + tool-parser machinery in
+    BackendServicer._predict. These tests instantiate BackendServicer
+    directly and mock the vLLM engine + tool parser, so they do not need
+    a GPU, a model, or a running gRPC server. Kept in a separate class to
+    avoid the parent setUp() which spawns a subprocess.
+
+    Covers #582 (follow-up to #10346):
+      1. Markup-leak prevention with a non-streaming parser (buffer fallback)
+      2. No content duplication on the plain-text path with the buffer fallback
+      3. Native streaming progressive plain-text emission
+      4. Native streaming structured tool_call, no markup leak
+      5. Parser exception → graceful fallback to buffer, still no markup
+      6. No-tool-parser regression: unchanged per-delta content stream
+    """
+
+    @staticmethod
+    def _make_generate(chunks):
+        """Build a fake vLLM engine.generate that yields cumulative chunks."""
+        from types import SimpleNamespace
+        async def gen(*a, **k):
+            for i, t in enumerate(chunks):
+                yield SimpleNamespace(
+                    outputs=[SimpleNamespace(
+                        text=t,
+                        token_ids=list(range(i + 1)),
+                        logprobs=None,
+                    )],
+                    prompt_token_ids=[0],
+                )
+        return lambda *a, **k: gen()
+
+    @staticmethod
+    def _collect(servicer, req):
+        import asyncio
+        async def run():
+            return [r async for r in servicer._predict(req, None, streaming=True)]
+        return asyncio.run(run())
+
+    def _new_servicer(self):
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from backend import BackendServicer
+        s = BackendServicer()
+        s.reasoning_parser_cls = None
+        s.tool_parser_cls = None
+        s.tokenizer = None
+        return s
+
+    # ── Case 1+2: parser without streaming method → buffer fallback ──
+    def test_buffer_path_no_markup_no_duplication(self):
+        from types import SimpleNamespace
+
+        def parser_cls(called, content_text, calls):
+            class _P:
+                def __init__(self, tokenizer, tools=None):
+                    pass
+                # NOTE: NO extract_tool_calls_streaming → takes the buffer path
+                def extract_tool_calls(self, c, request=None):
+                    return SimpleNamespace(
+                        tools_called=called, content=content_text, tool_calls=calls,
+                    )
+            return _P
+
+        tools_json = '[{"type":"function","function":{"name":"calc","parameters":{}}}]'
+
+        # Tool-call case: no raw markup in any delta.content
+        s = self._new_servicer()
+        s.llm = SimpleNamespace(generate=self._make_generate([
+            '<tool_call>\n{"name": "calc"',
+            '<tool_call>\n{"name": "calc", "arguments": {"x": 1}}\n</tool_call>',
+        ]))
+        call = SimpleNamespace(id="call_1",
+                               function=SimpleNamespace(name="calc", arguments='{"x": 1}'))
+        s.tool_parser_cls = parser_cls(True, "", [call])
+        req = backend_pb2.PredictOptions(Prompt="x", Tools=tools_json)
+        replies = self._collect(s, req)
+        contents = [cd.content for r in replies for cd in r.chat_deltas if cd.content]
+        self.assertFalse(
+            any("<tool_call" in c for c in contents),
+            f"markup leaked: {contents!r}",
+        )
+        names = [tc.name for r in replies for cd in r.chat_deltas for tc in cd.tool_calls]
+        self.assertIn("calc", names, "tool_call missing from final chunk")
+
+        # Plain-text-with-tools case: full content delivered exactly once
+        s2 = self._new_servicer()
+        s2.llm = SimpleNamespace(generate=self._make_generate([
+            "The capital ",
+            "The capital of France is Paris.",
+        ]))
+        s2.tool_parser_cls = parser_cls(False, "", [])
+        req2 = backend_pb2.PredictOptions(Prompt="x", Tools=tools_json)
+        joined = "".join(
+            cd.content for r in self._collect(s2, req2)
+            for cd in r.chat_deltas if cd.content
+        )
+        self.assertEqual(
+            joined.count("The capital of France is Paris."), 1,
+            f"buffered content duplicated: {joined!r}",
+        )
+
+    # ── Case 3: native streaming, progressive plain text ──
+    def test_native_streaming_progressive_plain_text(self):
+        from types import SimpleNamespace
+
+        class _DeltaMsg:
+            def __init__(self, content=None, reasoning=None, tool_calls=None):
+                self.content = content
+                self.reasoning = reasoning
+                self.tool_calls = tool_calls or []
+
+        class StreamingParser:
+            def __init__(self, tokenizer, tools=None):
+                pass
+            def extract_tool_calls(self, c, request=None):
+                # Should NOT be called when native streaming runs successfully.
+                raise AssertionError("extract_tool_calls invoked on native-streaming path")
+            def extract_tool_calls_streaming(
+                self, previous_text, current_text, delta_text,
+                previous_token_ids, current_token_ids, delta_token_ids, request,
+            ):
+                if not delta_text:
+                    return None
+                return _DeltaMsg(content=delta_text)
+
+        s = self._new_servicer()
+        s.llm = SimpleNamespace(generate=self._make_generate([
+            "Paris ",
+            "Paris is ",
+            "Paris is the capital of France.",
+        ]))
+        s.tool_parser_cls = StreamingParser
+        req = backend_pb2.PredictOptions(
+            Prompt="x",
+            Tools='[{"type":"function","function":{"name":"calc","parameters":{}}}]',
+        )
+        replies = self._collect(s, req)
+
+        intermediate_content = [
+            cd.content for r in replies[:-1] for cd in r.chat_deltas if cd.content
+        ]
+        self.assertTrue(
+            len(intermediate_content) > 0,
+            "Plain-text response not streamed progressively (native streaming inactive?)",
+        )
+        assembled = "".join(
+            cd.content for r in replies for cd in r.chat_deltas if cd.content
+        )
+        self.assertEqual(
+            assembled, "Paris is the capital of France.",
+            f"Assembled content wrong: {assembled!r}",
+        )
+
+    # ── Case 4: native streaming, structured tool_call, no markup ──
+    def test_native_streaming_tool_call_no_markup_leak(self):
+        from types import SimpleNamespace
+
+        class _DeltaMsg:
+            def __init__(self, content=None, reasoning=None, tool_calls=None):
+                self.content = content
+                self.reasoning = reasoning
+                self.tool_calls = tool_calls or []
+
+        class _ToolCallStreamer:
+            def __init__(self, tokenizer, tools=None):
+                self._emitted = False
+            def extract_tool_calls(self, c, request=None):
+                raise AssertionError("extract_tool_calls invoked on native-streaming path")
+            def extract_tool_calls_streaming(
+                self, previous_text, current_text, delta_text,
+                previous_token_ids, current_token_ids, delta_token_ids, request,
+            ):
+                if "</tool_call>" in current_text and not self._emitted:
+                    self._emitted = True
+                    fn = SimpleNamespace(name="calc", arguments='{"x": 1}')
+                    tc = SimpleNamespace(id="call_1", type="function", index=0, function=fn)
+                    return _DeltaMsg(tool_calls=[tc])
+                return None
+
+        s = self._new_servicer()
+        s.llm = SimpleNamespace(generate=self._make_generate([
+            '<tool_call>\n',
+            '<tool_call>\n{"name": "calc"',
+            '<tool_call>\n{"name": "calc", "arguments": {"x": 1}}\n</tool_call>',
+        ]))
+        s.tool_parser_cls = _ToolCallStreamer
+        req = backend_pb2.PredictOptions(
+            Prompt="x",
+            Tools='[{"type":"function","function":{"name":"calc","parameters":{}}}]',
+        )
+        replies = self._collect(s, req)
+
+        contents = [cd.content for r in replies for cd in r.chat_deltas if cd.content]
+        self.assertFalse(
+            any("<tool_call" in c or "</tool_call>" in c for c in contents),
+            f"markup leaked as content: {contents!r}",
+        )
+        names = [tc.name for r in replies for cd in r.chat_deltas for tc in cd.tool_calls if tc.name]
+        args  = [tc.arguments for r in replies for cd in r.chat_deltas for tc in cd.tool_calls if tc.arguments]
+        self.assertIn("calc", names, f"tool_call name missing; got {names!r}")
+        self.assertIn('{"x": 1}', args, f"tool_call args missing; got {args!r}")
+
+    # ── Case 5: parser exception → fallback to buffer, no leak ──
+    def test_native_streaming_parser_exception_falls_back_to_buffer(self):
+        from types import SimpleNamespace
+        call = SimpleNamespace(id="call_1",
+                               function=SimpleNamespace(name="calc", arguments='{"x": 1}'))
+
+        class _BrokenStreamer:
+            def __init__(self, tokenizer, tools=None):
+                pass
+            def extract_tool_calls(self, c, request=None):
+                return SimpleNamespace(tools_called=True, content="", tool_calls=[call])
+            def extract_tool_calls_streaming(self, *a, **kw):
+                raise RuntimeError("simulated parser bug")
+
+        s = self._new_servicer()
+        s.llm = SimpleNamespace(generate=self._make_generate([
+            '<tool_call>\n{"name": "calc"',
+            '<tool_call>\n{"name": "calc", "arguments": {"x": 1}}\n</tool_call>',
+        ]))
+        s.tool_parser_cls = _BrokenStreamer
+        req = backend_pb2.PredictOptions(
+            Prompt="x",
+            Tools='[{"type":"function","function":{"name":"calc","parameters":{}}}]',
+        )
+        replies = self._collect(s, req)
+
+        contents = [cd.content for r in replies for cd in r.chat_deltas if cd.content]
+        self.assertFalse(
+            any("<tool_call" in c for c in contents),
+            f"markup leaked after parser exception: {contents!r}",
+        )
+        names = [tc.name for r in replies for cd in r.chat_deltas for tc in cd.tool_calls]
+        self.assertIn("calc", names, "tool_call missing from final chunk after fallback")
+
+    # ── Case 6: no tool parser → unchanged per-delta content stream ──
+    def test_no_tool_parser_unchanged_per_delta_stream(self):
+        from types import SimpleNamespace
+        s = self._new_servicer()  # tool_parser_cls already None
+        s.llm = SimpleNamespace(generate=self._make_generate([
+            "Hello ", "Hello world", "Hello world!",
+        ]))
+        req = backend_pb2.PredictOptions(Prompt="x", Tools="")
+        replies = self._collect(s, req)
+
+        intermediate = [
+            cd.content for r in replies[:-1] for cd in r.chat_deltas if cd.content
+        ]
+        self.assertEqual(
+            intermediate, ["Hello ", "world", "!"],
+            f"plain streaming changed; got {intermediate!r}",
+        )
+
+
+class TestReasoningSplit(unittest.TestCase):
+    """Server-less tests for BackendServicer._split_reasoning.
+
+    vLLM's BaseThinkingReasoningParser returns the whole completion as
+    reasoning and None as content whenever the end token is missing. Taken
+    literally that duplicates a thinking-disabled answer into both fields.
+    """
+
+    class _Parser:
+        start_token = "<think>"
+        end_token = "</think>"
+
+    def _split(self, generated, prompt, reasoning, content):
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from backend import BackendServicer
+        return BackendServicer._split_reasoning(
+            self._Parser(), generated, prompt, reasoning, content,
+        )
+
+    def test_thinking_off_is_not_duplicated_into_reasoning(self):
+        """No tags anywhere: the answer is content, and only content."""
+        r, c = self._split(
+            "391", "user: 17*23?\n<think>\n\n</think>\n\n",
+            reasoning="391", content=None,
+        )
+        self.assertEqual(r, "")
+        self.assertEqual(c, "391")
+
+    def test_prefilled_start_tag_keeps_truncated_reasoning(self):
+        """Prompt left the block open and the end token never arrived
+        (budget exhausted): that really is all reasoning."""
+        r, c = self._split(
+            "thinking and thinking", "user: hi\n<think>\n",
+            reasoning="thinking and thinking", content=None,
+        )
+        self.assertEqual(r, "thinking and thinking")
+        self.assertEqual(c, "")
+
+    def test_end_token_present_keeps_parser_split(self):
+        r, c = self._split(
+            "adding two and two</think>4", "user: hi\n<think>\n",
+            reasoning="adding two and two", content="4",
+        )
+        self.assertEqual(r, "adding two and two")
+        self.assertEqual(c, "4")
+
+    def test_stop_right_after_end_token_yields_empty_content(self):
+        """Content must not fall back to the raw text — that would put the
+        reasoning into the answer."""
+        r, c = self._split(
+            "reasoned</think>", "user: hi\n<think>\n",
+            reasoning="reasoned", content=None,
+        )
+        self.assertEqual(r, "reasoned")
+        self.assertEqual(c, "")
+
+    def test_unknown_token_layout_keeps_previous_behaviour(self):
+        class _Bare:
+            pass
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from backend import BackendServicer
+        r, c = BackendServicer._split_reasoning(
+            _Bare(), "raw", "prompt", "raw", None,
+        )
+        self.assertEqual(r, "raw")
+        self.assertEqual(c, "raw")
+
+
+class TestReasoningParserConstruction(unittest.TestCase):
+    """The parser must learn whether thinking was on for this request.
+
+    vLLM's engine-based parsers (Qwen3Parser and friends) read
+    chat_template_kwargs["enable_thinking"] and default to True, so a parser
+    built without it treats a thinking-disabled completion as pure reasoning.
+    """
+
+    def _servicer(self):
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from backend import BackendServicer
+        s = BackendServicer()
+        s.tokenizer = object()
+        return s
+
+    def test_chat_template_kwargs_are_forwarded(self):
+        seen = {}
+
+        class _Parser:
+            def __init__(self, tokenizer, **kwargs):
+                seen.update(kwargs)
+
+        s = self._servicer()
+        s.reasoning_parser_cls = _Parser
+        s._new_reasoning_parser({"enable_thinking": False})
+        self.assertEqual(
+            seen.get("chat_template_kwargs"), {"enable_thinking": False},
+        )
+
+    def test_parser_without_the_kwarg_still_builds(self):
+        """Older parsers take only the tokenizer — must not break them."""
+        class _Old:
+            def __init__(self, tokenizer):
+                self.tokenizer = tokenizer
+
+        s = self._servicer()
+        s.reasoning_parser_cls = _Old
+        self.assertIsInstance(
+            s._new_reasoning_parser({"enable_thinking": False}), _Old,
+        )

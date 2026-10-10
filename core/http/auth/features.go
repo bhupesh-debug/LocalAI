@@ -39,16 +39,30 @@ var RouteFeatureRegistry = []RouteFeature{
 	{"POST", "/images/generations", FeatureImages},
 	{"POST", "/v1/images/inpainting", FeatureImages},
 	{"POST", "/images/inpainting", FeatureImages},
+	{"POST", "/v1/images/upscale", FeatureImages},
+	{"POST", "/images/upscale", FeatureImages},
 
 	// Audio transcription
 	{"POST", "/v1/audio/transcriptions", FeatureAudioTranscription},
 	{"POST", "/audio/transcriptions", FeatureAudioTranscription},
 
+	// Audio diarization (speaker turns)
+	{"POST", "/v1/audio/diarization", FeatureAudioDiarization},
+	{"POST", "/audio/diarization", FeatureAudioDiarization},
+
+	// Audio classification (sound-event tagging)
+	{"POST", "/v1/audio/classification", FeatureAudioClassification},
+	{"POST", "/audio/classification", FeatureAudioClassification},
+
 	// Audio speech / TTS
 	{"POST", "/v1/audio/speech", FeatureAudioSpeech},
 	{"POST", "/audio/speech", FeatureAudioSpeech},
 	{"POST", "/tts", FeatureAudioSpeech},
+	{"GET", "/v1/audio/voices", FeatureAudioSpeech},
+	{"GET", "/audio/voices", FeatureAudioSpeech},
 	{"POST", "/v1/text-to-speech/:voice-id", FeatureAudioSpeech},
+	{"GET", "/api/voice-profiles", FeatureAudioSpeech},
+	{"GET", "/api/voice-profiles/:id/audio", FeatureAudioSpeech},
 
 	// VAD
 	{"POST", "/vad", FeatureVAD},
@@ -57,8 +71,40 @@ var RouteFeatureRegistry = []RouteFeature{
 	// Detection
 	{"POST", "/v1/detection", FeatureDetection},
 
+	// Decisions API (OpenAI and SystemOne wire contracts)
+	{"POST", "/v1/decisions", FeatureDecisions},
+	{"POST", "/v1/systemone", FeatureDecisions},
+	{"POST", "/v1/systemone/permute", FeatureDecisions},
+	{"POST", "/v1/systemone/separate", FeatureDecisions},
+
+	// Face recognition
+	{"POST", "/v1/face/verify", FeatureFaceRecognition},
+	{"POST", "/v1/face/analyze", FeatureFaceRecognition},
+	{"POST", "/v1/face/embed", FeatureFaceRecognition},
+	{"POST", "/v1/face/register", FeatureFaceRecognition},
+	{"POST", "/v1/face/identify", FeatureFaceRecognition},
+	{"POST", "/v1/face/forget", FeatureFaceRecognition},
+
+	// Voice (speaker) recognition
+	{"POST", "/v1/voice/verify", FeatureVoiceRecognition},
+	{"POST", "/v1/voice/analyze", FeatureVoiceRecognition},
+	{"POST", "/v1/voice/embed", FeatureVoiceRecognition},
+	{"POST", "/v1/voice/register", FeatureVoiceRecognition},
+	{"POST", "/v1/voice/identify", FeatureVoiceRecognition},
+	{"POST", "/v1/voice/forget", FeatureVoiceRecognition},
+
+	// Audio transform (echo cancellation, noise suppression, voice conversion, etc.)
+	{"POST", "/audio/transformations", FeatureAudioTransform},
+	{"POST", "/audio/transform", FeatureAudioTransform},
+	{"GET", "/audio/transformations/stream", FeatureAudioTransform},
+
 	// Video
 	{"POST", "/video", FeatureVideo},
+
+	// 3D generation
+	{"POST", "/3d/generations", Feature3D},
+	{"POST", "/3d/remesh", Feature3D},
+	{"POST", "/3d/animate", Feature3D},
 
 	// Sound generation
 	{"POST", "/v1/sound-generation", FeatureSound},
@@ -76,9 +122,14 @@ var RouteFeatureRegistry = []RouteFeature{
 
 	// Tokenize
 	{"POST", "/v1/tokenize", FeatureTokenize},
+	{"POST", "/v1/detokenize", FeatureTokenize},
 
 	// Rerank
 	{"POST", "/v1/rerank", FeatureRerank},
+
+	// Moderation
+	{"POST", "/v1/moderations", FeatureModeration},
+	{"POST", "/moderations", FeatureModeration},
 
 	// Stores
 	{"POST", "/stores/set", FeatureStores},
@@ -97,6 +148,10 @@ var RouteFeatureRegistry = []RouteFeature{
 	{"POST", "/api/fine-tuning/jobs/:id/export", FeatureFineTuning},
 	{"GET", "/api/fine-tuning/jobs/:id/download", FeatureFineTuning},
 	{"POST", "/api/fine-tuning/datasets", FeatureFineTuning},
+
+	// PII analyze/redact service (the events log stays admin-gated in-handler)
+	{"POST", "/api/pii/analyze", FeaturePIIFilter},
+	{"POST", "/api/pii/redact", FeaturePIIFilter},
 
 	// Quantization
 	{"POST", "/api/quantization/jobs", FeatureQuantization},
@@ -123,6 +178,7 @@ func AgentFeatureMetas() []FeatureMeta {
 		{FeatureSkills, "Skills", false},
 		{FeatureCollections, "Collections", false},
 		{FeatureMCPJobs, "MCP CI Jobs", false},
+		{FeatureLocalAIAssistant, "LocalAI Assistant", false},
 	}
 }
 
@@ -141,15 +197,24 @@ func APIFeatureMetas() []FeatureMeta {
 		{FeatureImages, "Image Generation", true},
 		{FeatureAudioSpeech, "Audio Speech / TTS", true},
 		{FeatureAudioTranscription, "Audio Transcription", true},
+		{FeatureAudioDiarization, "Audio Diarization", true},
+		{FeatureAudioClassification, "Audio Classification", true},
 		{FeatureVAD, "Voice Activity Detection", true},
 		{FeatureDetection, "Detection", true},
 		{FeatureVideo, "Video Generation", true},
+		{Feature3D, "3D Generation", true},
 		{FeatureEmbeddings, "Embeddings", true},
 		{FeatureSound, "Sound Generation", true},
 		{FeatureRealtime, "Realtime", true},
+		{FeatureModeration, "Moderation", true},
 		{FeatureRerank, "Rerank", true},
 		{FeatureTokenize, "Tokenize", true},
 		{FeatureMCP, "MCP", true},
 		{FeatureStores, "Stores", true},
+		{FeatureFaceRecognition, "Face Recognition", true},
+		{FeatureVoiceRecognition, "Voice Recognition", true},
+		{FeatureAudioTransform, "Audio Transform", true},
+		{FeaturePIIFilter, "PII Analyze / Redact", true},
+		{FeatureDecisions, "Decisions", true},
 	}
 }

@@ -33,6 +33,7 @@ import json
 import os
 import signal
 import sys
+import tempfile
 import time
 from concurrent import futures
 from pathlib import Path
@@ -637,7 +638,10 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             normalized = (pooled / (norm + 1e-12))
             vec = normalized.cast(dtypes.float32).tolist()
 
-            return backend_pb2.EmbeddingResult(embeddings=[float(x) for x in vec])
+            return backend_pb2.EmbeddingResult(
+                embeddings=[float(x) for x in vec],
+                layout=backend_pb2.EMBEDDING_LAYOUT_FINAL,
+            )
         except Exception as exc:
             import traceback
             traceback.print_exc()
@@ -668,8 +672,11 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             )
             arr = img_tensor.numpy()
             image = Image.fromarray(arr)
-            dst = request.dst or "/tmp/tinygrad_image.png"
-            image.save(dst)
+            dst = request.dst or os.path.join(tempfile.gettempdir(), "tinygrad_image.png")
+            # Force PNG rather than letting Pillow guess from the extension: the
+            # core passes a staging path ending in .tmp, which Pillow can't map
+            # to a format ("unknown file extension: .tmp").
+            image.save(dst, format="PNG")
             return backend_pb2.Result(success=True, message=dst)
         except Exception as exc:
             import traceback

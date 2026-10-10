@@ -19,7 +19,30 @@ import (
 	"golang.org/x/oauth2"
 	githubOAuth "golang.org/x/oauth2/github"
 	"gorm.io/gorm"
+
+	"github.com/mudler/LocalAI/pkg/httpclient"
 )
+
+// oidcSupportedSigningAlgs is the set of ID-token signature algorithms the OIDC
+// verifier accepts. go-oidc defaults to RS256 only, which rejects identity
+// providers that sign tokens with EC keys (ES*) or other algorithms — e.g.
+// Authentik configured with an EC signing key fails the callback with
+// "unexpected signature algorithm ... expected [RS256]" (#10677). All entries
+// are asymmetric algorithms verified against the provider's published JWKS;
+// HS256 is intentionally excluded (it is symmetric and would validate against
+// the client secret, a different and security-sensitive trust model).
+var oidcSupportedSigningAlgs = []string{
+	oidc.RS256, oidc.RS384, oidc.RS512,
+	oidc.ES256, oidc.ES384, oidc.ES512,
+	oidc.PS256, oidc.PS384, oidc.PS512,
+	oidc.EdDSA,
+}
+
+// OIDCSupportedSigningAlgs returns a copy of the ID-token signature algorithms
+// the OIDC verifier accepts. Exposed for tests.
+func OIDCSupportedSigningAlgs() []string {
+	return append([]string(nil), oidcSupportedSigningAlgs...)
+}
 
 // providerEntry holds the OAuth2/OIDC config for a single provider.
 type providerEntry struct {
@@ -30,11 +53,16 @@ type providerEntry struct {
 }
 
 // oauthUserInfo is a provider-agnostic representation of an authenticated user.
+// EmailVerified MUST reflect upstream verification: AssignRole compares Email
+// against the configured admin email, so an unverified claim of a privileged
+// address must not be honoured. Callers that cannot prove verification set
+// EmailVerified=false.
 type oauthUserInfo struct {
-	Subject   string
-	Email     string
-	Name      string
-	AvatarURL string
+	Subject       string
+	Email         string
+	EmailVerified bool
+	Name          string
+	AvatarURL     string
 }
 
 // OAuthManager manages multiple OAuth/OIDC providers.
@@ -78,7 +106,10 @@ func NewOAuthManager(baseURL string, params OAuthParams) (*OAuthManager, error) 
 			return nil, fmt.Errorf("OIDC discovery failed for %s: %w", params.OIDCIssuer, err)
 		}
 
-		verifier := provider.Verifier(&oidc.Config{ClientID: params.OIDCClientID})
+		verifier := provider.Verifier(&oidc.Config{
+			ClientID:             params.OIDCClientID,
+			SupportedSigningAlgs: oidcSupportedSigningAlgs,
+		})
 
 		m.providers[ProviderOIDC] = &providerEntry{
 			name: ProviderOIDC,
@@ -195,6 +226,11 @@ func (m *OAuthManager) CallbackHandler(providerName string, db *gorm.DB, adminEm
 			userInfo, err = fetchGitHubUserInfoAsOAuth(ctx, token.AccessToken)
 		}
 		if err != nil {
+			// Surface the real cause server-side: ID-token verify failures (issuer/
+			// audience mismatch behind a reverse proxy), a missing id_token, claim
+			// parse errors, or the GitHub userinfo HTTP status/body. The client still
+			// gets the generic message below; details go to logs only. See #10677.
+			xlog.Error("OAuth callback: failed to resolve user info", "provider", providerName, "error", err)
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to fetch user info"})
 		}
 
@@ -236,10 +272,15 @@ func (m *OAuthManager) CallbackHandler(providerName string, db *gorm.DB, adminEm
 					email = strings.ToLower(strings.TrimSpace(userInfo.Email))
 				}
 
-				role := AssignRole(tx, email, adminEmail)
+				// roleEmail is what AssignRole and NeedsInviteOrApproval
+				// use to short-circuit on admin-email matches. Pass the
+				// unverified-email-substituted form so an IdP-supplied
+				// copy of LOCALAI_ADMIN_EMAIL doesn't bypass either gate.
+				roleEmail := emailForRoleDecision(email, userInfo.EmailVerified)
+				role := AssignRole(tx, roleEmail, adminEmail)
 				status := StatusActive
 
-				if NeedsInviteOrApproval(tx, email, adminEmail, registrationMode) {
+				if NeedsInviteOrApproval(tx, roleEmail, adminEmail, registrationMode) {
 					if registrationMode == "invite" {
 						if inviteCode == "" {
 							return fmt.Errorf("invite_required")
@@ -294,8 +335,11 @@ func (m *OAuthManager) CallbackHandler(providerName string, db *gorm.DB, adminEm
 			return c.JSON(http.StatusForbidden, map[string]string{"error": "account pending approval"})
 		}
 
-		// Maybe promote on login
-		MaybePromote(db, user, adminEmail)
+		// Same gate as roleEmail above: only verified emails can flip an
+		// existing user to admin via the LOCALAI_ADMIN_EMAIL match.
+		if userInfo.EmailVerified {
+			MaybePromote(db, user, adminEmail)
+		}
 
 		// Create session
 		sessionID, err := CreateSession(db, user.ID, hmacSecret)
@@ -321,20 +365,26 @@ func extractOIDCUserInfo(ctx context.Context, verifier *oidc.IDTokenVerifier, to
 	}
 
 	var claims struct {
-		Sub     string `json:"sub"`
-		Email   string `json:"email"`
-		Name    string `json:"name"`
-		Picture string `json:"picture"`
+		Sub           string `json:"sub"`
+		Email         string `json:"email"`
+		EmailVerified *bool  `json:"email_verified"`
+		Name          string `json:"name"`
+		Picture       string `json:"picture"`
 	}
 	if err := idToken.Claims(&claims); err != nil {
 		return nil, fmt.Errorf("failed to parse ID token claims: %w", err)
 	}
 
+	// Default to false on absence: an IdP that doesn't issue the claim is
+	// not asserting verification, and we must not promote on its email.
+	verified := claims.EmailVerified != nil && *claims.EmailVerified
+
 	return &oauthUserInfo{
-		Subject:   claims.Sub,
-		Email:     claims.Email,
-		Name:      claims.Name,
-		AvatarURL: claims.Picture,
+		Subject:       claims.Sub,
+		Email:         claims.Email,
+		EmailVerified: verified,
+		Name:          claims.Name,
+		AvatarURL:     claims.Picture,
 	}, nil
 }
 
@@ -353,21 +403,24 @@ type githubEmail struct {
 }
 
 // fetchGitHubUserInfoAsOAuth fetches GitHub user info and returns it as oauthUserInfo.
+// GitHub only surfaces verified emails (public profile email and the
+// /user/emails Verified=true filter), so a non-empty email is always verified.
 func fetchGitHubUserInfoAsOAuth(ctx context.Context, accessToken string) (*oauthUserInfo, error) {
 	info, err := fetchGitHubUserInfo(ctx, accessToken)
 	if err != nil {
 		return nil, err
 	}
 	return &oauthUserInfo{
-		Subject:   fmt.Sprintf("%d", info.ID),
-		Email:     info.Email,
-		Name:      info.Name,
-		AvatarURL: info.AvatarURL,
+		Subject:       fmt.Sprintf("%d", info.ID),
+		Email:         info.Email,
+		EmailVerified: info.Email != "",
+		Name:          info.Name,
+		AvatarURL:     info.AvatarURL,
 	}, nil
 }
 
 func fetchGitHubUserInfo(ctx context.Context, accessToken string) (*githubUserInfo, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := httpclient.NewWithTimeout(10 * time.Second)
 
 	req, _ := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/user", nil)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -398,7 +451,7 @@ func fetchGitHubUserInfo(ctx context.Context, accessToken string) (*githubUserIn
 }
 
 func fetchGitHubPrimaryEmail(ctx context.Context, accessToken string) (string, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := httpclient.NewWithTimeout(10 * time.Second)
 
 	req, _ := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/user/emails", nil)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -435,7 +488,6 @@ func fetchGitHubPrimaryEmail(ctx context.Context, accessToken string) (string, e
 
 	return "", fmt.Errorf("no verified email found")
 }
-
 
 func generateState() (string, error) {
 	b := make([]byte, 16)

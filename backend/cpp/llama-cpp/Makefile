@@ -1,5 +1,5 @@
 
-LLAMA_VERSION?=45cac7ca703fb9085eae62b9121fca01d20177f6
+LLAMA_VERSION?=de7fa0a3c6a2e1b4cd9f22eb8d6bf5b12dbdb63b
 LLAMA_REPO?=https://github.com/ggerganov/llama.cpp
 
 CMAKE_ARGS?=
@@ -10,8 +10,16 @@ TARGET?=--target grpc-server
 JOBS?=$(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
 ARCH?=$(shell uname -m)
 
-# Disable Shared libs as we are linking on static gRPC and we can't mix shared and static
-CMAKE_ARGS+=-DBUILD_SHARED_LIBS=OFF -DLLAMA_CURL=OFF
+# Shared libs default to OFF: we link static gRPC and the avx/avx2/avx512/fallback
+# variants are fully static. The CPU_ALL_VARIANTS build flips SHARED_LIBS=ON (ggml/llama
+# become shared so the dynamic CPU backends work; gRPC stays static via its imported
+# targets). SHARED_LIBS is a make variable, not an appended -D, so it survives the
+# recursive sub-make into the VARIANT build dir (which re-parses this Makefile) instead
+# of being re-clobbered by a second -DBUILD_SHARED_LIBS=OFF. EXTRA_CMAKE_ARGS is the hook
+# the CPU_ALL_VARIANTS target uses to inject -DGGML_BACKEND_DL/-DGGML_CPU_ALL_VARIANTS.
+SHARED_LIBS?=OFF
+EXTRA_CMAKE_ARGS?=
+CMAKE_ARGS+=-DBUILD_SHARED_LIBS=$(SHARED_LIBS) -DLLAMA_CURL=OFF $(EXTRA_CMAKE_ARGS)
 
 CURRENT_MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 ifeq ($(NATIVE),false)
@@ -33,7 +41,10 @@ else ifeq ($(BUILD_TYPE),hipblas)
 	ROCM_PATH ?= /opt/rocm
 	export CXX=$(ROCM_HOME)/llvm/bin/clang++
 	export CC=$(ROCM_HOME)/llvm/bin/clang
-	AMDGPU_TARGETS?=gfx908,gfx90a,gfx942,gfx950,gfx1030,gfx1100,gfx1101,gfx1102,gfx1200,gfx1201
+	AMDGPU_TARGETS?=gfx908,gfx90a,gfx942,gfx950,gfx1030,gfx1100,gfx1101,gfx1102,gfx1151,gfx1200,gfx1201
+ifeq ($(strip $(AMDGPU_TARGETS)),)
+$(error AMDGPU_TARGETS is empty — set it to a comma-separated list of gfx targets e.g. gfx1100,gfx1101)
+endif
 	CMAKE_ARGS+=-DGGML_HIP=ON -DAMDGPU_TARGETS=$(AMDGPU_TARGETS)
 else ifeq ($(BUILD_TYPE),vulkan)
 	CMAKE_ARGS+=-DGGML_VULKAN=1
@@ -56,6 +67,7 @@ ifeq ($(BUILD_TYPE),sycl_f16)
 	CMAKE_ARGS+=-DGGML_SYCL=ON \
 		-DCMAKE_C_COMPILER=icx \
 		-DCMAKE_CXX_COMPILER=icpx \
+		-DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON \
 		-DCMAKE_CXX_FLAGS="-fsycl" \
 		-DGGML_SYCL_F16=ON
 endif
@@ -64,6 +76,7 @@ ifeq ($(BUILD_TYPE),sycl_f32)
 	CMAKE_ARGS+=-DGGML_SYCL=ON \
 		-DCMAKE_C_COMPILER=icx \
 		-DCMAKE_CXX_COMPILER=icpx \
+		-DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON \
 		-DCMAKE_CXX_FLAGS="-fsycl"
 endif
 
@@ -117,15 +130,39 @@ llama-cpp-fallback: llama.cpp
 	CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_AVX=off -DGGML_AVX2=off -DGGML_AVX512=off -DGGML_FMA=off -DGGML_F16C=off -DGGML_BMI2=off" $(MAKE) VARIANT="llama-cpp-fallback-build" build-llama-cpp-grpc-server
 	cp -rfv $(CURRENT_MAKEFILE_DIR)/../llama-cpp-fallback-build/grpc-server llama-cpp-fallback
 
+# Single-build CPU backend using ggml's CPU_ALL_VARIANTS. Produces ONE grpc-server
+# plus a set of dlopen-able libggml-cpu-*.so (sandybridge/haswell/skylakex/...) that
+# ggml's backend registry selects from at runtime by probing host CPU features.
+# Replaces the avx/avx2/avx512/fallback multi-binary build on x86.
+#
+# CPU_ALL_VARIANTS requires GGML_BACKEND_DL, which requires BUILD_SHARED_LIBS=ON, so we
+# pass SHARED_LIBS=ON and the DL flags as make variables (NOT pre-expanded into the
+# CMAKE_ARGS env string): command-line make variables propagate through every recursive
+# sub-make, so the deepest VARIANT-dir build computes BUILD_SHARED_LIBS=ON consistently.
+# Only ggml/llama go shared - gRPC is found via its static imported targets, so the
+# grpc-server binary keeps static gRPC and only dynamically links ggml.
+#
+# TARGET adds "ggml": the per-microarch backends are runtime-dlopened, not link deps of
+# grpc-server, so they only build because each is an add_dependencies() of the ggml target.
+llama-cpp-cpu-all: llama.cpp
+	cp -rf $(CURRENT_MAKEFILE_DIR)/../llama-cpp $(CURRENT_MAKEFILE_DIR)/../llama-cpp-cpu-all-build
+	$(MAKE) -C $(CURRENT_MAKEFILE_DIR)/../llama-cpp-cpu-all-build purge
+	$(info ${GREEN}I llama-cpp build info:cpu-all-variants${RESET})
+	$(MAKE) SHARED_LIBS=ON EXTRA_CMAKE_ARGS="-DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON" TARGET="--target grpc-server --target ggml" VARIANT="llama-cpp-cpu-all-build" build-llama-cpp-grpc-server
+	cp -rfv $(CURRENT_MAKEFILE_DIR)/../llama-cpp-cpu-all-build/grpc-server llama-cpp-cpu-all
+	rm -rf ggml-shared-libs && mkdir -p ggml-shared-libs
+	find $(CURRENT_MAKEFILE_DIR)/../llama-cpp-cpu-all-build/llama.cpp/build \( -name '*.so*' -o -name '*.dylib' \) -exec cp -av {} ggml-shared-libs/ \;
+	@echo "Collected ggml shared backends:" && ls -la ggml-shared-libs/
+
 llama-cpp-grpc: llama.cpp
 	cp -rf $(CURRENT_MAKEFILE_DIR)/../llama-cpp $(CURRENT_MAKEFILE_DIR)/../llama-cpp-grpc-build
 	$(MAKE) -C $(CURRENT_MAKEFILE_DIR)/../llama-cpp-grpc-build purge
 	$(info ${GREEN}I llama-cpp build info:grpc${RESET})
-	CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_RPC=ON -DGGML_AVX=off -DGGML_AVX2=off -DGGML_AVX512=off -DGGML_FMA=off -DGGML_F16C=off -DGGML_BMI2=off" TARGET="--target grpc-server --target rpc-server" $(MAKE) VARIANT="llama-cpp-grpc-build" build-llama-cpp-grpc-server
+	CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_RPC=ON -DGGML_AVX=off -DGGML_AVX2=off -DGGML_AVX512=off -DGGML_FMA=off -DGGML_F16C=off -DGGML_BMI2=off" TARGET="--target grpc-server --target ggml-rpc-server" $(MAKE) VARIANT="llama-cpp-grpc-build" build-llama-cpp-grpc-server
 	cp -rfv $(CURRENT_MAKEFILE_DIR)/../llama-cpp-grpc-build/grpc-server llama-cpp-grpc
 
 llama-cpp-rpc-server: llama-cpp-grpc
-	cp -rf $(CURRENT_MAKEFILE_DIR)/../llama-cpp-grpc-build/llama.cpp/build/bin/rpc-server llama-cpp-rpc-server
+	cp -rf $(CURRENT_MAKEFILE_DIR)/../llama-cpp-grpc-build/llama.cpp/build/bin/ggml-rpc-server llama-cpp-rpc-server
 
 llama.cpp:
 	mkdir -p llama.cpp

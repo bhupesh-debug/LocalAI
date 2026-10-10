@@ -2,13 +2,17 @@ export const API_CONFIG = {
   endpoints: {
     // Operations
     operations: '/api/operations',
+    operationsHistory: '/api/operations/history',
     cancelOperation: (jobID) => `/api/operations/${jobID}/cancel`,
+    pauseOperation: (jobID) => `/api/operations/${jobID}/pause`,
     dismissOperation: (jobID) => `/api/operations/${jobID}/dismiss`,
 
     // Models gallery
     models: '/api/models',
     installModel: (id) => `/api/models/install/${id}`,
     deleteModel: (id) => `/api/models/delete/${id}`,
+    modelEstimate: (id) => `/api/models/estimate/${id}`,
+    modelVariants: (id) => `/api/models/variants/${id}`,
     modelConfig: (id) => `/api/models/config/${id}`,
     modelConfigJson: (name) => `/api/models/config-json/${name}`,
     configMetadata: '/api/models/config-metadata',
@@ -35,8 +39,11 @@ export const API_CONFIG = {
 
     // Traces
     traces: '/api/traces',
+    tracesSummary: '/api/traces/summary',
+    trace: (id) => `/api/traces/${encodeURIComponent(id)}`,
     clearTraces: '/api/traces/clear',
     backendTraces: '/api/backend-traces',
+    backendTrace: (id) => `/api/backend-traces/${encodeURIComponent(id)}`,
     clearBackendTraces: '/api/backend-traces/clear',
 
     // Backend Logs
@@ -59,6 +66,9 @@ export const API_CONFIG = {
     cancelAgentJob: (id) => `/api/agent/jobs/${id}/cancel`,
     executeAgentJob: '/api/agent/jobs/execute',
 
+    // Progress of a cold load still staging a model onto a worker
+    modelLoadStatus: (id) => `/api/models/${encodeURIComponent(id)}/load-status`,
+
     // OpenAI-compatible endpoints
     chatCompletions: '/v1/chat/completions',
     mcpChatCompletions: '/v1/mcp/chat/completions',
@@ -71,10 +81,30 @@ export const API_CONFIG = {
     imageGenerations: '/v1/images/generations',
     audioSpeech: '/v1/audio/speech',
     audioTranscriptions: '/v1/audio/transcriptions',
+    audioTransformations: '/audio/transformations',
+    audioTransformStream: '/audio/transformations/stream',
     soundGeneration: '/v1/sound-generation',
     embeddings: '/v1/embeddings',
+
+    // Face biometrics
+    faceVerify: '/v1/face/verify',
+    faceAnalyze: '/v1/face/analyze',
+    faceEmbed: '/v1/face/embed',
+    faceRegister: '/v1/face/register',
+    faceIdentify: '/v1/face/identify',
+    faceForget: '/v1/face/forget',
+
+    // Voice biometrics
+    voiceVerify: '/v1/voice/verify',
+    voiceAnalyze: '/v1/voice/analyze',
+    voiceEmbed: '/v1/voice/embed',
+    voiceRegister: '/v1/voice/register',
+    voiceIdentify: '/v1/voice/identify',
+    voiceForget: '/v1/voice/forget',
+
     modelsList: '/v1/models',
     modelsCapabilities: '/api/models/capabilities',
+    modelsAliases: '/api/aliases',
 
     // Realtime / WebRTC
     realtimeCalls: '/v1/realtime/calls',
@@ -83,8 +113,12 @@ export const API_CONFIG = {
     // LocalAI-specific
     tts: '/tts',
     video: '/video',
+    threeDGenerations: '/3d/generations',
+    threeDAnimate: '/3d/animate',
+    threeDRemesh: '/3d/remesh',
     backendMonitor: '/backend/monitor',
     backendShutdown: '/backend/shutdown',
+    backendLoad: '/backend/load',
     modelsApply: '/models/apply',
     modelsDelete: (name) => `/models/delete/${name}`,
     modelsAvailable: '/models/available',
@@ -93,16 +127,24 @@ export const API_CONFIG = {
     modelsImportUri: '/models/import-uri',
     modelsImport: '/models/import',
     vramEstimate: '/api/models/vram-estimate',
+    modelsStorage: '/api/models/storage',
     modelsJobStatus: (uid) => `/models/jobs/${uid}`,
-    modelEditGet: (name) => `/api/models/edit/${name}`,
+    modelEditGet: (name) => `/api/models/edit/${encodeURIComponent(name)}`,
     modelEdit: (name) => `/models/edit/${name}`,
     modelToggleState: (name, action) => `/models/toggle-state/${name}/${action}`,
     modelTogglePinned: (name, action) => `/models/toggle-pinned/${name}/${action}`,
     backendsAvailable: '/backends/available',
+    backendsKnown: '/backends/known',
     backendsInstalled: '/backends',
     version: '/version',
     system: '/system',
     corsProxy: '/api/cors-proxy',
+
+    // Failover chains
+    failoverChains: '/api/failover',
+    failoverChain: (name) => `/api/failover/${encodeURIComponent(name)}`,
+    failoverEvents: '/api/failover/events',
+    failoverPin: (name) => `/api/failover/${encodeURIComponent(name)}/pin`,
 
     // Nodes (distributed)
     nodes: '/api/nodes',
@@ -114,13 +156,17 @@ export const API_CONFIG = {
     nodeHeartbeat: (id) => `/api/nodes/${id}/heartbeat`,
     nodeBackends: (id) => `/api/nodes/${id}/backends`,
     nodeBackendsInstall: (id) => `/api/nodes/${id}/backends/install`,
+    nodeBackendsUpgrade: (id) => `/api/nodes/${id}/backends/upgrade`,
     nodeBackendsDelete: (id) => `/api/nodes/${id}/backends/delete`,
     nodeBackendLogs: (id) => `/api/nodes/${id}/backend-logs`,
     nodeBackendLogsModel: (id, modelId) => `/api/nodes/${id}/backend-logs/${encodeURIComponent(modelId)}`,
     nodeModelsUnload: (id) => `/api/nodes/${id}/models/unload`,
     nodeLabels: (id) => `/api/nodes/${id}/labels`,
     nodeLabelKey: (id, key) => `/api/nodes/${id}/labels/${key}`,
+    nodeMaxReplicasPerModel: (id) => `/api/nodes/${id}/max-replicas-per-model`,
+    nodeVramBudget: (id) => `/api/nodes/${id}/vram-budget`,
     nodesScheduling: '/api/nodes/scheduling',
+    nodesModels: '/api/nodes/models',
     nodesSchedulingModel: (model) => `/api/nodes/scheduling/${encodeURIComponent(model)}`,
   },
 }

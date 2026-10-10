@@ -1,6 +1,9 @@
 package openai
 
 import (
+	"encoding/json"
+	"io"
+	"mime"
 	"net/http"
 	"time"
 
@@ -15,6 +18,10 @@ import (
 type RealtimeCallRequest struct {
 	SDP   string `json:"sdp"`
 	Model string `json:"model"`
+	// LocalAIAssistant opts the session into the in-process admin tool
+	// surface (same modality as the chat page's "Manage Mode"). Admin-only;
+	// the realtime entry point gates it the same way the chat handler does.
+	LocalAIAssistant bool `json:"localai_assistant,omitempty"`
 }
 
 // RealtimeCallResponse is the JSON response for POST /v1/realtime/calls.
@@ -23,11 +30,74 @@ type RealtimeCallResponse struct {
 	SessionID string `json:"session_id"`
 }
 
+func decodeRealtimeCallRequest(c echo.Context) (RealtimeCallRequest, bool, error) {
+	var req RealtimeCallRequest
+	mediaType := ""
+	contentType := c.Request().Header.Get(echo.HeaderContentType)
+	if contentType != "" {
+		var err error
+		mediaType, _, err = mime.ParseMediaType(contentType)
+		if err != nil {
+			return req, false, err
+		}
+	}
+
+	switch mediaType {
+	case echo.MIMEMultipartForm:
+		if err := c.Request().ParseMultipartForm(32 << 20); err != nil {
+			return req, true, err
+		}
+		req.SDP = c.FormValue("sdp")
+		var session struct {
+			Model            string `json:"model"`
+			LocalAIAssistant bool   `json:"localai_assistant,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(c.FormValue("session")), &session); err != nil {
+			return req, true, err
+		}
+		req.Model = session.Model
+		req.LocalAIAssistant = session.LocalAIAssistant
+		return req, true, nil
+	case "application/sdp":
+		sdp, err := readRealtimeSDP(c.Request().Body)
+		req.SDP = sdp
+		req.Model = c.QueryParam("model")
+		return req, true, err
+	default:
+		err := c.Bind(&req)
+		return req, false, err
+	}
+}
+
+func readRealtimeSDP(body io.Reader) (string, error) {
+	data, err := io.ReadAll(body)
+	return string(data), err
+}
+
+func writeRealtimeCallResponse(c echo.Context, plainSDPResponse bool, sdp, sessionID string) error {
+	if plainSDPResponse {
+		return c.Blob(http.StatusCreated, "application/sdp", []byte(sdp))
+	}
+
+	return c.JSON(http.StatusCreated, RealtimeCallResponse{
+		SDP:       sdp,
+		SessionID: sessionID,
+	})
+}
+
 // RealtimeCalls handles POST /v1/realtime/calls for WebRTC signaling.
 func RealtimeCalls(application *application.Application) echo.HandlerFunc {
+	se, settingEngineErr := webRTCSettingEngine(application.ApplicationConfig())
+	if settingEngineErr != nil {
+		xlog.Error("failed to configure realtime WebRTC UDP listener", "error", settingEngineErr)
+	}
+
 	return func(c echo.Context) error {
-		var req RealtimeCallRequest
-		if err := c.Bind(&req); err != nil {
+		if settingEngineErr != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": settingEngineErr.Error()})
+		}
+		req, plainSDPResponse, err := decodeRealtimeCallRequest(c)
+		if err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		}
 		if req.SDP == "" {
@@ -44,7 +114,7 @@ func RealtimeCalls(application *application.Application) echo.HandlerFunc {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "codec registration failed"})
 		}
 
-		api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
+		api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithSettingEngine(se))
 
 		pc, err := api.NewPeerConnection(webrtc.Configuration{})
 		if err != nil {
@@ -123,10 +193,13 @@ func RealtimeCalls(application *application.Application) echo.HandlerFunc {
 			handleIncomingAudioTrack(track, transport)
 		})
 
-		// Set the remote SDP (client's offer)
+		// Set the remote SDP (client's offer). Raise the data-channel
+		// max-message-size the browser advertised so pion permits the larger
+		// realtime events some turns produce (e.g. tool calls), which would
+		// otherwise be dropped on send. See realtime_webrtc_sctp.go.
 		if err := pc.SetRemoteDescription(webrtc.SessionDescription{
 			Type: webrtc.SDPTypeOffer,
-			SDP:  req.SDP,
+			SDP:  raiseDataChannelMaxMessageSize(req.SDP),
 		}); err != nil {
 			transport.Close()
 			xlog.Error("failed to set remote description", "error", err)
@@ -165,15 +238,16 @@ func RealtimeCalls(application *application.Application) echo.HandlerFunc {
 
 		// Start the realtime session in a goroutine
 		evaluator := application.TemplatesEvaluator()
+		opts := RealtimeSessionOptions{
+			LocalAIAssistant: req.LocalAIAssistant,
+			IsAdmin:          isCurrentUserAdmin(c, application),
+		}
 		go func() {
 			defer transport.Close()
-			runRealtimeSession(application, transport, req.Model, evaluator)
+			runRealtimeSession(application, transport, req.Model, evaluator, opts)
 		}()
 
-		return c.JSON(http.StatusCreated, RealtimeCallResponse{
-			SDP:       localDesc.SDP,
-			SessionID: sessionID,
-		})
+		return writeRealtimeCallResponse(c, plainSDPResponse, localDesc.SDP, sessionID)
 	}
 }
 

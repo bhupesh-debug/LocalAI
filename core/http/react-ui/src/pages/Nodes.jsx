@@ -1,1108 +1,324 @@
-import { useState, useEffect, useCallback, Fragment } from 'react'
-import { useOutletContext, useNavigate } from 'react-router-dom'
+/* eslint-disable no-unused-vars -- components used only inside JSX look unused to this config, which has no eslint-plugin-react */
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Link, useOutletContext } from 'react-router-dom'
+import { useTranslation } from 'react-i18next'
 import { nodesApi } from '../utils/api'
-import { useModels } from '../hooks/useModels'
+import { filterNodes, paginateNodes, runBounded, sortNodes } from '../utils/nodeFleet'
+import { DISTRIBUTED_COMMAND, attentionOf, memoryOf, updateTargets } from '../utils/swarm'
+import { useNodeList, usePhone, useReplicas } from '../hooks/useSwarm'
+import { useOperateSummary } from '../contexts/OperateSummaryContext'
 import LoadingSpinner from '../components/LoadingSpinner'
 import ConfirmDialog from '../components/ConfirmDialog'
-import ImageSelector, { useImageSelector, dockerImage, dockerFlags } from '../components/ImageSelector'
+import LocalMachineView from '../components/nodes/LocalMachineView'
+import AddNodeFlow from '../components/swarm/AddNodeFlow'
+import CommandBlock from '../components/swarm/CommandBlock'
+import NodeMap from '../components/swarm/NodeMap'
+import NodesTable from '../components/swarm/NodesTable'
+import RunningModels from '../components/swarm/RunningModels'
+import Icon from '../components/Icon'
+import './swarm.css'
 
-function timeAgo(dateString) {
-  if (!dateString) return 'never'
-  const seconds = Math.floor((Date.now() - new Date(dateString).getTime()) / 1000)
-  if (seconds < 0) return 'just now'
-  if (seconds < 60) return `${seconds}s ago`
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes}m ago`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours}h ago`
-  const days = Math.floor(hours / 24)
-  return `${days}d ago`
+const DENSITY_KEY = 'localai-swarm-density'
+const STATUSES = ['healthy', 'draining', 'pending', 'unhealthy', 'offline']
+const ATTENTION_FILTERS = ['pending', 'down', 'lowVram', 'lowRam', 'lowDisk']
+
+function readDensity() {
+  try { return localStorage.getItem(DENSITY_KEY) === 'compact' ? 'compact' : 'comfortable' } catch { return 'comfortable' }
 }
 
-function formatVRAM(bytes) {
-  if (!bytes || bytes === 0) return null
-  const gb = bytes / (1024 * 1024 * 1024)
-  return gb >= 1 ? `${gb.toFixed(1)} GB` : `${(bytes / (1024 * 1024)).toFixed(0)} MB`
-}
-
-function gpuVendorLabel(vendor) {
-  const labels = {
-    nvidia: 'NVIDIA',
-    amd: 'AMD',
-    intel: 'Intel',
-    vulkan: 'Vulkan',
-  }
-  return labels[vendor] || null
-}
-
-const statusConfig = {
-  healthy: { color: 'var(--color-success)', label: 'Healthy' },
-  unhealthy: { color: 'var(--color-error)', label: 'Unhealthy' },
-  offline: { color: 'var(--color-error)', label: 'Offline' },
-  registering: { color: 'var(--color-primary)', label: 'Registering' },
-  draining: { color: 'var(--color-warning)', label: 'Draining' },
-  pending: { color: 'var(--color-warning)', label: 'Pending Approval' },
-}
-
-const modelStateConfig = {
-  loaded: { bg: 'var(--color-success-light)', color: 'var(--color-success)', border: 'var(--color-success-border)' },
-  loading: { bg: 'var(--color-primary-light)', color: 'var(--color-primary)', border: 'var(--color-primary-border)' },
-  unloading: { bg: 'var(--color-warning-light)', color: 'var(--color-warning)', border: 'var(--color-warning-border)' },
-  idle: { bg: 'var(--color-bg-tertiary)', color: 'var(--color-text-muted)', border: 'var(--color-border-subtle)' },
-}
-
-function StatCard({ icon, label, value, color }) {
-  return (
-    <div className="card" style={{ padding: 'var(--spacing-sm) var(--spacing-md)', flex: '1 1 0', minWidth: 120 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
-        <i className={icon} style={{ color: 'var(--color-text-muted)', fontSize: '0.75rem' }} />
-        <span style={{ fontSize: '0.6875rem', color: 'var(--color-text-muted)', fontWeight: 500, textTransform: 'uppercase', letterSpacing: '0.03em' }}>{label}</span>
-      </div>
-      <div style={{ fontSize: '1.375rem', fontWeight: 700, fontFamily: 'JetBrains Mono, monospace', color: color || 'var(--color-text-primary)' }}>
-        {value}
-      </div>
-    </div>
-  )
-}
-
-function StepNumber({ n, bg, color }) {
-  return (
-    <span style={{
-      width: 28, height: 28, borderRadius: '50%', background: bg,
-      color, display: 'flex', alignItems: 'center', justifyContent: 'center',
-      fontSize: '0.8125rem', fontWeight: 700, flexShrink: 0,
-    }}>{n}</span>
-  )
-}
-
-function CommandBlock({ command, addToast }) {
-  const copy = () => {
-    navigator.clipboard.writeText(command)
-    addToast('Copied to clipboard', 'success', 2000)
-  }
-  return (
-    <div style={{ position: 'relative' }}>
-      <pre style={{
-        background: 'var(--color-bg-primary)', padding: 'var(--spacing-md)',
-        paddingRight: 'var(--spacing-xl)', borderRadius: 'var(--radius-md)',
-        fontSize: '0.8125rem', fontFamily: "'JetBrains Mono', monospace",
-        whiteSpace: 'pre-wrap', wordBreak: 'break-all',
-        color: 'var(--color-warning)', overflow: 'auto',
-        border: '1px solid var(--color-border-subtle)',
-      }}>
-        {command}
-      </pre>
-      <button
-        onClick={copy}
-        style={{
-          position: 'absolute', top: 8, right: 8,
-          background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border-subtle)',
-          borderRadius: 'var(--radius-sm)', padding: '4px 8px', cursor: 'pointer',
-          color: 'var(--color-text-secondary)', fontSize: '0.75rem',
-        }}
-        title="Copy"
-      >
-        <i className="fas fa-copy" />
-      </button>
-    </div>
-  )
-}
-
-function WorkerHintCard({ addToast, activeTab, hasWorkers }) {
-  const frontendUrl = window.location.origin
-  const { selected, setSelected, option, dev, setDev } = useImageSelector('cpu')
-  const isAgent = activeTab === 'agent'
-  const workerCmd = isAgent ? 'agent-worker' : 'worker'
-  const flags = dockerFlags(option)
-  const flagsStr = flags ? `${flags} \\\n  ` : ''
-
-  const title = hasWorkers
-    ? (isAgent ? 'Add more agent workers' : 'Add more workers')
-    : (isAgent ? 'No agent workers registered yet' : 'No workers registered yet')
-
-  return (
-    <div className="card" style={{ padding: 'var(--spacing-lg)', marginBottom: 'var(--spacing-xl)' }}>
-      <h3 style={{ fontSize: '1rem', fontWeight: 700, marginBottom: 'var(--spacing-md)', display: 'flex', alignItems: 'center' }}>
-        <i className={`fas ${hasWorkers ? 'fa-plus-circle' : 'fa-info-circle'}`} style={{ color: 'var(--color-primary)', marginRight: 'var(--spacing-sm)' }} />
-        {title}
-      </h3>
-      <p style={{ color: 'var(--color-text-secondary)', fontSize: '0.875rem', marginBottom: 'var(--spacing-md)' }}>
-        {isAgent
-          ? 'Start agent worker nodes to execute MCP tools and agent tasks. Agent workers self-register with this frontend.'
-          : 'Start worker nodes to scale inference across multiple machines. Workers self-register with this frontend.'}
-      </p>
-
-      <p style={{ fontWeight: 600, fontSize: '0.8125rem', marginBottom: 'var(--spacing-xs)' }}>Select your hardware</p>
-      <ImageSelector selected={selected} onSelect={setSelected} dev={dev} onDevChange={setDev} />
-
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-md)' }}>
-        <div>
-          <p style={{ fontWeight: 600, fontSize: '0.8125rem', marginBottom: 'var(--spacing-xs)' }}>CLI</p>
-          <CommandBlock
-            command={`local-ai ${workerCmd} \\\n  --register-to "${frontendUrl}" \\\n  --nats-url "nats://nats:4222" \\\n  --registration-token "$LOCALAI_REGISTRATION_TOKEN"`}
-            addToast={addToast}
-          />
-        </div>
-        <div>
-          <p style={{ fontWeight: 600, fontSize: '0.8125rem', marginBottom: 'var(--spacing-xs)' }}>Docker</p>
-          <CommandBlock
-            command={`docker run --net host ${flagsStr}\\\n  -e LOCALAI_REGISTER_TO="${frontendUrl}" \\\n  -e LOCALAI_NATS_URL="nats://nats:4222" \\\n  -e LOCALAI_REGISTRATION_TOKEN="$TOKEN" \\\n  ${dockerImage(option, dev)} ${workerCmd}`}
-            addToast={addToast}
-          />
-        </div>
-      </div>
-
-      <p style={{ fontSize: '0.8125rem', color: 'var(--color-text-muted)', marginTop: 'var(--spacing-md)' }}>
-        For full setup instructions, architecture details, and Kubernetes deployment, see the{' '}
-        <a href="https://localai.io/features/distributed-mode/" target="_blank" rel="noopener noreferrer"
-          style={{ color: 'var(--color-primary)' }}>Distributed Mode documentation <i className="fas fa-external-link-alt" style={{ fontSize: '0.625rem' }} /></a>.
-      </p>
-    </div>
-  )
-}
-
-function SchedulingForm({ onSave, onCancel }) {
-  const [mode, setMode] = useState('placement')
-  const [modelName, setModelName] = useState('')
-  const [selectorText, setSelectorText] = useState('')
-  const [minReplicas, setMinReplicas] = useState(1)
-  const [maxReplicas, setMaxReplicas] = useState(0)
-  const { models } = useModels()
-
-  const parseSelector = () => {
-    if (!selectorText.trim()) return null
-    const pairs = {}
-    selectorText.split(',').forEach(p => {
-      const [k, v] = p.split('=').map(s => s.trim())
-      if (k) pairs[k] = v || ''
-    })
-    return Object.keys(pairs).length > 0 ? pairs : null
-  }
-
-  const isValid = () => {
-    if (!modelName) return false
-    if (mode === 'placement') return !!parseSelector()
-    return minReplicas > 0 || maxReplicas > 0
-  }
-
-  const handleSubmit = () => {
-    const nodeSelector = parseSelector()
-    onSave({
-      model_name: modelName,
-      node_selector: nodeSelector || undefined,
-      min_replicas: mode === 'placement' ? 0 : minReplicas,
-      max_replicas: mode === 'placement' ? 0 : maxReplicas,
-    })
-  }
-
-  const modeBtn = (value, label) => (
-    <button
-      className={`btn btn-sm ${mode === value ? 'btn-primary' : 'btn-secondary'}`}
-      onClick={() => setMode(value)}
-      style={{ flex: 1 }}
-    >{label}</button>
-  )
-
-  return (
-    <div className="card" style={{ padding: 'var(--spacing-md)', marginBottom: 'var(--spacing-md)' }}>
-      <div style={{ display: 'flex', gap: 'var(--spacing-xs)', marginBottom: 'var(--spacing-sm)' }}>
-        {modeBtn('placement', 'Node Placement')}
-        {modeBtn('autoscaling', 'Auto-Scaling')}
-      </div>
-      <p style={{ fontSize: '0.8125rem', color: 'var(--color-text-muted)', margin: '0 0 var(--spacing-sm) 0' }}>
-        {mode === 'placement'
-          ? 'Constrain which nodes this model can run on. Model loads on-demand and can be evicted when idle.'
-          : 'Automatically maintain replica counts across nodes. Models with min \u2265 1 are protected from eviction.'}
-      </p>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--spacing-sm)' }}>
-        <div>
-          <label className="form-label">Model</label>
-          <select className="input" value={modelName} onChange={e => setModelName(e.target.value)}>
-            <option value="">Select a model...</option>
-            {models.map(m => <option key={m.id} value={m.id}>{m.id}</option>)}
-          </select>
-        </div>
-        <div>
-          <label className="form-label">Node Selector{mode === 'placement' ? '' : ' (optional)'}</label>
-          <input className="input" type="text" value={selectorText} onChange={e => setSelectorText(e.target.value)}
-            placeholder="e.g. gpu.vendor=nvidia,tier=fast" />
-          {mode === 'autoscaling' && !selectorText.trim() && (
-            <span style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>Empty = all nodes</span>
-          )}
-        </div>
-        {mode === 'autoscaling' && <>
-          <div>
-            <label className="form-label">Min Replicas</label>
-            <input className="input" type="number" min={0} value={minReplicas}
-              onChange={e => setMinReplicas(parseInt(e.target.value) || 0)} />
-          </div>
-          <div>
-            <label className="form-label">Max Replicas (0 = no limit)</label>
-            <input className="input" type="number" min={0} value={maxReplicas}
-              onChange={e => setMaxReplicas(parseInt(e.target.value) || 0)} />
-          </div>
-        </>}
-      </div>
-      <div style={{ display: 'flex', gap: 'var(--spacing-sm)', marginTop: 'var(--spacing-sm)', justifyContent: 'flex-end' }}>
-        <button className="btn btn-secondary btn-sm" onClick={onCancel}>Cancel</button>
-        <button className="btn btn-primary btn-sm" onClick={handleSubmit} disabled={!isValid()}>Save</button>
-      </div>
-    </div>
-  )
-}
-
+// The distributed install, seen as a table of nodes, a map of them, or the
+// models running across them. A single install never reaches this page's
+// cluster view: it shows the machine instead, with the way to add more.
 export default function Nodes() {
   const { addToast } = useOutletContext()
-  const navigate = useNavigate()
-  const [nodesList, setNodesList] = useState([])
-  const [loading, setLoading] = useState(true)
-  const [enabled, setEnabled] = useState(true)
-  const [expandedNodeId, setExpandedNodeId] = useState(null)
-  const [nodeModels, setNodeModels] = useState({})
-  const [nodeBackends, setNodeBackends] = useState({})
-  const [confirmDelete, setConfirmDelete] = useState(null)
-  const [confirmUnload, setConfirmUnload] = useState(null)
-  const [showTips, setShowTips] = useState(false)
-  const [activeTab, setActiveTab] = useState('backend') // 'backend', 'agent', or 'scheduling'
-  const [schedulingConfigs, setSchedulingConfigs] = useState([])
-  const [showSchedulingForm, setShowSchedulingForm] = useState(false)
-  const [labelInputs, setLabelInputs] = useState({})
+  const { t } = useTranslation('swarm')
+  const summary = useOperateSummary()
+  const { nodes, status: loadStatus, refetch } = useNodeList()
+  const replicas = useReplicas()
+  const phone = usePhone()
 
-  const setLabelInput = (nodeId, field, val) =>
-    setLabelInputs(prev => ({
-      ...prev,
-      [nodeId]: { ...(prev[nodeId] || { key: '', value: '' }), [field]: val }
-    }))
+  const [view, setView] = useState('list')
+  const [density, setDensity] = useState(readDensity)
+  const [query, setQuery] = useState('')
+  const [state, setState] = useState('')
+  const [type, setType] = useState('')
+  const [groupBy, setGroupBy] = useState('none')
+  const [needsOnly, setNeedsOnly] = useState(false)
+  const [reason, setReason] = useState(null)
+  const [sort, setSort] = useState({ key: 'name', direction: 'asc' })
+  const [page, setPage] = useState(1)
+  const [selectedIds, setSelectedIds] = useState(() => new Set())
+  const [confirmRemove, setConfirmRemove] = useState(false)
+  const [bulkRunning, setBulkRunning] = useState(false)
+  const bulkRef = useRef(false)
+  const [busyId, setBusyId] = useState(null)
+  const [updating, setUpdating] = useState(false)
 
-  const fetchNodes = useCallback(async () => {
-    try {
-      const data = await nodesApi.list()
-      setNodesList(Array.isArray(data) ? data : [])
-      setEnabled(true)
-    } catch (err) {
-      if (err.message?.includes('503') || err.message?.includes('Service Unavailable')) {
-        setEnabled(false)
-      }
-    } finally {
-      setLoading(false)
-    }
-  }, [])
+  // Phones do not draw the map: a tangle of lines is no use at 390 px.
+  const shownView = phone && view === 'map' ? 'list' : view
 
-  const fetchScheduling = useCallback(async () => {
-    try {
-      const data = await nodesApi.listScheduling()
-      setSchedulingConfigs(Array.isArray(data) ? data : [])
-    } catch { setSchedulingConfigs([]) }
-  }, [])
-
+  const loadReplicas = replicas.load
   useEffect(() => {
-    fetchNodes()
-    fetchScheduling()
-    const interval = setInterval(fetchNodes, 5000)
-    return () => clearInterval(interval)
-  }, [fetchNodes, fetchScheduling])
+    if (shownView === 'map' || shownView === 'models') void loadReplicas()
+  }, [shownView, loadReplicas])
 
-  const fetchModels = useCallback(async (nodeId) => {
+  // A selection never outlives its node.
+  useEffect(() => {
+    if (loadStatus !== 'ready') return
+    setSelectedIds(current => {
+      const live = new Set(nodes.map(node => node.id))
+      const kept = [...current].filter(id => live.has(id))
+      return kept.length === current.size ? current : new Set(kept)
+    })
+  }, [nodes, loadStatus])
+
+  const reasons = useMemo(() => attentionOf(nodes), [nodes])
+  const labelKeys = useMemo(() => [...new Set(nodes.flatMap(node => Object.keys(node.labels || {})))].sort(), [nodes])
+  const reasonCounts = useMemo(() => Object.fromEntries(ATTENTION_FILTERS.map(key => [key, [...reasons.values()].filter(list => list.includes(key)).length])), [reasons])
+
+  const filtered = useMemo(() => {
+    const base = filterNodes(nodes, { query, statuses: state ? [state] : [], types: type ? [type] : [] })
+    if (!needsOnly) return base
+    return base.filter(node => {
+      const why = reasons.get(node.id)
+      return why && (!reason || why.includes(reason))
+    })
+  }, [nodes, query, state, type, needsOnly, reason, reasons])
+  const ordered = useMemo(() => {
+    const keyed = filtered.map(node => ({ ...node, _memory: memoryOf(node)?.total ?? null, _seen: Date.parse(node.last_heartbeat) || null }))
+    return sortNodes(keyed, sort)
+  }, [filtered, sort])
+  const pagination = useMemo(() => paginateNodes(ordered, page), [ordered, page])
+
+  useEffect(() => { if (pagination.page !== page) setPage(pagination.page) }, [page, pagination.page])
+  useEffect(() => { setPage(1) }, [query, state, type, needsOnly, reason, groupBy])
+
+  const setDensityKept = value => {
+    setDensity(value)
+    try { localStorage.setItem(DENSITY_KEY, value) } catch { /* the choice just does not persist */ }
+  }
+
+  const approve = async id => {
+    setBusyId(id)
     try {
-      const data = await nodesApi.getModels(nodeId)
-      setNodeModels(prev => ({ ...prev, [nodeId]: Array.isArray(data) ? data : [] }))
-    } catch {
-      setNodeModels(prev => ({ ...prev, [nodeId]: [] }))
+      await nodesApi.approve(id)
+      addToast(t('toast.approvedOne'), 'success')
+      await refetch()
+    } catch (error) {
+      addToast(error.message, 'error')
+    } finally {
+      setBusyId(null)
     }
-  }, [])
+  }
 
-  const fetchBackends = useCallback(async (nodeId) => {
-    try {
-      const data = await nodesApi.getBackends(nodeId)
-      setNodeBackends(prev => ({ ...prev, [nodeId]: Array.isArray(data) ? data : [] }))
-    } catch {
-      setNodeBackends(prev => ({ ...prev, [nodeId]: [] }))
-    }
-  }, [])
-
-  const toggleExpand = (nodeId) => {
-    if (expandedNodeId === nodeId) {
-      setExpandedNodeId(null)
-    } else {
-      setExpandedNodeId(nodeId)
-      if (!nodeModels[nodeId]) {
-        fetchModels(nodeId)
+  const runBulk = action => {
+    if (bulkRef.current) return
+    bulkRef.current = true
+    setBulkRunning(true)
+    const ids = [...selectedIds]
+    const need = action === 'drain' ? 'healthy' : action === 'resume' ? 'draining' : null
+    const status = new Map(nodes.map(node => [node.id, node.status]))
+    const eligible = need ? ids.filter(id => status.get(id) === need) : ids
+    const skipped = ids.length - eligible.length
+    void (async () => {
+      try {
+        const results = await runBounded(eligible, 8, id => nodesApi[action](id))
+        const succeeded = results.filter(result => result.status === 'fulfilled').length
+        const failed = results.length - succeeded
+        const label = t(`bulk.done.${action}`)
+        addToast(t('bulk.result', { label, succeeded, failed, skipped }), failed || skipped ? 'warning' : 'success')
+        await refetch()
+      } finally {
+        setConfirmRemove(false)
+        bulkRef.current = false
+        setBulkRunning(false)
       }
-      if (!nodeBackends[nodeId]) {
-        fetchBackends(nodeId)
-      }
-    }
+    })()
   }
 
-  const handleReinstallBackend = async (nodeId, backendName) => {
+  const targets = useMemo(
+    () => updateTargets({ upgrades: summary?.upgrades, nodes, selectedIds }),
+    [summary?.upgrades, nodes, selectedIds],
+  )
+  const updateBackends = async () => {
+    if (updating || targets.pairs.length === 0) return
+    setUpdating(true)
     try {
-      await nodesApi.installBackend(nodeId, backendName)
-      addToast(`Backend "${backendName}" reinstalled`, 'success')
-      fetchBackends(nodeId)
-    } catch (err) {
-      addToast(`Failed to reinstall backend: ${err.message}`, 'error')
+      const results = await runBounded(targets.pairs, 6, pair => nodesApi.upgradeBackend(pair.nodeId, pair.backend))
+      const failed = results.filter(r => r.status === 'rejected').length
+      addToast(
+        failed
+          ? t('update.partial', { failed, total: results.length })
+          : t('update.started', { count: targets.nodeIds.length }),
+        failed ? 'warning' : 'info',
+      )
+      await summary?.refresh?.()
+    } finally {
+      setUpdating(false)
     }
   }
 
-  const handleDrain = async (nodeId) => {
-    try {
-      await nodesApi.drain(nodeId)
-      addToast('Node set to draining', 'success')
-      fetchNodes()
-    } catch (err) {
-      addToast(`Failed to drain node: ${err.message}`, 'error')
-    }
+  if (loadStatus === 'loading') return <div className="page page--wide loading-center"><LoadingSpinner size="lg" /></div>
+  if (loadStatus === 'single') {
+    return <LocalMachineView addToast={addToast} scaleOut={<ScaleOut addToast={addToast} />} />
   }
-
-  const handleResume = async (nodeId) => {
-    try {
-      await nodesApi.resume(nodeId)
-      addToast('Node resumed', 'success')
-      fetchNodes()
-    } catch (err) {
-      addToast(`Failed to resume node: ${err.message}`, 'error')
-    }
-  }
-
-  const handleApprove = async (nodeId) => {
-    try {
-      await nodesApi.approve(nodeId)
-      addToast('Node approved', 'success')
-      fetchNodes()
-    } catch (err) {
-      addToast(`Failed to approve node: ${err.message}`, 'error')
-    }
-  }
-
-  const handleUnloadModel = async (nodeId, modelName) => {
-    try {
-      await nodesApi.unloadModel(nodeId, modelName)
-      addToast(`Model "${modelName}" unloaded`, 'success')
-      fetchModels(nodeId)
-    } catch (err) {
-      addToast(`Failed to unload model: ${err.message}`, 'error')
-    }
-  }
-
-  const handleAddLabel = async (nodeId, key, value) => {
-    try {
-      await nodesApi.mergeLabels(nodeId, { [key]: value })
-      addToast(`Label "${key}=${value}" added`, 'success')
-      fetchNodes()
-    } catch (err) {
-      addToast(`Failed to add label: ${err.message}`, 'error')
-    }
-  }
-
-  const handleDeleteLabel = async (nodeId, key) => {
-    try {
-      await nodesApi.deleteLabel(nodeId, key)
-      addToast(`Label "${key}" removed`, 'success')
-      fetchNodes()
-    } catch (err) {
-      addToast(`Failed to remove label: ${err.message}`, 'error')
-    }
-  }
-
-  const handleDelete = async (nodeId) => {
-    try {
-      await nodesApi.delete(nodeId)
-      addToast('Node removed', 'success')
-      setConfirmDelete(null)
-      if (expandedNodeId === nodeId) setExpandedNodeId(null)
-      fetchNodes()
-    } catch (err) {
-      addToast(`Failed to remove node: ${err.message}`, 'error')
-      setConfirmDelete(null)
-    }
-  }
-
-  if (loading) {
+  if (loadStatus === 'ready' && nodes.length === 0) {
     return (
-      <div className="page" style={{ display: 'flex', justifyContent: 'center', padding: 'var(--spacing-xl)' }}>
-        <LoadingSpinner size="lg" />
+      <div className="page page--wide sw-page" data-testid="swarm-first-run">
+        <header className="sw-head">
+          <h1 className="sw-title">{t('first.title')}</h1>
+          <p className="sw-note">{t('first.sub')}</p>
+        </header>
+        <AddNodeFlow nodes={nodes} single={false} addToast={addToast} onApproved={refetch} />
       </div>
     )
   }
 
-  // Disabled state
-  if (!enabled) {
-    return (
-      <div className="page">
-        <div style={{ textAlign: 'center', padding: 'var(--spacing-xl) 0' }}>
-          <i className="fas fa-network-wired" style={{ fontSize: '3rem', color: 'var(--color-primary)', marginBottom: 'var(--spacing-md)' }} />
-          <h1 style={{ fontSize: '1.5rem', fontWeight: 600, marginBottom: 'var(--spacing-sm)' }}>
-            Distributed Mode Not Enabled
-          </h1>
-          <p style={{ color: 'var(--color-text-secondary)', maxWidth: 600, margin: '0 auto var(--spacing-xl)' }}>
-            Enable distributed mode to manage backend nodes across multiple machines. Nodes self-register and are monitored for health, enabling horizontal scaling of model inference.
-          </p>
-
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 'var(--spacing-md)', marginBottom: 'var(--spacing-xl)' }}>
-            <div className="card" style={{ textAlign: 'center', padding: 'var(--spacing-md)' }}>
-              <div style={{
-                width: 40, height: 40, borderRadius: 'var(--radius-md)', margin: '0 auto var(--spacing-sm)',
-                background: 'var(--color-primary-light)', display: 'flex', alignItems: 'center', justifyContent: 'center',
-              }}>
-                <i className="fas fa-server" style={{ color: 'var(--color-primary)', fontSize: '1.25rem' }} />
-              </div>
-              <h3 style={{ fontSize: '0.9375rem', fontWeight: 600, marginBottom: 'var(--spacing-xs)' }}>Horizontal Scaling</h3>
-              <p style={{ fontSize: '0.8125rem', color: 'var(--color-text-secondary)' }}>Add backend nodes to scale inference capacity</p>
-            </div>
-            <div className="card" style={{ textAlign: 'center', padding: 'var(--spacing-md)' }}>
-              <div style={{
-                width: 40, height: 40, borderRadius: 'var(--radius-md)', margin: '0 auto var(--spacing-sm)',
-                background: 'var(--color-accent-light)', display: 'flex', alignItems: 'center', justifyContent: 'center',
-              }}>
-                <i className="fas fa-route" style={{ color: 'var(--color-accent)', fontSize: '1.25rem' }} />
-              </div>
-              <h3 style={{ fontSize: '0.9375rem', fontWeight: 600, marginBottom: 'var(--spacing-xs)' }}>Smart Routing</h3>
-              <p style={{ fontSize: '0.8125rem', color: 'var(--color-text-secondary)' }}>Route requests to the best available node</p>
-            </div>
-            <div className="card" style={{ textAlign: 'center', padding: 'var(--spacing-md)' }}>
-              <div style={{
-                width: 40, height: 40, borderRadius: 'var(--radius-md)', margin: '0 auto var(--spacing-sm)',
-                background: 'var(--color-success-light)', display: 'flex', alignItems: 'center', justifyContent: 'center',
-              }}>
-                <i className="fas fa-heart-pulse" style={{ color: 'var(--color-success)', fontSize: '1.25rem' }} />
-              </div>
-              <h3 style={{ fontSize: '0.9375rem', fontWeight: 600, marginBottom: 'var(--spacing-xs)' }}>Health Monitoring</h3>
-              <p style={{ fontSize: '0.8125rem', color: 'var(--color-text-secondary)' }}>Automatic heartbeat checks and failover</p>
-            </div>
-          </div>
-        </div>
-
-        <div className="card" style={{ maxWidth: 700, margin: '0 auto var(--spacing-xl)', padding: 'var(--spacing-lg)', textAlign: 'left' }}>
-          <h3 style={{ fontSize: '1.125rem', fontWeight: 700, marginBottom: 'var(--spacing-md)', display: 'flex', alignItems: 'center' }}>
-            <i className="fas fa-rocket" style={{ color: 'var(--color-accent)', marginRight: 'var(--spacing-sm)' }} />
-            How to Enable Distributed Mode
-          </h3>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-md)' }}>
-            <div style={{ display: 'flex', gap: 'var(--spacing-sm)' }}>
-              <StepNumber n={1} bg="var(--color-accent-light)" color="var(--color-accent)" />
-              <div style={{ flex: 1 }}>
-                <p style={{ fontWeight: 500, marginBottom: 'var(--spacing-xs)' }}>Start LocalAI with distributed mode</p>
-                <CommandBlock
-                  command={`local-ai run --distributed \\\n  --distributed-db "postgres://user:pass@host/db" \\\n  --distributed-nats "nats://host:4222"`}
-                  addToast={addToast}
-                />
-              </div>
-            </div>
-            <div style={{ display: 'flex', gap: 'var(--spacing-sm)' }}>
-              <StepNumber n={2} bg="var(--color-accent-light)" color="var(--color-accent)" />
-              <div style={{ flex: 1 }}>
-                <p style={{ fontWeight: 500, marginBottom: 'var(--spacing-xs)' }}>Register backend nodes</p>
-                <CommandBlock
-                  command={`local-ai worker \\\n  --register-to "http://localai-host:8080" \\\n  --nats-url "nats://nats:4222" \\\n  --node-name "gpu-node-1"`}
-                  addToast={addToast}
-                />
-              </div>
-            </div>
-            <div style={{ display: 'flex', gap: 'var(--spacing-sm)' }}>
-              <StepNumber n={3} bg="var(--color-accent-light)" color="var(--color-accent)" />
-              <div style={{ flex: 1 }}>
-                <p style={{ fontWeight: 500 }}>Manage nodes from this dashboard</p>
-                <p style={{ color: 'var(--color-text-secondary)', fontSize: '0.8125rem', marginTop: 'var(--spacing-xs)' }}>
-                  Once enabled, refresh this page to see registered nodes and their health status.
-                </p>
-              </div>
-            </div>
-          <p style={{ fontSize: '0.8125rem', color: 'var(--color-text-muted)', marginTop: 'var(--spacing-md)' }}>
-            For full setup instructions, architecture details, and Kubernetes deployment, see the{' '}
-            <a href="https://localai.io/features/distributed-mode/" target="_blank" rel="noopener noreferrer"
-              style={{ color: 'var(--color-primary)' }}>Distributed Mode documentation <i className="fas fa-external-link-alt" style={{ fontSize: '0.625rem' }} /></a>.
-          </p>
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  // Split nodes by type
-  const backendNodes = nodesList.filter(n => !n.node_type || n.node_type === 'backend')
-  const agentNodes = nodesList.filter(n => n.node_type === 'agent')
-  const filteredNodes = activeTab === 'agent' ? agentNodes : backendNodes
-
-  // Compute stats for current tab
-  const total = filteredNodes.length
-  const healthy = filteredNodes.filter(n => n.status === 'healthy').length
-  const unhealthy = filteredNodes.filter(n => n.status === 'unhealthy' || n.status === 'offline').length
-  const draining = filteredNodes.filter(n => n.status === 'draining').length
-  const pending = filteredNodes.filter(n => n.status === 'pending').length
+  const attentionCount = reasons.size
+  const updateLabel = targets.backends.length === 1
+    ? t('update.named', { backend: targets.backends[0], count: targets.nodeIds.length })
+    : t('update.many', { count: targets.nodeIds.length })
 
   return (
-    <div className="page">
-      <div className="page-header">
-        <h1 className="page-title">
-          <i className="fas fa-network-wired" style={{ marginRight: 'var(--spacing-sm)' }} />
-          Distributed Nodes
-        </h1>
-        <p className="page-subtitle">
-          Manage backend and agent worker nodes
-        </p>
-      </div>
+    <div className="page page--wide sw-page" data-testid="swarm-nodes">
+      <h1 className="dk-sr-only">{t('nodes.title')}</h1>
 
-      {/* Tabs */}
-      <div style={{ display: 'flex', gap: 'var(--spacing-xs)', marginBottom: 'var(--spacing-lg)', borderBottom: '2px solid var(--color-border)' }}>
-        <button
-          onClick={() => setActiveTab('backend')}
-          style={{
-            padding: 'var(--spacing-sm) var(--spacing-lg)',
-            border: 'none', cursor: 'pointer', fontWeight: 600, fontSize: '0.875rem',
-            background: 'none',
-            color: activeTab === 'backend' ? 'var(--color-primary)' : 'var(--color-text-muted)',
-            borderBottom: activeTab === 'backend' ? '2px solid var(--color-primary)' : '2px solid transparent',
-            marginBottom: '-2px',
-          }}
-        >
-          <i className="fas fa-server" style={{ marginRight: 6 }} />
-          Backend Workers ({backendNodes.length})
-        </button>
-        <button
-          onClick={() => setActiveTab('agent')}
-          style={{
-            padding: 'var(--spacing-sm) var(--spacing-lg)',
-            border: 'none', cursor: 'pointer', fontWeight: 600, fontSize: '0.875rem',
-            background: 'none',
-            color: activeTab === 'agent' ? 'var(--color-primary)' : 'var(--color-text-muted)',
-            borderBottom: activeTab === 'agent' ? '2px solid var(--color-primary)' : '2px solid transparent',
-            marginBottom: '-2px',
-          }}
-        >
-          <i className="fas fa-robot" style={{ marginRight: 6 }} />
-          Agent Workers ({agentNodes.length})
-        </button>
-        <button
-          onClick={() => setActiveTab('scheduling')}
-          style={{
-            padding: 'var(--spacing-sm) var(--spacing-lg)',
-            border: 'none', cursor: 'pointer', fontWeight: 600, fontSize: '0.875rem',
-            background: 'none',
-            color: activeTab === 'scheduling' ? 'var(--color-primary)' : 'var(--color-text-muted)',
-            borderBottom: activeTab === 'scheduling' ? '2px solid var(--color-primary)' : '2px solid transparent',
-            marginBottom: '-2px',
-          }}
-        >
-          <i className="fas fa-calendar-alt" style={{ marginRight: 6 }} />
-          Scheduling ({schedulingConfigs.length})
-        </button>
-      </div>
+      {loadStatus === 'error' && (
+        <div className="sw-error" role="alert"><Icon name="alert-circle" /><span>{t('nodes.stale')}</span></div>
+      )}
 
-      {activeTab !== 'scheduling' && <>
-      {/* Stat cards */}
-      <div style={{ display: 'flex', gap: 'var(--spacing-md)', marginBottom: 'var(--spacing-xl)', flexWrap: 'wrap' }}>
-        <StatCard icon={activeTab === 'agent' ? 'fas fa-robot' : 'fas fa-server'} label={`Total ${activeTab === 'agent' ? 'Agent' : 'Backend'} Workers`} value={total} />
-        <StatCard icon="fas fa-check-circle" label="Healthy" value={healthy} color="var(--color-success)" />
-        <StatCard icon="fas fa-exclamation-circle" label="Unhealthy" value={unhealthy} color={unhealthy > 0 ? 'var(--color-error)' : undefined} />
-        <StatCard icon="fas fa-hourglass-half" label="Draining" value={draining} color={draining > 0 ? 'var(--color-warning)' : undefined} />
-        {pending > 0 && (
-          <StatCard icon="fas fa-clock" label="Pending" value={pending} color="var(--color-warning)" />
-        )}
-        {activeTab === 'backend' && (() => {
-          const clusterTotalVRAM = backendNodes.reduce((sum, n) => sum + (n.total_vram || 0), 0)
-          const clusterUsedVRAM = backendNodes.reduce((sum, n) => {
-            if (n.total_vram && n.available_vram != null) return sum + (n.total_vram - n.available_vram)
-            return sum
-          }, 0)
-          const totalModelsLoaded = backendNodes.reduce((sum, n) => sum + (n.model_count || 0), 0)
-          const totalInFlight = backendNodes.reduce((sum, n) => sum + (n.in_flight_count || 0), 0)
-          return (
-            <>
-              {clusterTotalVRAM > 0 && (
-                <StatCard icon="fas fa-microchip" label="Cluster VRAM"
-                  value={`${formatVRAM(clusterUsedVRAM) || '0'} / ${formatVRAM(clusterTotalVRAM)}`} />
-              )}
-              <StatCard icon="fas fa-cube" label="Models Loaded" value={totalModelsLoaded} />
-              <StatCard icon="fas fa-exchange-alt" label="In-Flight Requests" value={totalInFlight}
-                color={totalInFlight > 0 ? 'var(--color-primary)' : undefined} />
-            </>
-          )
-        })()}
-      </div>
-
-      {/* Worker tips */}
-      {!loading && filteredNodes.length === 0 ? (
-        <WorkerHintCard addToast={addToast} activeTab={activeTab} hasWorkers={false} />
-      ) : (
-        <>
-          <button
-            onClick={() => setShowTips(t => !t)}
-            style={{
-              background: 'none', border: 'none', cursor: 'pointer',
-              color: 'var(--color-primary)', fontSize: '0.8125rem', fontWeight: 500,
-              display: 'flex', alignItems: 'center', gap: 6,
-              padding: 0, marginBottom: 'var(--spacing-md)',
-            }}
-          >
-            <i className={`fas fa-chevron-${showTips ? 'down' : 'right'}`} style={{ fontSize: '0.625rem' }} />
-            Add more workers
+      <div className="sw-bar">
+        <div className="sw-chips" role="group" aria-label={t('nodes.filter')}>
+          <button type="button" className="dk-chip" aria-pressed={!needsOnly} onClick={() => { setNeedsOnly(false); setReason(null) }}>
+            {t('nodes.all')} <span className="sw-chip__n">{nodes.length}</span>
           </button>
-          {showTips && <WorkerHintCard addToast={addToast} activeTab={activeTab} hasWorkers />}
+          <button type="button" className="dk-chip" aria-pressed={needsOnly} onClick={() => setNeedsOnly(true)}>
+            {t('nodes.needs')} <span className="sw-chip__n">{attentionCount}</span>
+          </button>
+        </div>
+        <div className="sw-bar__acts">
+          {targets.pairs.length > 0 && (
+            <button type="button" className="dk-btn dk-btn--secondary" disabled={updating} onClick={updateBackends} data-testid="bulk-update">
+              <Icon name={updating ? 'spinner' : 'arrow-up'} spin={updating} /> {updateLabel}
+            </button>
+          )}
+          <div className="dk-segmented" role="radiogroup" aria-label={t('nodes.view')}>
+            <button type="button" role="radio" aria-checked={shownView === 'list'} className="dk-seg" onClick={() => setView('list')}><Icon name="list" /> {t('nodes.list')}</button>
+            {!phone && <button type="button" role="radio" aria-checked={shownView === 'map'} className="dk-seg" onClick={() => setView('map')}><Icon name="nodes" /> {t('nodes.map')}</button>}
+            <button type="button" role="radio" aria-checked={shownView === 'models'} className="dk-seg" onClick={() => setView('models')}><Icon name="layers" /> {t('nodes.running')}</button>
+          </div>
+          <Link className="dk-btn dk-btn--primary" to="/app/nodes/add"><Icon name="plus" /> {t('nodes.add')}</Link>
+        </div>
+      </div>
+
+      {needsOnly && shownView === 'list' && (
+        <div className="sw-chips" role="group" aria-label={t('nodes.reasons')}>
+          {ATTENTION_FILTERS.filter(key => reasonCounts[key] > 0 || reason === key).map(key => (
+            <button key={key} type="button" className="dk-chip dk-chip--sm" aria-pressed={reason === key} onClick={() => setReason(reason === key ? null : key)}>
+              {t(`attention.${key}Filter`)} <span className="sw-chip__n">{reasonCounts[key]}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {shownView === 'list' && (
+        <>
+          <div className="sw-filters">
+            <div className="dk-input-icon sw-search">
+              <Icon name="search" className="dk-icon" />
+              <input className="dk-input" type="search" aria-label={t('nodes.search')} placeholder={t('nodes.searchPlaceholder')} value={query} onChange={event => setQuery(event.target.value)} />
+            </div>
+            <select className="dk-select" aria-label={t('nodes.filterState')} value={state} onChange={event => setState(event.target.value)}>
+              <option value="">{t('nodes.anyState')}</option>
+              {STATUSES.map(value => <option key={value} value={value}>{t(`state.${value === 'unhealthy' ? 'down' : value}`)}</option>)}
+            </select>
+            <select className="dk-select" aria-label={t('nodes.filterType')} value={type} onChange={event => setType(event.target.value)}>
+              <option value="">{t('nodes.anyType')}</option>
+              <option value="backend">backend</option>
+              <option value="agent">agent</option>
+            </select>
+            <select className="dk-select" aria-label={t('nodes.group')} value={groupBy} onChange={event => setGroupBy(event.target.value)}>
+              <option value="none">{t('nodes.noGroup')}</option>
+              <option value="node_type">{t('nodes.groupType')}</option>
+              {labelKeys.map(key => <option key={key} value={`label:${key}`}>{t('nodes.groupLabel', { key })}</option>)}
+            </select>
+            <div className="dk-segmented sw-filters__density" role="radiogroup" aria-label={t('nodes.density')}>
+              <button type="button" role="radio" aria-checked={density === 'comfortable'} className="dk-seg" onClick={() => setDensityKept('comfortable')}>{t('nodes.comfortable')}</button>
+              <button type="button" role="radio" aria-checked={density === 'compact'} className="dk-seg" onClick={() => setDensityKept('compact')}>{t('nodes.compact')}</button>
+            </div>
+          </div>
+
+          {selectedIds.size > 0 && (
+            <div className="sw-selection" role="group" aria-label={t('bulk.label')}>
+              <strong aria-live="polite">{t('bulk.selected', { count: selectedIds.size })}</strong>
+              <button type="button" className="dk-btn dk-btn--secondary dk-btn--sm" disabled={bulkRunning} onClick={() => runBulk('drain')}>{t('bulk.drain')}</button>
+              <button type="button" className="dk-btn dk-btn--secondary dk-btn--sm" disabled={bulkRunning} onClick={() => runBulk('resume')}>{t('bulk.resume')}</button>
+              <button type="button" className="dk-btn dk-btn--danger dk-btn--sm" disabled={bulkRunning} onClick={() => setConfirmRemove(true)}>{t('bulk.remove')}</button>
+              <button type="button" className="dk-btn dk-btn--ghost dk-btn--sm" disabled={bulkRunning} onClick={() => setSelectedIds(new Set())}>{t('bulk.clear')}</button>
+              <span className="sw-count" aria-live="polite">{t('bulk.inView', { count: ordered.length })}</span>
+            </div>
+          )}
+
+          <NodesTable
+            nodes={pagination.items}
+            reasons={reasons}
+            selectedIds={selectedIds}
+            onSelectionChange={setSelectedIds}
+            sort={sort}
+            onSortChange={setSort}
+            groupBy={groupBy}
+            onApprove={approve}
+            compact={density === 'compact'}
+            busyId={busyId}
+          />
+          <div className="sw-pager">
+            <span>{t('pager.page', { page: pagination.page, total: pagination.totalPages })}</span>
+            <button type="button" className="dk-btn dk-btn--secondary dk-btn--sm" aria-label={t('pager.previousAria')} disabled={pagination.page === 1} onClick={() => setPage(value => value - 1)}>{t('pager.previous')}</button>
+            <button type="button" className="dk-btn dk-btn--secondary dk-btn--sm" aria-label={t('pager.nextAria')} disabled={pagination.page === pagination.totalPages} onClick={() => setPage(value => value + 1)}>{t('pager.next')}</button>
+          </div>
         </>
       )}
 
-      {/* Node table */}
-      {filteredNodes.length > 0 && (
-        <div className="table-container">
-          <table className="table">
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Status</th>
-                <th>GPU / VRAM</th>
-                <th>Last Heartbeat</th>
-                <th style={{ textAlign: 'right' }}>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filteredNodes.map(node => {
-                const status = statusConfig[node.status] || statusConfig.unhealthy
-                const isExpanded = expandedNodeId === node.id
-                const models = nodeModels[node.id]
-                const backends = nodeBackends[node.id]
-                const vendorLabel = gpuVendorLabel(node.gpu_vendor)
-                const totalVRAMStr = formatVRAM(node.total_vram)
-                const availVRAMStr = formatVRAM(node.available_vram)
-                const usedVRAM = node.total_vram && node.available_vram != null
-                  ? node.total_vram - node.available_vram
-                  : null
-                const usedVRAMStr = usedVRAM != null ? formatVRAM(usedVRAM) : null
-
-                // RAM fallback for CPU-only workers
-                const hasGPU = node.total_vram > 0
-                const totalRAMStr = formatVRAM(node.total_ram)
-                const usedRAM = node.total_ram && node.available_ram != null
-                  ? node.total_ram - node.available_ram
-                  : null
-                const usedRAMStr = usedRAM != null ? formatVRAM(usedRAM) : null
-
-                const canExpand = activeTab !== 'agent'
-                return (
-                  <Fragment key={node.id}>
-                    <tr
-                      onClick={canExpand ? () => toggleExpand(node.id) : undefined}
-                      style={{ cursor: canExpand ? 'pointer' : 'default' }}
-                    >
-                      <td>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--spacing-sm)' }}>
-                          <i className="fas fa-server" style={{ color: 'var(--color-text-muted)', fontSize: '0.875rem' }} />
-                          <div>
-                            <div style={{ fontWeight: 600, fontSize: '0.875rem' }}>{node.name}</div>
-                            <div style={{ fontSize: '0.75rem', fontFamily: "'JetBrains Mono', monospace", color: 'var(--color-text-muted)' }}>
-                              {node.address}
-                            </div>
-                            {node.labels && Object.keys(node.labels).length > 0 && (
-                              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3, marginTop: 3 }}>
-                                {Object.entries(node.labels).slice(0, 5).map(([k, v]) => (
-                                  <span key={k} style={{
-                                    fontSize: '0.625rem', padding: '1px 5px', borderRadius: 3,
-                                    background: 'var(--color-bg-tertiary)', color: 'var(--color-text-muted)',
-                                    fontFamily: "'JetBrains Mono', monospace", border: '1px solid var(--color-border-subtle)',
-                                  }}>{k}={v}</span>
-                                ))}
-                                {Object.keys(node.labels).length > 5 && (
-                                  <span style={{ fontSize: '0.625rem', color: 'var(--color-text-muted)' }}>
-                                    +{Object.keys(node.labels).length - 5} more
-                                  </span>
-                                )}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      </td>
-                      <td>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                          <i className="fas fa-circle" style={{ fontSize: '0.5rem', color: status.color }} />
-                          <span style={{ fontSize: '0.8125rem', color: status.color, fontWeight: 500 }}>
-                            {status.label}
-                          </span>
-                        </div>
-                      </td>
-                      <td>
-                        {hasGPU && totalVRAMStr ? (
-                          <div style={{ fontSize: '0.8125rem', fontFamily: "'JetBrains Mono', monospace" }}>
-                            {vendorLabel && (
-                              <span style={{ color: 'var(--color-text-secondary)', marginRight: 4 }}>{vendorLabel}</span>
-                            )}
-                            <span style={{ color: 'var(--color-text-muted)' }}>
-                              {usedVRAMStr || '0'} / {totalVRAMStr}
-                            </span>
-                          </div>
-                        ) : totalRAMStr ? (
-                          <div style={{ fontSize: '0.8125rem', fontFamily: "'JetBrains Mono', monospace" }}>
-                            <span style={{ color: 'var(--color-text-secondary)', marginRight: 4 }}>CPU</span>
-                            <span style={{ color: 'var(--color-text-muted)' }}>
-                              {usedRAMStr || '0'} / {totalRAMStr} RAM
-                            </span>
-                          </div>
-                        ) : (
-                          <span style={{ fontSize: '0.8125rem', color: 'var(--color-text-muted)' }}>-</span>
-                        )}
-                      </td>
-                      <td>
-                        <span style={{ fontSize: '0.8125rem', fontFamily: "'JetBrains Mono', monospace", color: 'var(--color-text-secondary)' }}>
-                          {timeAgo(node.last_heartbeat)}
-                        </span>
-                      </td>
-                      <td style={{ textAlign: 'right' }}>
-                        <div style={{ display: 'flex', gap: 'var(--spacing-xs)', justifyContent: 'flex-end' }} onClick={e => e.stopPropagation()}>
-                          {node.status === 'pending' && (
-                            <button
-                              className="btn btn-primary btn-sm"
-                              onClick={() => handleApprove(node.id)}
-                              title="Approve node"
-                            >
-                              <i className="fas fa-check" />
-                            </button>
-                          )}
-                          {node.status === 'draining' && (
-                            <button
-                              className="btn btn-secondary btn-sm"
-                              onClick={() => handleResume(node.id)}
-                              title="Resume node"
-                            >
-                              <i className="fas fa-play" />
-                            </button>
-                          )}
-                          {node.status !== 'draining' && node.status !== 'pending' && (
-                            <button
-                              className="btn btn-secondary btn-sm"
-                              onClick={() => handleDrain(node.id)}
-                              title="Drain node"
-                            >
-                              <i className="fas fa-pause" />
-                            </button>
-                          )}
-                          <button
-                            className="btn btn-danger btn-sm"
-                            onClick={() => setConfirmDelete(node)}
-                            title="Remove node"
-                          >
-                            <i className="fas fa-trash" />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                    {isExpanded && canExpand && (
-                      <tr>
-                        <td colSpan={5} style={{ padding: 0, background: 'var(--color-bg-secondary)' }}>
-                          <div style={{ padding: 'var(--spacing-md) var(--spacing-lg)' }}>
-                            <h4 style={{ fontSize: '0.8125rem', fontWeight: 600, marginBottom: 'var(--spacing-sm)', color: 'var(--color-text-secondary)' }}>
-                              <i className="fas fa-cube" style={{ marginRight: 6 }} />
-                              Loaded Models
-                            </h4>
-                            {!models ? (
-                              <LoadingSpinner size="sm" />
-                            ) : models.length === 0 ? (
-                              <p style={{ fontSize: '0.8125rem', color: 'var(--color-text-muted)' }}>No models loaded on this node</p>
-                            ) : (
-                              <table className="table" style={{ margin: 0 }}>
-                                <thead>
-                                  <tr>
-                                    <th>Model</th>
-                                    <th>State</th>
-                                    <th>In-Flight</th>
-                                    <th style={{ width: 40 }}>Logs</th>
-                                    <th style={{ textAlign: 'right' }}>Actions</th>
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {models.map(m => {
-                                    const stCfg = modelStateConfig[m.state] || modelStateConfig.idle
-                                    return (
-                                      <tr key={m.id || m.model_name}>
-                                        <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: '0.8125rem' }}>
-                                          {m.model_name}
-                                        </td>
-                                        <td>
-                                          <span style={{
-                                            display: 'inline-block', padding: '2px 8px', borderRadius: 'var(--radius-sm)',
-                                            fontSize: '0.75rem', fontWeight: 500,
-                                            background: stCfg.bg, color: stCfg.color, border: `1px solid ${stCfg.border}`,
-                                          }}>
-                                            {m.state}
-                                          </span>
-                                        </td>
-                                        <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: '0.8125rem' }}>
-                                          {m.in_flight ?? 0}
-                                        </td>
-                                        <td>
-                                          <a
-                                            href="#"
-                                            onClick={(e) => {
-                                              e.preventDefault()
-                                              navigate(`/app/node-backend-logs/${node.id}/${encodeURIComponent(m.model_name)}`)
-                                            }}
-                                            style={{ fontSize: '0.75rem', color: 'var(--color-primary)' }}
-                                            title="View backend logs"
-                                          >
-                                            <i className="fas fa-terminal" />
-                                          </a>
-                                        </td>
-                                        <td style={{ textAlign: 'right' }}>
-                                          <button
-                                            className="btn btn-danger btn-sm"
-                                            title={m.in_flight > 0 ? 'Unload model (has in-flight requests)' : 'Unload model'}
-                                            onClick={(e) => {
-                                              e.stopPropagation()
-                                              setConfirmUnload({
-                                                nodeId: node.id,
-                                                nodeName: node.name,
-                                                modelName: m.model_name,
-                                                inFlight: m.in_flight ?? 0,
-                                              })
-                                            }}
-                                          >
-                                            <i className="fas fa-stop" />
-                                          </button>
-                                        </td>
-                                      </tr>
-                                    )
-                                  })}
-                                </tbody>
-                              </table>
-                            )}
-
-                            <h4 style={{ fontSize: '0.8125rem', fontWeight: 600, marginTop: 'var(--spacing-md)', marginBottom: 'var(--spacing-sm)', color: 'var(--color-text-secondary)' }}>
-                              <i className="fas fa-cogs" style={{ marginRight: 6 }} />
-                              Installed Backends
-                            </h4>
-                            {!backends ? (
-                              <LoadingSpinner size="sm" />
-                            ) : backends.length === 0 ? (
-                              <p style={{ fontSize: '0.8125rem', color: 'var(--color-text-muted)' }}>No backends installed on this node</p>
-                            ) : (
-                              <table className="table" style={{ margin: 0 }}>
-                                <thead>
-                                  <tr>
-                                    <th>Name</th>
-                                    <th>Type</th>
-                                    <th>Installed At</th>
-                                    <th style={{ textAlign: 'right' }}>Actions</th>
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {backends.map(b => (
-                                    <tr key={b.name}>
-                                      <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: '0.8125rem' }}>
-                                        {b.name}
-                                      </td>
-                                      <td>
-                                        <span style={{
-                                          display: 'inline-block', padding: '2px 8px', borderRadius: 'var(--radius-sm)',
-                                          fontSize: '0.75rem', fontWeight: 500,
-                                          background: b.is_system ? 'var(--color-bg-tertiary)' : 'var(--color-primary-light)',
-                                          color: b.is_system ? 'var(--color-text-muted)' : 'var(--color-primary)',
-                                          border: `1px solid ${b.is_system ? 'var(--color-border-subtle)' : 'var(--color-primary-border)'}`,
-                                        }}>
-                                          {b.is_system ? 'system' : 'gallery'}
-                                        </span>
-                                      </td>
-                                      <td style={{ fontSize: '0.8125rem', color: 'var(--color-text-muted)' }}>
-                                        {b.installed_at ? timeAgo(b.installed_at) : '-'}
-                                      </td>
-                                      <td style={{ textAlign: 'right' }}>
-                                        {!b.is_system && (
-                                          <button
-                                            className="btn btn-secondary btn-sm"
-                                            onClick={() => handleReinstallBackend(node.id, b.name)}
-                                            title="Reinstall backend"
-                                          >
-                                            <i className="fas fa-sync-alt" />
-                                          </button>
-                                        )}
-                                      </td>
-                                    </tr>
-                                  ))}
-                                </tbody>
-                              </table>
-                            )}
-
-                            {/* Labels */}
-                            <div style={{ marginTop: 'var(--spacing-md)' }}>
-                              <h4 style={{ fontSize: '0.8125rem', fontWeight: 600, marginBottom: 'var(--spacing-sm)', color: 'var(--color-text-secondary)' }}>
-                                <i className="fas fa-tags" style={{ marginRight: 6 }} />
-                                Labels
-                              </h4>
-                              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--spacing-xs)', marginBottom: 'var(--spacing-sm)' }}>
-                                {node.labels && Object.entries(node.labels).map(([k, v]) => (
-                                  <span key={k} style={{
-                                    display: 'inline-flex', alignItems: 'center', gap: 4,
-                                    fontSize: '0.75rem', padding: '2px 8px', borderRadius: 4,
-                                    background: 'var(--color-bg-tertiary)', border: '1px solid var(--color-border-subtle)',
-                                    fontFamily: "'JetBrains Mono', monospace",
-                                  }}>
-                                    {k}={v}
-                                    <button
-                                      onClick={(e) => { e.stopPropagation(); handleDeleteLabel(node.id, k) }}
-                                      style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-text-muted)', fontSize: '0.625rem', padding: 0 }}
-                                      title="Remove label"
-                                    >
-                                      <i className="fas fa-times" />
-                                    </button>
-                                  </span>
-                                ))}
-                              </div>
-                              {/* Add label form */}
-                              <div style={{ display: 'flex', gap: 'var(--spacing-xs)', alignItems: 'center' }}>
-                                <input
-                                  className="input"
-                                  type="text"
-                                  placeholder="key"
-                                  style={{ width: '8rem' }}
-                                  value={(labelInputs[node.id] || {}).key || ''}
-                                  onChange={e => setLabelInput(node.id, 'key', e.target.value)}
-                                />
-                                <input
-                                  className="input"
-                                  type="text"
-                                  placeholder="value"
-                                  style={{ width: '8rem' }}
-                                  value={(labelInputs[node.id] || {}).value || ''}
-                                  onChange={e => setLabelInput(node.id, 'value', e.target.value)}
-                                />
-                                <button className="btn btn-secondary btn-sm" onClick={async (e) => {
-                                  e.stopPropagation()
-                                  const { key = '', value: val = '' } = labelInputs[node.id] || {}
-                                  if (key.trim()) {
-                                    await handleAddLabel(node.id, key.trim(), val.trim())
-                                    setLabelInputs(prev => ({ ...prev, [node.id]: { key: '', value: '' } }))
-                                  }
-                                }}>Add</button>
-                              </div>
-                            </div>
-                          </div>
-                        </td>
-                      </tr>
-                    )}
-                  </Fragment>
-                )
-              })}
-            </tbody>
-          </table>
-        </div>
+      {shownView === 'map' && (
+        <>
+          <NodeMap nodes={needsOnly ? nodes.filter(node => reasons.has(node.id)) : nodes} rows={replicas.state === 'loaded' ? replicas.rows : null} />
+          <p className="sw-note sw-note--quiet">{t('map.note')}</p>
+        </>
       )}
-      </>}
 
-      {activeTab === 'scheduling' && (
-        <div>
-          <button className="btn btn-primary btn-sm" style={{ marginBottom: 'var(--spacing-md)' }}
-            onClick={() => setShowSchedulingForm(f => !f)}>
-            <i className="fas fa-plus" style={{ marginRight: 6 }} />
-            Add Scheduling Rule
-          </button>
-          {showSchedulingForm && <SchedulingForm onSave={async (config) => {
-            try {
-              await nodesApi.setScheduling(config)
-              fetchScheduling()
-              setShowSchedulingForm(false)
-              addToast('Scheduling rule saved', 'success')
-            } catch (err) {
-              addToast(`Failed to save rule: ${err.message}`, 'error')
-            }
-          }} onCancel={() => setShowSchedulingForm(false)} />}
-          {schedulingConfigs.length === 0 && !showSchedulingForm ? (
-            <p style={{ fontSize: '0.875rem', color: 'var(--color-text-muted)', textAlign: 'center', padding: 'var(--spacing-xl) 0' }}>
-              No scheduling rules configured. Add a rule to control how models are placed on nodes.
-            </p>
-          ) : schedulingConfigs.length > 0 && (
-            <div className="table-container">
-              <table className="table">
-                <thead><tr>
-                  <th>Model</th>
-                  <th>Mode</th>
-                  <th>Node Selector</th>
-                  <th>Min Replicas</th>
-                  <th>Max Replicas</th>
-                  <th style={{ textAlign: 'right' }}>Actions</th>
-                </tr></thead>
-                <tbody>
-                  {schedulingConfigs.map(cfg => {
-                    const isAutoScaling = cfg.min_replicas > 0 || cfg.max_replicas > 0
-                    const hasSelector = !!cfg.node_selector
-                    const modeLabel = isAutoScaling ? 'Auto-scaling' : hasSelector ? 'Placement' : 'Inactive'
-                    const modeColor = isAutoScaling ? 'var(--color-success)' : hasSelector ? 'var(--color-primary)' : 'var(--color-text-muted)'
-                    return (
-                    <tr key={cfg.id || cfg.model_name}>
-                      <td style={{ fontWeight: 600, fontSize: '0.875rem' }}>{cfg.model_name}</td>
-                      <td>
-                        <span style={{
-                          display: 'inline-block', fontSize: '0.75rem', padding: '2px 8px', borderRadius: 3,
-                          background: 'var(--color-bg-tertiary)', border: `1px solid ${modeColor}`,
-                          color: modeColor, fontWeight: 600,
-                        }}>{modeLabel}</span>
-                      </td>
-                      <td>
-                        {cfg.node_selector ? (() => {
-                          try {
-                            const sel = typeof cfg.node_selector === 'string' ? JSON.parse(cfg.node_selector) : cfg.node_selector
-                            return Object.entries(sel).map(([k,v]) => (
-                              <span key={k} style={{
-                                display: 'inline-block', fontSize: '0.75rem', padding: '2px 6px', borderRadius: 3,
-                                background: 'var(--color-bg-tertiary)', border: '1px solid var(--color-border-subtle)',
-                                fontFamily: "'JetBrains Mono', monospace", marginRight: 4,
-                              }}>{k}={v}</span>
-                            ))
-                          } catch { return <span style={{ color: 'var(--color-text-muted)', fontSize: '0.8125rem' }}>{cfg.node_selector}</span> }
-                        })() : <span style={{ color: 'var(--color-text-muted)', fontSize: '0.8125rem' }}>Any node</span>}
-                      </td>
-                      <td style={{ fontFamily: "'JetBrains Mono', monospace" }}>
-                        {isAutoScaling ? cfg.min_replicas : '-'}
-                      </td>
-                      <td style={{ fontFamily: "'JetBrains Mono', monospace" }}>
-                        {isAutoScaling ? (cfg.max_replicas || 'no limit') : '-'}
-                      </td>
-                      <td style={{ textAlign: 'right' }}>
-                        <button className="btn btn-danger btn-sm" onClick={async () => {
-                          try {
-                            await nodesApi.deleteScheduling(cfg.model_name)
-                            fetchScheduling()
-                            addToast('Rule deleted', 'success')
-                          } catch (err) {
-                            addToast(`Failed to delete rule: ${err.message}`, 'error')
-                          }
-                        }}><i className="fas fa-trash" /></button>
-                      </td>
-                    </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-      )}
+      {shownView === 'models' && <RunningModels nodes={nodes} replicas={replicas} addToast={addToast} />}
 
       <ConfirmDialog
-        open={!!confirmDelete}
-        title="Remove Node"
-        message={confirmDelete ? `Are you sure you want to remove node "${confirmDelete.name}"? This will deregister it from the cluster.` : ''}
-        confirmLabel="Remove"
+        open={confirmRemove}
+        title={t('bulk.removeTitle')}
+        message={t('bulk.removeMessage', { count: selectedIds.size })}
+        confirmLabel={t('bulk.removeConfirm')}
+        pendingLabel={t('bulk.removing')}
+        pending={bulkRunning}
         danger
-        onConfirm={() => confirmDelete && handleDelete(confirmDelete.id)}
-        onCancel={() => setConfirmDelete(null)}
+        onConfirm={() => runBulk('delete')}
+        onCancel={() => setConfirmRemove(false)}
       />
+    </div>
+  )
+}
 
-      <ConfirmDialog
-        open={!!confirmUnload}
-        title="Unload Model"
-        message={
-          confirmUnload
-            ? confirmUnload.inFlight > 0
-              ? `"${confirmUnload.modelName}" on ${confirmUnload.nodeName} currently has ${confirmUnload.inFlight} in-flight request(s). Unloading will interrupt them. Continue?`
-              : `Unload "${confirmUnload.modelName}" from ${confirmUnload.nodeName}?`
-            : ''
-        }
-        confirmLabel="Unload"
-        danger={confirmUnload?.inFlight > 0}
-        onConfirm={() => {
-          if (confirmUnload) {
-            handleUnloadModel(confirmUnload.nodeId, confirmUnload.modelName)
-          }
-          setConfirmUnload(null)
-        }}
-        onCancel={() => setConfirmUnload(null)}
-      />
+// The way to more than one machine, shown from the single-node view on request:
+// distributed mode first, then the worker steps on their own page.
+function ScaleOut({ addToast }) {
+  const { t } = useTranslation('swarm')
+  return (
+    <div className="dk-card sw-scale" data-testid="scale-out">
+      <h2 className="sw-scale__title">{t('scale.title')}</h2>
+      <p className="sw-note">{t('scale.sub')}</p>
+      <CommandBlock command={DISTRIBUTED_COMMAND} label={t('scale.title')} addToast={addToast} />
+      <p className="sw-note sw-note--quiet">
+        {t('add.distributed.docs')}{' '}
+        <a className="dk-link" href="https://localai.io/features/distributed-mode/" target="_blank" rel="noopener noreferrer">{t('add.distributed.docsLink')}</a>
+      </p>
+      <div>
+        <Link className="dk-btn dk-btn--secondary" to="/app/nodes/add">{t('scale.next')}</Link>
+      </div>
     </div>
   )
 }

@@ -34,6 +34,7 @@ type LauncherUI struct {
 	backendsPathEntry *widget.Entry
 	addressEntry      *widget.Entry
 	logLevelSelect    *widget.Select
+	autoStartCheck    *widget.Check
 	startOnBootCheck  *widget.Check
 
 	// Environment Variables
@@ -57,8 +58,16 @@ type LauncherUI struct {
 
 // NewLauncherUI creates a new UI instance
 func NewLauncherUI() *LauncherUI {
+	// Truncate the status text with an ellipsis. Status messages can carry a
+	// download error containing a long, unbreakable URL/path; without this the
+	// label demands the full single-line width and stretches the window (and
+	// the progress bar) arbitrarily wide. The full error is still shown in the
+	// error dialog.
+	statusLabel := widget.NewLabel("Initializing...")
+	statusLabel.Truncation = fyne.TextTruncateEllipsis
+
 	return &LauncherUI{
-		statusLabel:       widget.NewLabel("Initializing..."),
+		statusLabel:       statusLabel,
 		versionLabel:      widget.NewLabel("Version: Unknown"),
 		startStopButton:   widget.NewButton("Start LocalAI", nil),
 		webUIButton:       widget.NewButton("Open WebUI", nil),
@@ -67,6 +76,7 @@ func NewLauncherUI() *LauncherUI {
 		backendsPathEntry: widget.NewEntry(),
 		addressEntry:      widget.NewEntry(),
 		logLevelSelect:    widget.NewSelect([]string{"error", "warn", "info", "debug", "trace"}, nil),
+		autoStartCheck:    widget.NewCheck("Start LocalAI when the launcher opens", nil),
 		startOnBootCheck:  widget.NewCheck("Start LocalAI on system boot", nil),
 		logText:           widget.NewMultiLineEntry(),
 		progressBar:       widget.NewProgressBar(),
@@ -109,6 +119,7 @@ func (ui *LauncherUI) createConfigTab() *fyne.Container {
 			widget.NewLabel("Log Level:"),
 			ui.logLevelSelect,
 		),
+		ui.autoStartCheck,
 		ui.startOnBootCheck,
 	))
 
@@ -393,6 +404,8 @@ func (ui *LauncherUI) saveConfiguration() {
 	config.BackendsPath = ui.backendsPathEntry.Text
 	config.Address = ui.addressEntry.Text
 	config.LogLevel = ui.logLevelSelect.Selected
+	autoStart := ui.autoStartCheck.Checked
+	config.AutoStart = &autoStart
 	config.StartOnBoot = ui.startOnBootCheck.Checked
 
 	// Ensure environment variables are included in the configuration
@@ -482,14 +495,19 @@ func (ui *LauncherUI) downloadUpdate() {
 	ui.UpdateStatus("Downloading update " + version + "...")
 
 	go func() {
-		err := ui.launcher.DownloadUpdate(version, func(progress float64) {
-			// Update progress bar
+		err := ui.launcher.DownloadUpdate(version, func(downloaded, total int64) {
 			fyne.Do(func() {
-				ui.progressBar.SetValue(progress)
+				if total > 0 {
+					ui.progressBar.SetValue(float64(downloaded) / float64(total))
+				}
 			})
-			// Update status with percentage
-			percentage := int(progress * 100)
-			ui.UpdateStatus(fmt.Sprintf("Downloading update %s... %d%%", version, percentage))
+			// The progress bar already shows the percentage, so report the
+			// human-readable size here instead of repeating the percent.
+			if total > 0 {
+				ui.UpdateStatus(fmt.Sprintf("Downloading update %s… %s / %s", version, formatBytes(downloaded), formatBytes(total)))
+			} else {
+				ui.UpdateStatus(fmt.Sprintf("Downloading update %s… %s", version, formatBytes(downloaded)))
+			}
 		})
 
 		fyne.Do(func() {
@@ -570,6 +588,7 @@ func (ui *LauncherUI) LoadConfiguration() {
 	ui.backendsPathEntry.SetText(config.BackendsPath)
 	ui.addressEntry.SetText(config.Address)
 	ui.logLevelSelect.SetSelected(config.LogLevel)
+	ui.autoStartCheck.SetChecked(config.AutoStart == nil || *config.AutoStart)
 	ui.startOnBootCheck.SetChecked(config.StartOnBoot)
 
 	// Load environment variables
@@ -590,79 +609,6 @@ func (ui *LauncherUI) LoadConfiguration() {
 	log.Printf("UI LoadConfiguration: configuration loaded successfully")
 }
 
-// showDownloadProgress shows a progress window for downloading LocalAI
-func (ui *LauncherUI) showDownloadProgress(version, title string) {
-	fyne.DoAndWait(func() {
-		// Create progress window using the launcher's app
-		progressWindow := ui.launcher.app.NewWindow("Downloading LocalAI")
-		progressWindow.Resize(fyne.NewSize(400, 250))
-		progressWindow.CenterOnScreen()
-
-		// Progress bar
-		progressBar := widget.NewProgressBar()
-		progressBar.SetValue(0)
-
-		// Status label
-		statusLabel := widget.NewLabel("Preparing download...")
-
-		// Release notes button
-		releaseNotesButton := widget.NewButton("View Release Notes", func() {
-			releaseNotesURL, err := ui.launcher.githubReleaseNotesURL(version)
-			if err != nil {
-				log.Printf("Failed to parse URL: %v", err)
-				return
-			}
-
-			ui.launcher.app.OpenURL(releaseNotesURL)
-		})
-
-		// Progress container
-		progressContainer := container.NewVBox(
-			widget.NewLabel(title),
-			progressBar,
-			statusLabel,
-			widget.NewSeparator(),
-			releaseNotesButton,
-		)
-
-		progressWindow.SetContent(progressContainer)
-		progressWindow.Show()
-
-		// Start download in background
-		go func() {
-			err := ui.launcher.DownloadUpdate(version, func(progress float64) {
-				// Update progress bar
-				fyne.Do(func() {
-					progressBar.SetValue(progress)
-					percentage := int(progress * 100)
-					statusLabel.SetText(fmt.Sprintf("Downloading... %d%%", percentage))
-				})
-			})
-
-			// Handle completion
-			fyne.Do(func() {
-				if err != nil {
-					statusLabel.SetText(fmt.Sprintf("Download failed: %v", err))
-					// Show error dialog
-					dialog.ShowError(err, progressWindow)
-				} else {
-					statusLabel.SetText("Download completed successfully!")
-					progressBar.SetValue(1.0)
-
-					// Show success dialog
-					dialog.ShowConfirm("Installation Complete",
-						"LocalAI has been downloaded and installed successfully. You can now start LocalAI from the launcher.",
-						func(close bool) {
-							progressWindow.Close()
-							// Update status
-							ui.UpdateStatus("LocalAI installed successfully")
-						}, progressWindow)
-				}
-			})
-		}()
-	})
-}
-
 // UpdateRunningState updates UI based on LocalAI running state
 func (ui *LauncherUI) UpdateRunningState(isRunning bool) {
 	fyne.Do(func() {
@@ -674,6 +620,14 @@ func (ui *LauncherUI) UpdateRunningState(isRunning bool) {
 			ui.webUIButton.Disable()
 		}
 	})
+}
+
+// WelcomeDontShowAgainChecked reports the initial state of the welcome
+// window's "don't show this welcome window again" checkbox for the given
+// config: checked only when the user has already opted out of the welcome
+// window.
+func WelcomeDontShowAgainChecked(config *Config) bool {
+	return config != nil && config.ShowWelcome != nil && !*config.ShowWelcome
 }
 
 // ShowWelcomeWindow displays the welcome window with helpful information
@@ -737,19 +691,20 @@ Getting Started:
 			ui.openURL("https://discord.gg/XgwjKptP7Z")
 		})
 
-		// Checkbox to disable welcome window
-		dontShowAgainCheck := widget.NewCheck("Don't show this welcome window again", func(checked bool) {
+		// Checkbox to disable welcome window. The initial state is applied
+		// BEFORE the change callback is attached: SetChecked fires OnChanged,
+		// and letting the initialization itself persist a ShowWelcome flip is
+		// exactly the bug that suppressed this window forever after its first
+		// showing (#11673).
+		dontShowAgainCheck := widget.NewCheck("Don't show this welcome window again", nil)
+		dontShowAgainCheck.SetChecked(WelcomeDontShowAgainChecked(ui.launcher.GetConfig()))
+		dontShowAgainCheck.OnChanged = func(checked bool) {
 			if ui.launcher != nil {
 				config := ui.launcher.GetConfig()
 				v := !checked
 				config.ShowWelcome = &v
 				ui.launcher.SetConfig(config)
 			}
-		})
-
-		config := ui.launcher.GetConfig()
-		if config.ShowWelcome != nil {
-			dontShowAgainCheck.SetChecked(*config.ShowWelcome)
 		}
 
 		// Close button

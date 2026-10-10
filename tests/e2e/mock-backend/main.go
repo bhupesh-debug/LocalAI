@@ -13,7 +13,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/mudler/LocalAI/pkg/grpc/grpcerrors"
 	pb "github.com/mudler/LocalAI/pkg/grpc/proto"
 	"github.com/mudler/xlog"
 	"google.golang.org/grpc"
@@ -31,6 +34,47 @@ type MockBackend struct {
 	pb.UnimplementedBackendServer
 }
 
+// lastLoadParams records the most recent LoadModel parameters so a Predict
+// call can echo them back. Used by the path-resolution e2e test, which needs
+// to verify that relative draft_model / mmproj / modelfile paths in the YAML
+// config arrive at the backend already resolved against the models directory.
+// Each backend binary serves a single model, so a single value is enough.
+var (
+	lastLoadParamsMu sync.RWMutex
+	lastLoadParams   *pb.ModelOptions
+)
+
+func recordLoadParams(opts *pb.ModelOptions) {
+	lastLoadParamsMu.Lock()
+	defer lastLoadParamsMu.Unlock()
+	lastLoadParams = opts
+}
+
+func snapshotLoadParams() *pb.ModelOptions {
+	lastLoadParamsMu.RLock()
+	defer lastLoadParamsMu.RUnlock()
+	return lastLoadParams
+}
+
+// checkModelIdentity mirrors the guard the real backends apply (pkg/grpc,
+// backend/python/common/model_identity.py, backend/cpp/*/grpc-server.cpp) so
+// the distributed e2e suite exercises the #10952 fix rather than only the
+// unit tests. Empty on either side means skip, which is why every existing
+// spec that sends a bare request struct keeps working.
+//
+// It takes an interface rather than *pb.PredictOptions because every modality
+// request message now carries the field, and the rule must not drift per RPC.
+func checkModelIdentity(in interface{ GetModelIdentity() string }) error {
+	if in == nil || in.GetModelIdentity() == "" {
+		return nil
+	}
+	opts := snapshotLoadParams()
+	if opts == nil || opts.Model == "" || opts.Model == in.GetModelIdentity() {
+		return nil
+	}
+	return grpcerrors.ModelMismatch("mock-backend", opts.Model, in.GetModelIdentity())
+}
+
 // promptHasToolResults checks if the prompt contains evidence of prior tool
 // execution — specifically the output from the mock MCP server's get_weather tool.
 func promptHasToolResults(prompt string) bool {
@@ -43,7 +87,16 @@ func (m *MockBackend) Health(ctx context.Context, in *pb.HealthMessage) (*pb.Rep
 }
 
 func (m *MockBackend) LoadModel(ctx context.Context, in *pb.ModelOptions) (*pb.Result, error) {
-	xlog.Debug("LoadModel called", "model", in.Model)
+	xlog.Debug("LoadModel called",
+		"model", in.Model,
+		"modelfile", in.ModelFile,
+		"draft_model", in.DraftModel,
+		"mmproj", in.MMProj)
+	recordLoadParams(in)
+	// Lets e2e specs build a failover target whose backend cannot load.
+	if strings.HasPrefix(in.Model, "fail-load") {
+		return &pb.Result{Message: "mock: load failure", Success: false}, nil
+	}
 	return &pb.Result{
 		Message: "Model loaded successfully (mocked)",
 		Success: true,
@@ -51,9 +104,81 @@ func (m *MockBackend) LoadModel(ctx context.Context, in *pb.ModelOptions) (*pb.R
 }
 
 func (m *MockBackend) Predict(ctx context.Context, in *pb.PredictOptions) (*pb.Reply, error) {
+	if err := checkModelIdentity(in); err != nil {
+		return nil, err
+	}
+	if opts := snapshotLoadParams(); opts != nil && (strings.Contains(opts.Model, "mm-red") || strings.Contains(opts.Model, "mm-blue")) {
+		if err := auditDecision("predict", []byte(opts.Model)); err != nil {
+			return nil, err
+		}
+		b, err := json.Marshal(map[string]any{"model": opts.Model, "images": in.Images, "prompt": in.Prompt})
+		return &pb.Reply{Message: b, PromptTokens: 1, Tokens: 1}, err
+	}
 	xlog.Debug("Predict called", "prompt", in.Prompt)
+	if strings.Contains(in.Prompt, "MOCK_ERROR_CONTEXT_OVERFLOW") {
+		return nil, errMockContextOverflow
+	}
 	if strings.Contains(in.Prompt, "MOCK_ERROR") {
 		return nil, fmt.Errorf("mock backend predict error: simulated failure")
+	}
+
+	// ECHO_LOAD_PARAMS lets path-resolution tests inspect what LoadModel
+	// received without adding a new RPC. The reply carries a JSON snapshot
+	// of the relevant ModelOptions fields so the test can assert that
+	// relative paths from the YAML have been resolved before reaching the
+	// backend.
+	if strings.Contains(in.Prompt, "ECHO_LOAD_PARAMS") {
+		opts := snapshotLoadParams()
+		snapshot := map[string]string{}
+		if opts != nil {
+			snapshot["model"] = opts.Model
+			snapshot["model_file"] = opts.ModelFile
+			snapshot["draft_model"] = opts.DraftModel
+			snapshot["mmproj"] = opts.MMProj
+		}
+		payload, err := json.Marshal(snapshot)
+		if err != nil {
+			return nil, fmt.Errorf("mock backend echo error: %w", err)
+		}
+		return &pb.Reply{
+			Message:      payload,
+			Tokens:       int32(len(snapshot)),
+			PromptTokens: 1,
+		}, nil
+	}
+
+	// ECHO_PREDICT_METADATA lets tests assert exactly what the REST layer
+	// forwarded to the backend as gRPC PredictOptions.Metadata (e.g. the
+	// chat_template_kwargs blob and the standalone enable_thinking/reasoning_effort
+	// keys). The reply carries a JSON snapshot of in.Metadata so an HTTP-level
+	// test can pin the request -> gRPC mapping without a new RPC.
+	if strings.Contains(in.Prompt, "ECHO_PREDICT_METADATA") {
+		payload, err := json.Marshal(in.Metadata)
+		if err != nil {
+			return nil, fmt.Errorf("mock backend echo metadata error: %w", err)
+		}
+		return &pb.Reply{
+			Message:      payload,
+			Tokens:       int32(len(in.Metadata)),
+			PromptTokens: 1,
+		}, nil
+	}
+
+	// ECHO_SERVED_MODEL returns the loaded model file path so router e2e
+	// tests can verify which candidate actually served the request without
+	// adding a new RPC. The router fans out to a single backend process per
+	// candidate, so lastLoadParams.Model is unique per candidate.
+	if strings.Contains(in.Prompt, "ECHO_SERVED_MODEL") {
+		opts := snapshotLoadParams()
+		modelID := ""
+		if opts != nil {
+			modelID = opts.Model
+		}
+		return &pb.Reply{
+			Message:      []byte("SERVED_MODEL=" + modelID),
+			Tokens:       2,
+			PromptTokens: 1,
+		}, nil
 	}
 
 	// Simulate C++ autoparser: tool call via ChatDeltas, empty message
@@ -118,7 +243,7 @@ func (m *MockBackend) Predict(ctx context.Context, in *pb.PredictOptions) (*pb.R
 	// Simulate multiple tool calls in a single response (Go-side JSON parser path).
 	if strings.Contains(in.Prompt, "MULTI_TOOL_CALL") {
 		return &pb.Reply{
-			Message:      []byte(`{"name": "get_weather", "arguments": {"location": "Rome"}}
+			Message: []byte(`{"name": "get_weather", "arguments": {"location": "Rome"}}
 {"name": "get_weather", "arguments": {"location": "Paris"}}`),
 			Tokens:       30,
 			PromptTokens: 10,
@@ -144,8 +269,18 @@ func (m *MockBackend) Predict(ctx context.Context, in *pb.PredictOptions) (*pb.R
 	}, nil
 }
 
+// errMockContextOverflow is llama.cpp's error for a prompt that does not fit
+// the slot's context (tools/server/server-context.cpp).
+var errMockContextOverflow = fmt.Errorf("request (9739 tokens) exceeds the available context size (8192 tokens), try increasing it")
+
 func (m *MockBackend) PredictStream(in *pb.PredictOptions, stream pb.Backend_PredictStreamServer) error {
+	if err := checkModelIdentity(in); err != nil {
+		return err
+	}
 	xlog.Debug("PredictStream called", "prompt", in.Prompt)
+	if strings.Contains(in.Prompt, "MOCK_ERROR_CONTEXT_OVERFLOW") {
+		return errMockContextOverflow
+	}
 	if strings.Contains(in.Prompt, "MOCK_ERROR_IMMEDIATE") {
 		return fmt.Errorf("mock backend stream error: simulated failure")
 	}
@@ -156,6 +291,13 @@ func (m *MockBackend) PredictStream(in *pb.PredictOptions, stream pb.Backend_Pre
 			}
 		}
 		return fmt.Errorf("mock backend stream error: simulated mid-stream failure")
+	}
+	if strings.Contains(in.Prompt, "MOCK_SLOW_STREAM") {
+		select {
+		case <-time.After(500 * time.Millisecond):
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		}
 	}
 
 	// Simulate C++ autoparser behavior: tool calls delivered via ChatDeltas
@@ -262,11 +404,18 @@ func (m *MockBackend) PredictStream(in *pb.PredictOptions, stream pb.Backend_Pre
 
 	var toStream string
 	toolName := mockToolNameFromRequest(in)
-	if toolName != "" && !promptHasToolResults(in.Prompt) {
+	switch {
+	case toolName != "" && !promptHasToolResults(in.Prompt):
 		toStream = fmt.Sprintf(`{"name": "%s", "arguments": {"location": "San Francisco"}}`, toolName)
-	} else if toolName != "" {
+	case toolName != "":
 		toStream = "Based on the tool results, the weather in San Francisco is sunny, 72°F."
-	} else {
+	case strings.Contains(in.Prompt, "MOCK_LEAK_EMAIL"):
+		// PII streaming test fixture: emit a response containing an email
+		// address so the streaming PII filter has something to mask. The
+		// content is split character-by-character below, so the mask
+		// must hold across chunk boundaries.
+		toStream = "Sure — here it is: alice@example.com is the address."
+	default:
 		toStream = "This is a mocked streaming response."
 	}
 	for i, r := range toStream {
@@ -297,16 +446,69 @@ func mockToolNameFromRequest(in *pb.PredictOptions) string {
 }
 
 func (m *MockBackend) Embedding(ctx context.Context, in *pb.PredictOptions) (*pb.EmbeddingResult, error) {
-	xlog.Debug("Embedding called", "prompt", in.Prompt)
+	if err := auditDecision("embedding", []byte("Embedding")); err != nil {
+		return nil, err
+	}
+	if err := checkModelIdentity(in); err != nil {
+		return nil, err
+	}
+	// The embeddings path ships the text in PredictOptions.Embeddings
+	// (see core/backend/embeddings.go), not Prompt; check both so the
+	// markers below work however the caller packed the request.
+	text := in.Embeddings
+	if text == "" {
+		text = in.Prompt
+	}
+	xlog.Debug("Embedding called", "text", text)
+	// Deterministic per-token mode for Go-side pooling tests: a prompt
+	// carrying the "per-token:" marker yields len(fields) vectors of dim 8
+	// with vec[i][j] = (i+1)/(j+2), so endpoint tests can assert exact
+	// pooled goldens. The marker may sit mid-prompt (the embeddings
+	// messages[] path renders conversations as "<role>: <content>" lines),
+	// so match anywhere and tokenize what follows the first occurrence.
+	if idx := strings.Index(text, "per-token:"); idx >= 0 {
+		fields := strings.Fields(text[idx+len("per-token:"):])
+		tokens := len(fields)
+		const dim = 8
+		flat := make([]float32, 0, tokens*dim)
+		for i := 0; i < tokens; i++ {
+			for j := 0; j < dim; j++ {
+				flat = append(flat, float32(i+1)/float32(j+2))
+			}
+		}
+		return &pb.EmbeddingResult{
+			Embeddings:   flat,
+			Tokens:       int32(tokens),
+			Dim:          dim,
+			PromptTokens: int32(tokens),
+			Layout:       pb.EmbeddingLayout_EMBEDDING_LAYOUT_PER_TOKEN,
+		}, nil
+	}
+	// Legacy mode: a prompt carrying "no-shape:" simulates a backend built
+	// before EmbeddingResult carried shape and layout fields, so tests can
+	// assert the fail-closed error when Go-side pooling is requested.
+	legacyShape := strings.Contains(text, "no-shape:")
 	// Return a mock embedding vector of 768 dimensions
 	embeddings := make([]float32, 768)
 	for i := range embeddings {
 		embeddings[i] = float32(i%100) / 100.0 // Pattern: 0.0, 0.01, 0.02, ..., 0.99, 0.0, ...
 	}
-	return &pb.EmbeddingResult{Embeddings: embeddings}, nil
+	if legacyShape {
+		return &pb.EmbeddingResult{Embeddings: embeddings}, nil
+	}
+	return &pb.EmbeddingResult{
+		Embeddings:   embeddings,
+		Tokens:       1,
+		Dim:          768,
+		PromptTokens: 1,
+		Layout:       pb.EmbeddingLayout_EMBEDDING_LAYOUT_FINAL,
+	}, nil
 }
 
 func (m *MockBackend) GenerateImage(ctx context.Context, in *pb.GenerateImageRequest) (*pb.Result, error) {
+	if err := checkModelIdentity(in); err != nil {
+		return nil, err
+	}
 	xlog.Debug("GenerateImage called", "prompt", in.PositivePrompt)
 	return &pb.Result{
 		Message: "Image generated successfully (mocked)",
@@ -315,6 +517,9 @@ func (m *MockBackend) GenerateImage(ctx context.Context, in *pb.GenerateImageReq
 }
 
 func (m *MockBackend) GenerateVideo(ctx context.Context, in *pb.GenerateVideoRequest) (*pb.Result, error) {
+	if err := checkModelIdentity(in); err != nil {
+		return nil, err
+	}
 	xlog.Debug("GenerateVideo called", "prompt", in.Prompt)
 	return &pb.Result{
 		Message: "Video generated successfully (mocked)",
@@ -323,6 +528,9 @@ func (m *MockBackend) GenerateVideo(ctx context.Context, in *pb.GenerateVideoReq
 }
 
 func (m *MockBackend) TTS(ctx context.Context, in *pb.TTSRequest) (*pb.Result, error) {
+	if err := checkModelIdentity(in); err != nil {
+		return nil, err
+	}
 	xlog.Debug("TTS called", "text", in.Text)
 	dst := in.GetDst()
 	if dst != "" {
@@ -340,6 +548,9 @@ func (m *MockBackend) TTS(ctx context.Context, in *pb.TTSRequest) (*pb.Result, e
 }
 
 func (m *MockBackend) TTSStream(in *pb.TTSRequest, stream pb.Backend_TTSStreamServer) error {
+	if err := checkModelIdentity(in); err != nil {
+		return err
+	}
 	xlog.Debug("TTSStream called", "text", in.Text)
 	// Stream mock audio chunks (simplified - just send a few bytes)
 	chunks := [][]byte{
@@ -356,6 +567,9 @@ func (m *MockBackend) TTSStream(in *pb.TTSRequest, stream pb.Backend_TTSStreamSe
 }
 
 func (m *MockBackend) SoundGeneration(ctx context.Context, in *pb.SoundGenerationRequest) (*pb.Result, error) {
+	if err := checkModelIdentity(in); err != nil {
+		return nil, err
+	}
 	xlog.Debug("SoundGeneration called",
 		"text", in.Text,
 		"caption", in.GetCaption(),
@@ -435,12 +649,16 @@ func writeMinimalWAV(path string) error {
 }
 
 func (m *MockBackend) AudioTranscription(ctx context.Context, in *pb.TranscriptRequest) (*pb.TranscriptResult, error) {
+	if err := checkModelIdentity(in); err != nil {
+		return nil, err
+	}
 	dst := in.GetDst()
 	wavSR := 0
 	dataLen := 0
 	rms := 0.0
 
 	if dst != "" {
+		// #nosec G304 -- test-only mock backend reading the path core just staged
 		if data, err := os.ReadFile(dst); err == nil {
 			if len(data) >= 44 {
 				wavSR = int(binary.LittleEndian.Uint32(data[24:28]))
@@ -480,12 +698,108 @@ func (m *MockBackend) AudioTranscription(ctx context.Context, in *pb.TranscriptR
 }
 
 func (m *MockBackend) TokenizeString(ctx context.Context, in *pb.PredictOptions) (*pb.TokenizationResponse, error) {
-	xlog.Debug("TokenizeString called", "prompt", in.Prompt)
-	// Return mock token IDs
-	tokens := []int32{101, 2023, 2003, 1037, 3231, 1012}
+	if err := checkModelIdentity(in); err != nil {
+		return nil, err
+	}
+	xlog.Debug("TokenizeString called", "prompt_len", len(in.Prompt))
+	// Approximate BPE: ~4 chars/token, minimum 1. Realistic enough for the
+	// router's fitMessages to exercise the budget/rune-pretrim path with
+	// recognisable counts that scale with input size.
+	n := max((len(in.Prompt)+3)/4, 1)
+	tokens := make([]int32, n)
+	for i := range tokens {
+		tokens[i] = int32(i + 1)
+	}
 	return &pb.TokenizationResponse{
-		Length: int32(len(tokens)),
+		Length: int32(n),
 		Tokens: tokens,
+	}, nil
+}
+
+// Score implements deterministic marker-driven ranking for router e2e
+// tests. The Score RPC receives the full rendered routing prompt (system
+// prompt + chat envelope + user turn), and the system prompt by construction
+// lists every policy label — so any keyword-against-prompt heuristic would
+// match every candidate. Instead we look for an explicit `ROUTE_HINT=<label>`
+// marker, which only appears when a test deliberately places one in a user
+// message. The candidate whose extracted label equals the hint gets a large
+// log-prob boost; all others stay at the base. With no hint, every candidate
+// scores equally, softmax is uniform, and (with a sensible activation
+// threshold) the router falls back.
+func (m *MockBackend) Score(ctx context.Context, in *pb.ScoreRequest) (*pb.ScoreResponse, error) {
+	if err := checkModelIdentity(in); err != nil {
+		return nil, err
+	}
+	if in.QuestionType == "systemone" {
+		return mockDecision(ctx, in)
+	}
+	xlog.Debug("Score called", "candidates", len(in.Candidates))
+	hint := extractRouteHint(in.Prompt)
+	out := &pb.ScoreResponse{Candidates: make([]*pb.CandidateScore, len(in.Candidates))}
+	for i, c := range in.Candidates {
+		label := extractRouteLabel(c)
+		// Base -5 (softmax ≈ 0.003), hint match +5 → 0 (softmax ≈ 0.99).
+		logProb := -5.0
+		if hint != "" && label == hint {
+			logProb = 0.0
+		}
+		// num_tokens matches TokenizeString's heuristic so per-token mean
+		// log-prob consumers see consistent values.
+		nTok := max((len(c)+3)/4, 1)
+		out.Candidates[i] = &pb.CandidateScore{
+			LogProb:                 logProb,
+			NumTokens:               int32(nTok),
+			LengthNormalizedLogProb: logProb / float64(nTok),
+		}
+	}
+	return out, nil
+}
+
+// extractRouteHint returns the label after the LAST occurrence of
+// `ROUTE_HINT=` in the prompt, terminated by whitespace or end-of-string.
+// Using the last occurrence makes the marker stable across long
+// conversations: the *newest* user message's hint wins, mirroring how the
+// router's fitMessages keeps the newest turn whole.
+func extractRouteHint(prompt string) string {
+	const key = "ROUTE_HINT="
+	i := strings.LastIndex(prompt, key)
+	if i < 0 {
+		return ""
+	}
+	rest := prompt[i+len(key):]
+	end := strings.IndexAny(rest, " \t\r\n<")
+	if end < 0 {
+		return rest
+	}
+	return rest[:end]
+}
+
+// extractRouteLabel returns the label inside `{"route": "<label>"}`. Returns
+// "" on any shape it doesn't recognise — the caller treats that as a no-match.
+func extractRouteLabel(candidate string) string {
+	_, rest, ok := strings.Cut(candidate, `"route"`)
+	if !ok {
+		return ""
+	}
+	_, rest, ok = strings.Cut(rest, `"`)
+	if !ok {
+		return ""
+	}
+	label, _, ok := strings.Cut(rest, `"`)
+	if !ok {
+		return ""
+	}
+	return label
+}
+
+func (m *MockBackend) Detokenize(ctx context.Context, in *pb.DetokenizeRequest) (*pb.DetokenizeResponse, error) {
+	xlog.Debug("Detokenize called", "tokens", in.Tokens)
+	parts := make([]string, len(in.Tokens))
+	for i, t := range in.Tokens {
+		parts[i] = strconv.Itoa(int(t))
+	}
+	return &pb.DetokenizeResponse{
+		Content: "detokenized: " + strings.Join(parts, " "),
 	}, nil
 }
 
@@ -503,6 +817,9 @@ func (m *MockBackend) Status(ctx context.Context, in *pb.HealthMessage) (*pb.Sta
 }
 
 func (m *MockBackend) Detect(ctx context.Context, in *pb.DetectOptions) (*pb.DetectResponse, error) {
+	if err := checkModelIdentity(in); err != nil {
+		return nil, err
+	}
 	xlog.Debug("Detect called", "src", in.Src)
 	return &pb.DetectResponse{
 		Detections: []*pb.Detection{
@@ -571,6 +888,9 @@ func (m *MockBackend) StoresFind(ctx context.Context, in *pb.StoresFindOptions) 
 }
 
 func (m *MockBackend) Rerank(ctx context.Context, in *pb.RerankRequest) (*pb.RerankResult, error) {
+	if err := checkModelIdentity(in); err != nil {
+		return nil, err
+	}
 	xlog.Debug("Rerank called", "query", in.Query, "documents", len(in.Documents))
 	// Return mock reranking results
 	results := make([]*pb.DocumentResult, len(in.Documents))
@@ -602,6 +922,9 @@ func (m *MockBackend) GetMetrics(ctx context.Context, in *pb.MetricsRequest) (*p
 }
 
 func (m *MockBackend) VAD(ctx context.Context, in *pb.VADRequest) (*pb.VADResponse, error) {
+	if err := checkModelIdentity(in); err != nil {
+		return nil, err
+	}
 	// Compute RMS of the received float32 audio to decide whether speech is present.
 	var sumSq float64
 	for _, s := range in.Audio {
@@ -629,6 +952,48 @@ func (m *MockBackend) VAD(ctx context.Context, in *pb.VADRequest) (*pb.VADRespon
 			},
 		},
 	}, nil
+}
+
+// Diarize returns a deterministic two-speaker layout that exercises the
+// HTTP layer's normalisation: raw labels "5" and "2" should become
+// SPEAKER_00 and SPEAKER_01 in first-seen order, the SPEAKER_00 totals
+// should reflect two segments (1.0s + 1.5s = 2.5s), and IncludeText must
+// gate the per-segment Text field.
+func (m *MockBackend) Diarize(ctx context.Context, in *pb.DiarizeRequest) (*pb.DiarizeResponse, error) {
+	if err := checkModelIdentity(in); err != nil {
+		return nil, err
+	}
+	xlog.Debug("Diarize called",
+		"dst", in.Dst,
+		"num_speakers", in.NumSpeakers,
+		"include_text", in.IncludeText)
+
+	seg := func(start, end float32, speaker, text string) *pb.DiarizeSegment {
+		out := &pb.DiarizeSegment{Start: start, End: end, Speaker: speaker}
+		if in.IncludeText {
+			out.Text = text
+		}
+		return out
+	}
+	resp := &pb.DiarizeResponse{
+		Segments: []*pb.DiarizeSegment{
+			seg(0.0, 1.0, "5", "hello there"),
+			seg(1.0, 2.0, "2", "general kenobi"),
+			seg(2.0, 3.5, "5", "you are a bold one"),
+		},
+		NumSpeakers: 2,
+		Duration:    3.5,
+		Language:    in.Language,
+	}
+	// IncludeSounds gates the sound events; the mock always has a sound model.
+	if in.IncludeSounds {
+		resp.SoundsIncluded = true
+		resp.Sounds = []*pb.DiarizeSound{
+			{Start: 0.5, End: 1.25, Label: "Door", Confidence: 0.8},
+			{Start: 2.0, End: 3.0, Label: "Applause", Confidence: 0.6},
+		}
+	}
+	return resp, nil
 }
 
 func (m *MockBackend) AudioEncode(ctx context.Context, in *pb.AudioEncodeRequest) (*pb.AudioEncodeResult, error) {
@@ -666,6 +1031,76 @@ func (m *MockBackend) ModelMetadata(ctx context.Context, in *pb.ModelOptions) (*
 	return &pb.ModelMetadataResponse{
 		SupportsThinking: false,
 		RenderedTemplate: "",
+	}, nil
+}
+
+// voiceEmbedFromWAV reads a 16-bit LE mono WAV and returns a 2-d speaker
+// embedding derived from the signed DC offset of the samples. A positive DC
+// bias maps to one orthogonal unit vector, a negative bias to the other, so
+// e2e tests can deterministically simulate two distinct "speakers" that
+// survive resampling (DC is sample-rate independent). Near-zero DC maps to a
+// neutral vector equidistant from both. Returns nil for unreadable audio.
+func voiceEmbedFromWAV(path string) []float32 {
+	data, err := os.ReadFile(path) // #nosec G304 -- test-only mock backend reading the path core just staged
+	if err != nil || len(data) < 44 {
+		return nil
+	}
+	pcm := data[44:]
+	n := len(pcm) / 2
+	if n == 0 {
+		return nil
+	}
+	var sum float64
+	for i := 0; i < n; i++ {
+		s := int16(pcm[2*i]) | int16(pcm[2*i+1])<<8
+		sum += float64(s)
+	}
+	mean := sum / float64(n)
+	switch {
+	case mean > 500:
+		return []float32{1, 0}
+	case mean < -500:
+		return []float32{0, 1}
+	default:
+		return []float32{0.7071, 0.7071}
+	}
+}
+
+// VoiceEmbed returns a deterministic 2-d speaker embedding for the audio clip.
+// See voiceEmbedFromWAV for the (test-only) DC-offset discrimination scheme.
+func (m *MockBackend) VoiceEmbed(ctx context.Context, in *pb.VoiceEmbedRequest) (*pb.VoiceEmbedResponse, error) {
+	if err := checkModelIdentity(in); err != nil {
+		return nil, err
+	}
+	emb := voiceEmbedFromWAV(in.GetAudio())
+	xlog.Debug("VoiceEmbed called", "audio", in.GetAudio(), "embedding", emb)
+	if len(emb) == 0 {
+		return &pb.VoiceEmbedResponse{}, nil
+	}
+	return &pb.VoiceEmbedResponse{Embedding: emb, Model: "mock-speaker"}, nil
+}
+
+// VoiceVerify compares two clips by cosine distance over their mock embeddings.
+func (m *MockBackend) VoiceVerify(ctx context.Context, in *pb.VoiceVerifyRequest) (*pb.VoiceVerifyResponse, error) {
+	if err := checkModelIdentity(in); err != nil {
+		return nil, err
+	}
+	a := voiceEmbedFromWAV(in.GetAudio1())
+	b := voiceEmbedFromWAV(in.GetAudio2())
+	dist := float32(1)
+	if len(a) == 2 && len(b) == 2 {
+		dist = 1 - (a[0]*b[0] + a[1]*b[1]) // both unit vectors
+	}
+	threshold := in.GetThreshold()
+	if threshold == 0 {
+		threshold = 0.25
+	}
+	xlog.Debug("VoiceVerify called", "distance", dist, "threshold", threshold)
+	return &pb.VoiceVerifyResponse{
+		Verified:  dist <= threshold,
+		Distance:  dist,
+		Threshold: threshold,
+		Model:     "mock-speaker",
 	}, nil
 }
 

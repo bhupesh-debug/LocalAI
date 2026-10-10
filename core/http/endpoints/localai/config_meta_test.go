@@ -2,6 +2,7 @@ package localai_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,11 +12,23 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/mudler/LocalAI/core/config"
 	. "github.com/mudler/LocalAI/core/http/endpoints/localai"
+	"github.com/mudler/LocalAI/core/services/galleryop"
+	"github.com/mudler/LocalAI/core/services/modeladmin"
 	"github.com/mudler/LocalAI/pkg/model"
 	"github.com/mudler/LocalAI/pkg/system"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
+
+type endpointLifecycleRecorder struct {
+	batches        [][]modeladmin.ModelRevisionTransition
+	pendingCleanup int
+}
+
+func (r *endpointLifecycleRecorder) ApplyConfigRevisions(_ context.Context, transitions []modeladmin.ModelRevisionTransition) (int, error) {
+	r.batches = append(r.batches, append([]modeladmin.ModelRevisionTransition(nil), transitions...))
+	return r.pendingCleanup, nil
+}
 
 var _ = Describe("Config Metadata Endpoints", func() {
 	var (
@@ -45,11 +58,41 @@ var _ = Describe("Config Metadata Endpoints", func() {
 		app = echo.New()
 		app.GET("/api/models/config-metadata", ConfigMetadataEndpoint())
 		app.GET("/api/models/config-metadata/autocomplete/:provider", AutocompleteEndpoint(configLoader, modelLoader, appConfig))
-		app.PATCH("/api/models/config-json/:name", PatchConfigEndpoint(configLoader, modelLoader, appConfig))
+		app.PATCH("/api/models/config-json/:name", PatchConfigEndpoint(configLoader, nil, appConfig))
 	})
 
 	AfterEach(func() {
 		os.RemoveAll(tempDir)
+	})
+
+	It("lists native decisions on both Score backends but not NER, routers or disabled models", func() {
+		for name, body := range map[string]string{
+			"llama-decision": "backend: llama-cpp\nknown_usecases: [decisions]\n",
+			"vllm-decision":  "backend: vllm-cpp\nknown_usecases: [decisions]\n",
+			"ner":            "backend: vllm-cpp\nknown_usecases: [token_classify]\n",
+			"chat":           "backend: llama-cpp\nknown_usecases: [chat]\n",
+			"unsupported":    "backend: piper\nknown_usecases: [decisions]\n",
+			"disabled":       "backend: llama-cpp\nknown_usecases: [decisions]\ndisabled: true\n",
+			"router":         "backend: llama-cpp\nknown_usecases: [decisions]\nrouter:\n  classifier: decisions\n  classifier_model: llama-decision\n",
+		} {
+			Expect(os.WriteFile(filepath.Join(tempDir, name+".yaml"), []byte("name: "+name+"\n"+body), 0600)).To(Succeed())
+		}
+		Expect(configLoader.LoadModelConfigsFromPath(tempDir)).To(Succeed())
+		rec := httptest.NewRecorder()
+		app.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/models/config-metadata/autocomplete/models:decisions", nil))
+		Expect(rec.Code).To(Equal(http.StatusOK))
+		var result struct {
+			Values []string `json:"values"`
+		}
+		Expect(json.Unmarshal(rec.Body.Bytes(), &result)).To(Succeed())
+		Expect(result.Values).To(ConsistOf("llama-decision", "vllm-decision"))
+		for _, cfg := range configLoader.GetAllModelsConfigs() {
+			if cfg.Name == "llama-decision" || cfg.Name == "vllm-decision" {
+				Expect(cfg.Capabilities()).To(ContainElement(config.UsecaseDecisions))
+			} else {
+				Expect(cfg.Capabilities()).NotTo(ContainElement(config.UsecaseDecisions))
+			}
+		}
 	})
 
 	Context("GET /api/models/config-metadata", func() {
@@ -167,6 +210,39 @@ backend: llama-cpp
 	})
 
 	Context("PATCH /api/models/config-json/:name", func() {
+		It("rejects a name change without disk, loader, lifecycle, or broadcast effects", func() {
+			seedConfig := "name: test-model\nbackend: llama-cpp\ncontext_size: 4096\n"
+			configPath := filepath.Join(tempDir, "test-model.yaml")
+			Expect(os.WriteFile(configPath, []byte(seedConfig), 0644)).To(Succeed())
+			Expect(configLoader.LoadModelConfigsFromPath(tempDir)).To(Succeed())
+			lifecycle := &endpointLifecycleRecorder{}
+			galleryService := galleryop.NewGalleryService(appConfig, nil)
+			client := &endpointRecordingClient{}
+			galleryService.SetNATSClient(client)
+			endpointApp := echo.New()
+			endpointApp.PATCH("/api/models/config-json/:name", PatchConfigEndpoint(configLoader, galleryService, appConfig, lifecycle))
+
+			body := bytes.NewBufferString(`{"name":"renamed","context_size":8192}`)
+			req := httptest.NewRequest(http.MethodPatch, "/api/models/config-json/test-model", body)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			endpointApp.ServeHTTP(rec, req)
+
+			Expect(rec.Code).To(Equal(http.StatusBadRequest), rec.Body.String())
+			Expect(rec.Body.String()).To(ContainSubstring("cannot rename"))
+			Expect(configPath).To(BeAnExistingFile())
+			contents, err := os.ReadFile(configPath)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(string(contents)).To(Equal(seedConfig))
+			loaded, ok := configLoader.GetModelConfig("test-model")
+			Expect(ok).To(BeTrue())
+			Expect(loaded.ContextSize).To(HaveValue(Equal(4096)))
+			_, renamed := configLoader.GetModelConfig("renamed")
+			Expect(renamed).To(BeFalse())
+			Expect(lifecycle.batches).To(BeEmpty())
+			Expect(client.published).To(BeEmpty())
+		})
+
 		It("should return 404 for nonexistent model", func() {
 			body := bytes.NewBufferString(`{"backend": "bar"}`)
 			req := httptest.NewRequest(http.MethodPatch, "/api/models/config-json/nonexistent", body)
@@ -228,6 +304,8 @@ backend: llama-cpp
 			var resp map[string]any
 			Expect(json.Unmarshal(rec.Body.Bytes(), &resp)).To(Succeed())
 			Expect(resp["success"]).To(BeTrue())
+			Expect(resp["config_revision"]).ToNot(BeEmpty())
+			Expect(resp["pending_cleanup"]).To(BeNumerically("==", 0))
 
 			// Verify the reloaded config has the updated value
 			updatedConfig, exists := configLoader.GetModelConfig("test-model")
@@ -238,6 +316,30 @@ backend: llama-cpp
 			data, err := os.ReadFile(configPath)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(string(data)).To(ContainSubstring("vllm"))
+		})
+
+		It("reports lifecycle-backed pending cleanup with the saved revision", func() {
+			seedConfig := "name: test-model\nbackend: llama-cpp\ncontext_size: 4096\n"
+			Expect(os.WriteFile(filepath.Join(tempDir, "test-model.yaml"), []byte(seedConfig), 0o644)).To(Succeed())
+			Expect(configLoader.LoadModelConfigsFromPath(tempDir)).To(Succeed())
+			lifecycle := &endpointLifecycleRecorder{pendingCleanup: 4}
+			endpointApp := echo.New()
+			endpointApp.PATCH(
+				"/api/models/config-json/:name",
+				PatchConfigEndpoint(configLoader, nil, appConfig, lifecycle),
+			)
+
+			body := bytes.NewBufferString(`{"context_size":8192}`)
+			req := httptest.NewRequest(http.MethodPatch, "/api/models/config-json/test-model", body)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			endpointApp.ServeHTTP(rec, req)
+
+			Expect(rec.Code).To(Equal(http.StatusOK), rec.Body.String())
+			var response map[string]any
+			Expect(json.Unmarshal(rec.Body.Bytes(), &response)).To(Succeed())
+			Expect(response).To(HaveKeyWithValue("config_revision", Not(BeEmpty())))
+			Expect(response).To(HaveKeyWithValue("pending_cleanup", BeNumerically("==", 4)))
 		})
 
 		It("should not persist runtime defaults (SetDefaults values) to disk", func() {

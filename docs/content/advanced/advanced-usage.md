@@ -20,7 +20,7 @@ parameters:
 
 context_size: 512
 threads: 10
-backend: llama-stable
+backend: llama-cpp
 
 template:
   completion: completion
@@ -38,7 +38,7 @@ For a complete reference of all available configuration options, see the [Model 
    local-ai run github://mudler/LocalAI/examples/configurations/phi-2.yaml@master
    ```
 
-See also [chatbot-ui](https://github.com/mudler/LocalAI-examples/tree/main/chatbot-ui) as an example on how to use config files.
+See also the [configuration examples](https://github.com/mudler/LocalAI-examples/tree/main/configurations) in the LocalAI-examples repository for more config files.
 
 ### Prompt templates 
 
@@ -140,7 +140,7 @@ parameters:
   # Relative to the models path
   model: ...
 
-backend: llama-stable
+backend: llama-cpp
 ```
 
 ### Connect external backends
@@ -273,7 +273,7 @@ A list of the environment variable that tweaks parallelism is the following:
 ```
 ### Python backends GRPC max workers
 ### Default number of workers for GRPC Python backends.
-### This actually controls wether a backend can process multiple requests or not.
+### This actually controls whether a backend can process multiple requests or not.
 
 ### Define the number of parallel LLAMA.cpp workers (Defaults to 1)
 

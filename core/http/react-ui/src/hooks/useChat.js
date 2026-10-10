@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef } from 'react'
 import { API_CONFIG } from '../utils/config'
 import { apiUrl } from '../utils/basePath'
+import { effectiveSystemPrompt } from '../utils/systemPrompt'
 import { useDebouncedEffect } from './useDebounce'
 
 const thinkingTagRegex = /<thinking>([\s\S]*?)<\/thinking>|<think>([\s\S]*?)<\/think>|<\|channel>thought([\s\S]*?)<channel\|>/g
@@ -14,6 +15,68 @@ async function extractHttpError(response) {
     if (errorData.error?.message) errorMsg = errorData.error.message
   } catch (_) {}
   return errorMsg
+}
+
+// How long the UI keeps waiting for a model that is staging onto a worker.
+// Staging a multi-GB checkpoint runs for tens of minutes — far longer than the
+// server's own per-request wait budget — so the poll has to outlive several
+// 503s. Bounded, so a load that never finishes eventually surfaces as an error
+// rather than as a spinner nobody questions.
+const MODEL_LOAD_POLL_INTERVAL = 3000
+const MODEL_LOAD_MAX_ATTEMPTS = 3
+const MODEL_LOAD_MAX_POLLS = 600 // ~30 min per attempt
+
+// readModelLoading returns the `loading` object from the 503 the server sends
+// while a model is still cold-loading, or null for any other failure. It reads
+// a clone so the caller can still parse the body for its error message.
+async function readModelLoading(response) {
+  if (response.status !== 503) return null
+  try {
+    const data = await response.clone().json()
+    if (data?.error?.type !== 'model_loading') return null
+    return { ...(data.loading || {}), message: data.error?.message }
+  } catch {
+    return null
+  }
+}
+
+// waitForModelReady polls load-status until the model finishes loading (404 —
+// no job left), the load fails, or the caller aborts. Returns true when it is
+// worth re-sending the request.
+async function waitForModelReady(modelID, onProgress, signal) {
+  for (let i = 0; i < MODEL_LOAD_MAX_POLLS; i++) {
+    await new Promise(resolve => setTimeout(resolve, MODEL_LOAD_POLL_INTERVAL))
+    if (signal?.aborted) return false
+    try {
+      const res = await fetch(apiUrl(API_CONFIG.endpoints.modelLoadStatus(modelID)), { signal })
+      if (res.status === 404) return true // job gone: loaded, or worth one retry
+      if (!res.ok) return false
+      const status = await res.json()
+      if (status?.state === 'failed') return false
+      onProgress(status)
+    } catch {
+      return false
+    }
+  }
+  return false
+}
+
+// fetchWithModelLoadWait issues the request and, when the model is still
+// staging onto a worker, waits for it rather than surfacing an error. The
+// server answers 503 within its own wait budget so no connection is held for
+// the whole load; the UI picks the wait back up here and retries once ready.
+async function fetchWithModelLoadWait(url, init, modelID, onLoading, signal) {
+  let response = await fetch(url, init)
+  for (let attempt = 0; attempt < MODEL_LOAD_MAX_ATTEMPTS; attempt++) {
+    const loading = await readModelLoading(response)
+    if (!loading) return response
+    onLoading(loading)
+    const ready = await waitForModelReady(loading.model || modelID, onLoading, signal)
+    onLoading(null)
+    if (!ready) return response
+    response = await fetch(url, init)
+  }
+  return response
 }
 
 function extractThinking(text) {
@@ -92,6 +155,9 @@ function createNewChat(model = '', systemPrompt = '', mcpMode = false) {
     mcpServers: [],
     mcpResources: [],
     clientMCPServers: [],
+    // localaiAssistant wires the chat to the in-process admin MCP server
+    // exposed by /v1/chat/completions when an admin opts in.
+    localaiAssistant: false,
     temperature: null,
     topP: null,
     topK: null,
@@ -122,6 +188,10 @@ export function useChat(initialModel = '') {
   const [streamingToolCalls, setStreamingToolCalls] = useState([])
   const [tokensPerSecond, setTokensPerSecond] = useState(null)
   const [maxTokensPerSecond, setMaxTokensPerSecond] = useState(null)
+  // Live progress of a cold load the request is waiting on, so the composer can
+  // say "staging to nvidia-thor, 41%" instead of showing an error for a model
+  // that is loading exactly as it should.
+  const [modelLoading, setModelLoading] = useState(null)
   const abortControllerRef = useRef(null)
   const startTimeRef = useRef(null)
   const tokenCountRef = useRef(0)
@@ -137,6 +207,24 @@ export function useChat(initialModel = '') {
     setActiveChatId(chat.id)
     return chat
   }, [])
+
+  const forkChat = useCallback((chatId, uptoIndex) => {
+    const src = chats.find(c => c.id === chatId)
+    if (!src) return null
+    const end = typeof uptoIndex === 'number' ? uptoIndex : src.history.length
+    const forked = {
+      ...src,
+      id: generateId(),
+      name: `${src.name} (fork)`,
+      history: structuredClone(src.history.slice(0, end)),
+      tokenUsage: { prompt: 0, completion: 0, total: 0 },
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }
+    setChats(prev => [forked, ...prev])
+    setActiveChatId(forked.id)
+    return forked
+  }, [chats])
 
   const switchChat = useCallback((chatId) => {
     setActiveChatId(chatId)
@@ -194,12 +282,18 @@ export function useChat(initialModel = '') {
     const temperature = activeChat.temperature
     const topP = activeChat.topP
     const topK = activeChat.topK
-    const contextSize = activeChat.contextSize
 
     // Build user message content
     let messageContent
-    const userFiles = []
-    if (files.length > 0) {
+    let userFiles = []
+    if (options.prebuiltContent) {
+      // Caller (e.g. regenerate) already has the fully-assembled content from
+      // the original send — reuse it verbatim instead of rebuilding from
+      // display-only file metadata, which doesn't carry the base64/text
+      // payload needed to re-embed attachments.
+      messageContent = content
+      userFiles = files
+    } else if (files.length > 0) {
       messageContent = [{ type: 'text', text: content }]
       for (const file of files) {
         if (file.type?.startsWith('image/')) {
@@ -214,10 +308,22 @@ export function useChat(initialModel = '') {
             audio_url: { url: `data:${file.type};base64,${file.base64}` },
           })
           userFiles.push({ name: file.name, type: 'audio' })
+        } else if (file.type?.startsWith('video/')) {
+          messageContent.push({
+            type: 'video_url',
+            video_url: { url: `data:${file.type};base64,${file.base64}` },
+          })
+          userFiles.push({ name: file.name, type: 'video' })
         } else {
-          // Text/PDF files - append to content
-          userFiles.push({ name: file.name, type: 'file', content: file.textContent || '' })
-        }
+			// Text/PDF files - append to content
+			if (file.textContent) {
+				messageContent.push({
+					type: 'text',
+					text: `\n\n--- File: ${file.name} ---\n${file.textContent}\n--- End of ${file.name} ---`,
+				})
+			}
+			userFiles.push({ name: file.name, type: 'file', content: file.textContent || '' })
+		}
       }
     } else {
       messageContent = content
@@ -243,20 +349,35 @@ export function useChat(initialModel = '') {
     // Build messages array for API
     const chat = chats.find(c => c.id === chatId)
     const messages = []
-    if (chat?.systemPrompt) {
-      messages.push({ role: 'system', content: chat.systemPrompt })
+    // Omit empty/whitespace system prompts so the model YAML system_prompt
+    // (and tokenizer chat-template defaults) are not suppressed by a blank
+    // system turn from Chat Settings.
+    const systemPrompt = effectiveSystemPrompt(chat?.systemPrompt)
+    if (systemPrompt) {
+      messages.push({ role: 'system', content: systemPrompt })
     }
-    // Filter out thinking/reasoning/tool_call/tool_result messages
-    const historyForApi = (chat?.history || []).filter(m =>
+    // Filter out thinking/reasoning/tool_call/tool_result messages.
+    // options.baseHistory lets callers (e.g. mid-conversation retry) pass the
+    // intended truncated history synchronously; the closure `chat` still holds
+    // the stale pre-truncation state because setChats only schedules an update.
+    const baseHistory = options.baseHistory || chat?.history || []
+    const historyForApi = baseHistory.filter(m =>
       m.role !== 'thinking' && m.role !== 'reasoning' && m.role !== 'tool_call' && m.role !== 'tool_result'
+      && !(m.role === 'system' && !effectiveSystemPrompt(typeof m.content === 'string' ? m.content : ''))
     )
     messages.push(...historyForApi, { role: 'user', content: messageContent })
 
-    const requestBody = { model, messages, stream: true }
+    // include_usage tells LocalAI to emit a trailing chunk with token totals;
+    // without it the spec-compliant server drops `usage` from the stream and
+    // the token-count badge would never populate.
+    const requestBody = { model, messages, stream: true, stream_options: { include_usage: true } }
     if (temperature !== null && temperature !== undefined) requestBody.temperature = temperature
     if (topP !== null && topP !== undefined) requestBody.top_p = topP
     if (topK !== null && topK !== undefined) requestBody.top_k = topK
-    if (contextSize) requestBody.max_tokens = contextSize
+    // contextSize is the model's input+output window, not an
+    // output cap. Backends bound generation at remaining context
+    // automatically; Anthropic translate mode supplies its own
+    // default. So we deliberately do not send any output-token cap.
 
     // MCP: send selected servers via metadata so the backend activates them
     const hasMcpServers = activeChat.mcpServers && activeChat.mcpServers.length > 0
@@ -270,6 +391,14 @@ export function useChat(initialModel = '') {
     if (hasMcpResources) {
       if (!requestBody.metadata) requestBody.metadata = {}
       requestBody.metadata.mcp_resources = activeChat.mcpResources.join(',')
+    }
+
+    // LocalAI Assistant: opt this chat session into the in-process admin
+    // MCP server. The backend gates on admin role; the toggle is hidden
+    // for non-admins, but defense-in-depth still applies on the server.
+    if (activeChat.localaiAssistant) {
+      if (!requestBody.metadata) requestBody.metadata = {}
+      requestBody.metadata.localai_assistant = 'true'
     }
 
     // Client-side MCP: inject tools into request body
@@ -303,12 +432,12 @@ export function useChat(initialModel = '') {
       // Legacy MCP SSE streaming (custom event types from /v1/mcp/chat/completions)
       try {
         const timeoutId = setTimeout(() => controller.abort(), 300000) // 5 min timeout
-        const response = await fetch(apiUrl(endpoint), {
+        const response = await fetchWithModelLoadWait(apiUrl(endpoint), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(requestBody),
           signal: controller.signal,
-        })
+        }, requestBody.model, setModelLoading, controller.signal)
         clearTimeout(timeoutId)
 
         if (!response.ok) {
@@ -449,12 +578,12 @@ export function useChat(initialModel = '') {
         let fullToolCalls = [] // Tool calls with id for agentic loop
 
         try {
-          const response = await fetch(apiUrl(endpoint), {
+          const response = await fetchWithModelLoadWait(apiUrl(endpoint), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(loopBody),
             signal: controller.signal,
-          })
+          }, loopBody.model, setModelLoading, controller.signal)
 
           if (!response.ok) {
             throw new Error(await extractHttpError(response))
@@ -689,6 +818,7 @@ export function useChat(initialModel = '') {
     // Finalize
     setIsStreaming(false)
     setStreamingChatId(null)
+    setModelLoading(null)
     abortControllerRef.current = null
     setStreamingContent('')
     setStreamingReasoning('')
@@ -764,7 +894,9 @@ export function useChat(initialModel = '') {
     streamingToolCalls: isActiveStreaming ? streamingToolCalls : [],
     tokensPerSecond,
     maxTokensPerSecond,
+    modelLoading: isActiveStreaming ? modelLoading : null,
     addChat,
+    forkChat,
     switchChat,
     deleteChat,
     deleteAllChats,

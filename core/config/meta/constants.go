@@ -8,6 +8,7 @@ const (
 	ProviderModelsTTS        = "models:tts"
 	ProviderModelsTranscript = "models:transcript"
 	ProviderModelsVAD        = "models:vad"
+	ProviderModelsScore      = "models:score"
 )
 
 // Static option lists embedded directly in field metadata.
@@ -49,20 +50,42 @@ var DiffusersPipelineOptions = []FieldOption{
 	{Value: "StableVideoDiffusionPipeline", Label: "StableVideoDiffusionPipeline"},
 }
 
+// UsecaseOptions must stay in sync with GetAllModelConfigUsecases in
+// core/config/model_config.go — a value missing here is silently
+// inaccessible from the model editor, which is how `score` (the router
+// classifier usecase) hid for an entire release.
 var UsecaseOptions = []FieldOption{
 	{Value: "chat", Label: "Chat"},
 	{Value: "completion", Label: "Completion"},
 	{Value: "edit", Label: "Edit"},
 	{Value: "embeddings", Label: "Embeddings"},
 	{Value: "rerank", Label: "Rerank"},
+	{Value: "score", Label: "Score (Router Classifier)"},
 	{Value: "image", Label: "Image"},
+	{Value: "upscale", Label: "Image upscaling"},
+	{Value: "vision", Label: "Vision"},
+	{Value: "detection", Label: "Detection"},
+	{Value: "depth", Label: "Depth"},
+	{Value: "face_recognition", Label: "Face Recognition"},
 	{Value: "transcript", Label: "Transcript"},
+	{Value: "diarization", Label: "Diarization"},
+	{Value: "sound_classification", Label: "Sound Classification"},
+	{Value: "speaker_recognition", Label: "Speaker Recognition"},
 	{Value: "tts", Label: "TTS"},
 	{Value: "sound_generation", Label: "Sound Generation"},
+	{Value: "audio_transform", Label: "Audio Transform"},
+	{Value: "realtime_audio", Label: "Realtime Audio"},
 	{Value: "tokenize", Label: "Tokenize"},
 	{Value: "vad", Label: "VAD"},
 	{Value: "video", Label: "Video"},
-	{Value: "detection", Label: "Detection"},
+}
+
+// ModalityOptions enumerates the values accepted by known modality fields.
+var ModalityOptions = []FieldOption{
+	{Value: "text", Label: "Text"},
+	{Value: "image", Label: "Image"},
+	{Value: "audio", Label: "Audio"},
+	{Value: "video", Label: "Video"},
 }
 
 var DiffusersSchedulerOptions = []FieldOption{
@@ -76,4 +99,13 @@ var DiffusersSchedulerOptions = []FieldOption{
 	{Value: "dpm_singlestep", Label: "DPM Singlestep"},
 	{Value: "heun", Label: "Heun"},
 	{Value: "unipc", Label: "UniPC"},
+}
+
+// SystemMessagesAfterFirstOptions are the values of template.system_messages_after_first:
+// how system messages that appear after the first turn are handled before the chat
+// template runs (empty = pass through unchanged, which strict Jinja templates reject).
+var SystemMessagesAfterFirstOptions = []FieldOption{
+	{Value: "", Label: "Pass through (default)"},
+	{Value: "merge", Label: "Merge into the first system message"},
+	{Value: "user", Label: "Forward as user messages"},
 }

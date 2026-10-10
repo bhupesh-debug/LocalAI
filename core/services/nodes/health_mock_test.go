@@ -2,6 +2,7 @@ package nodes
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -122,8 +123,8 @@ func (f *fakeNodeHealthStore) FindStaleNodes(_ context.Context, _ time.Duration)
 	return nil, nil
 }
 
-func (f *fakeNodeHealthStore) RemoveNodeModel(_ context.Context, nodeID, modelName string) error {
-	f.record("RemoveNodeModel:" + nodeID + ":" + modelName)
+func (f *fakeNodeHealthStore) RemoveNodeModel(_ context.Context, nodeID, modelName string, replicaIndex int) error {
+	f.record(fmt.Sprintf("RemoveNodeModel:%s:%s:%d", nodeID, modelName, replicaIndex))
 	return nil
 }
 
@@ -153,7 +154,17 @@ func (c *fakeBackendClient) Predict(_ context.Context, _ *pb.PredictOptions, _ .
 func (c *fakeBackendClient) GenerateImage(_ context.Context, _ *pb.GenerateImageRequest, _ ...ggrpc.CallOption) (*pb.Result, error) {
 	return nil, nil
 }
+func (c *fakeBackendClient) UpscaleImage(_ context.Context, _ *pb.UpscaleImageRequest, _ ...ggrpc.CallOption) (*pb.Result, error) {
+	return nil, nil
+}
 func (c *fakeBackendClient) GenerateVideo(_ context.Context, _ *pb.GenerateVideoRequest, _ ...ggrpc.CallOption) (*pb.Result, error) {
+	return nil, nil
+}
+func (c *fakeBackendClient) Generate3D(_ context.Context, _ *pb.Generate3DRequest, _ ...ggrpc.CallOption) (*pb.Result, error) {
+	return nil, nil
+}
+
+func (c *fakeBackendClient) Animate3D(_ context.Context, _ *pb.Animate3DRequest, _ ...ggrpc.CallOption) (*pb.Result, error) {
 	return nil, nil
 }
 func (c *fakeBackendClient) TTS(_ context.Context, _ *pb.TTSRequest, _ ...ggrpc.CallOption) (*pb.Result, error) {
@@ -168,6 +179,27 @@ func (c *fakeBackendClient) SoundGeneration(_ context.Context, _ *pb.SoundGenera
 func (c *fakeBackendClient) Detect(_ context.Context, _ *pb.DetectOptions, _ ...ggrpc.CallOption) (*pb.DetectResponse, error) {
 	return nil, nil
 }
+func (c *fakeBackendClient) SoundDetection(_ context.Context, _ *pb.SoundDetectionRequest, _ ...ggrpc.CallOption) (*pb.SoundDetectionResponse, error) {
+	return nil, nil
+}
+func (c *fakeBackendClient) Depth(_ context.Context, _ *pb.DepthRequest, _ ...ggrpc.CallOption) (*pb.DepthResponse, error) {
+	return nil, nil
+}
+func (c *fakeBackendClient) FaceVerify(_ context.Context, _ *pb.FaceVerifyRequest, _ ...ggrpc.CallOption) (*pb.FaceVerifyResponse, error) {
+	return nil, nil
+}
+func (c *fakeBackendClient) FaceAnalyze(_ context.Context, _ *pb.FaceAnalyzeRequest, _ ...ggrpc.CallOption) (*pb.FaceAnalyzeResponse, error) {
+	return nil, nil
+}
+func (c *fakeBackendClient) VoiceVerify(_ context.Context, _ *pb.VoiceVerifyRequest, _ ...ggrpc.CallOption) (*pb.VoiceVerifyResponse, error) {
+	return nil, nil
+}
+func (c *fakeBackendClient) VoiceAnalyze(_ context.Context, _ *pb.VoiceAnalyzeRequest, _ ...ggrpc.CallOption) (*pb.VoiceAnalyzeResponse, error) {
+	return nil, nil
+}
+func (c *fakeBackendClient) VoiceEmbed(_ context.Context, _ *pb.VoiceEmbedRequest, _ ...ggrpc.CallOption) (*pb.VoiceEmbedResponse, error) {
+	return nil, nil
+}
 func (c *fakeBackendClient) AudioTranscription(_ context.Context, _ *pb.TranscriptRequest, _ ...ggrpc.CallOption) (*pb.TranscriptResult, error) {
 	return nil, nil
 }
@@ -175,6 +207,9 @@ func (c *fakeBackendClient) AudioTranscriptionStream(_ context.Context, _ *pb.Tr
 	return nil
 }
 func (c *fakeBackendClient) TokenizeString(_ context.Context, _ *pb.PredictOptions, _ ...ggrpc.CallOption) (*pb.TokenizationResponse, error) {
+	return nil, nil
+}
+func (c *fakeBackendClient) Detokenize(_ context.Context, _ *pb.DetokenizeRequest, _ ...ggrpc.CallOption) (*pb.DetokenizeResponse, error) {
 	return nil, nil
 }
 func (c *fakeBackendClient) Status(_ context.Context) (*pb.StatusResponse, error) {
@@ -201,10 +236,28 @@ func (c *fakeBackendClient) GetTokenMetrics(_ context.Context, _ *pb.MetricsRequ
 func (c *fakeBackendClient) VAD(_ context.Context, _ *pb.VADRequest, _ ...ggrpc.CallOption) (*pb.VADResponse, error) {
 	return nil, nil
 }
+func (c *fakeBackendClient) Diarize(_ context.Context, _ *pb.DiarizeRequest, _ ...ggrpc.CallOption) (*pb.DiarizeResponse, error) {
+	return nil, nil
+}
 func (c *fakeBackendClient) AudioEncode(_ context.Context, _ *pb.AudioEncodeRequest, _ ...ggrpc.CallOption) (*pb.AudioEncodeResult, error) {
 	return nil, nil
 }
 func (c *fakeBackendClient) AudioDecode(_ context.Context, _ *pb.AudioDecodeRequest, _ ...ggrpc.CallOption) (*pb.AudioDecodeResult, error) {
+	return nil, nil
+}
+func (c *fakeBackendClient) AudioTransform(_ context.Context, _ *pb.AudioTransformRequest, _ ...ggrpc.CallOption) (*pb.AudioTransformResult, error) {
+	return nil, nil
+}
+func (c *fakeBackendClient) AudioTransformStream(_ context.Context, _ ...ggrpc.CallOption) (grpc.AudioTransformStreamClient, error) {
+	return nil, nil
+}
+func (c *fakeBackendClient) AudioToAudioStream(_ context.Context, _ ...ggrpc.CallOption) (grpc.AudioToAudioStreamClient, error) {
+	return nil, nil
+}
+func (c *fakeBackendClient) AudioTranscriptionLive(_ context.Context, _ ...ggrpc.CallOption) (grpc.AudioTranscriptionLiveClient, error) {
+	return nil, nil
+}
+func (c *fakeBackendClient) Forward(_ context.Context, _ ...ggrpc.CallOption) (grpc.ForwardClient, error) {
 	return nil, nil
 }
 func (c *fakeBackendClient) ModelMetadata(_ context.Context, _ *pb.ModelOptions, _ ...ggrpc.CallOption) (*pb.ModelMetadataResponse, error) {
@@ -237,6 +290,12 @@ func (c *fakeBackendClient) StopQuantization(_ context.Context, _ *pb.Quantizati
 func (c *fakeBackendClient) Free(_ context.Context) error {
 	return nil
 }
+func (c *fakeBackendClient) TokenClassify(_ context.Context, _ *pb.TokenClassifyRequest, _ ...ggrpc.CallOption) (*pb.TokenClassifyResponse, error) {
+	return nil, nil
+}
+func (c *fakeBackendClient) Score(_ context.Context, _ *pb.ScoreRequest, _ ...ggrpc.CallOption) (*pb.ScoreResponse, error) {
+	return nil, nil
+}
 
 // --- fakeBackendClientFactory ---
 
@@ -260,7 +319,7 @@ func (f *fakeBackendClientFactory) setClient(address string, c *fakeBackendClien
 	f.clients[address] = c
 }
 
-func (f *fakeBackendClientFactory) NewClient(address string, _ bool) grpc.Backend {
+func (f *fakeBackendClientFactory) NewClient(_, address string, _ bool) grpc.Backend {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if c, ok := f.clients[address]; ok {
@@ -296,6 +355,7 @@ func newTestHealthMonitor(store NodeHealthStore, factory BackendClientFactory, a
 		staleThreshold: staleThreshold,
 		autoOffline:    autoOffline,
 		clientFactory:  factory,
+		misses:         make(map[modelKey]int),
 	}
 }
 

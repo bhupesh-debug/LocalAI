@@ -1,7 +1,8 @@
 import { Marked } from 'marked'
 import DOMPurify from 'dompurify'
-import hljs from 'highlight.js'
+import hljs from './hljs'
 import { apiUrl } from './basePath'
+import { iconSlot, fillIconSlots } from './iconHtml'
 
 const FENCE_REGEX = /```(\w*)\n([\s\S]*?)```/g
 
@@ -100,31 +101,48 @@ function guessTitle(lang, index) {
   return index > 0 && extMap[lang] ? base.replace('.', `-${index}.`) : base
 }
 
+const LANG_EXT = {
+  html: 'html', javascript: 'js', js: 'js', typescript: 'ts', ts: 'ts',
+  jsx: 'jsx', tsx: 'tsx', python: 'py', py: 'py', css: 'css', svg: 'svg',
+  json: 'json', yaml: 'yaml', yml: 'yaml', go: 'go', rust: 'rs', java: 'java',
+  markdown: 'md', md: 'md', bash: 'sh', sh: 'sh', sql: 'sql',
+}
+
+// File extension for a code artifact's language, for download filenames.
+export function extensionForLanguage(lang) {
+  return LANG_EXT[(lang || '').toLowerCase()] || 'txt'
+}
+
 export function getArtifactIcon(type, language) {
-  if (type === 'image') return 'fa-image'
-  if (type === 'pdf') return 'fa-file-pdf'
-  if (type === 'audio') return 'fa-music'
-  if (type === 'video') return 'fa-video'
-  if (type === 'url') return 'fa-link'
-  if (type === 'file') return 'fa-file'
+  if (type === 'image') return 'image'
+  if (type === 'pdf') return 'file-text'
+  if (type === 'audio') return 'music'
+  if (type === 'video') return 'video'
+  if (type === 'url') return 'link'
+  if (type === 'file') return 'file'
   if (type === 'code') {
-    if (language === 'html') return 'fa-globe'
-    if (language === 'svg') return 'fa-image'
-    if (language === 'css') return 'fa-palette'
-    if (language === 'md' || language === 'markdown') return 'fa-file-lines'
+    if (language === 'html') return 'globe'
+    if (language === 'svg') return 'image'
+    if (language === 'css') return 'palette'
+    if (language === 'md' || language === 'markdown') return 'file-text'
   }
-  return 'fa-code'
+  return 'code'
 }
 
 const artifactMarked = new Marked({
   renderer: {
     code({ text, lang }) {
-      // Will be overridden per-call
+      // Match markdown.js's fallback: when the language is unknown (not in
+      // the curated hljs set, see utils/hljs.js), use highlightAuto so the
+      // block still picks up theme colors — otherwise the same fenced block
+      // would render differently in chat (auto-highlighted) vs artifact card
+      // (plain text).
       if (lang && hljs.getLanguage(lang)) {
         const highlighted = hljs.highlight(text, { language: lang }).value
         return `<pre><code class="hljs language-${lang}">${highlighted}</code></pre>`
       }
-      return `<pre><code>${text.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</code></pre>`
+      const highlighted = hljs.highlightAuto(text).value
+      return `<pre><code class="hljs">${highlighted}</code></pre>`
     },
   },
   breaks: true,
@@ -150,14 +168,14 @@ export function renderMarkdownWithArtifacts(text, messageIndex) {
       const title = guessTitle(language, blockIndex)
       blockIndex++
       return `<div class="artifact-card" data-artifact-id="${id}">
-        <div class="artifact-card-icon"><i class="fas ${icon}"></i></div>
+        <div class="artifact-card-icon">${iconSlot(icon)}</div>
         <div class="artifact-card-info">
           <span class="artifact-card-title">${title}</span>
           <span class="artifact-card-lang">${language}</span>
         </div>
         <div class="artifact-card-actions">
-          <button class="artifact-card-download" data-artifact-id="${id}" title="Download"><i class="fas fa-download"></i></button>
-          <button class="artifact-card-open" data-artifact-id="${id}" title="Open in canvas"><i class="fas fa-external-link-alt"></i></button>
+          <button class="artifact-card-download" data-artifact-id="${id}" title="Download">${iconSlot('download')}</button>
+          <button class="artifact-card-open" data-artifact-id="${id}" title="Open in canvas">${iconSlot('external-link')}</button>
         </div>
       </div>`
     },
@@ -165,5 +183,5 @@ export function renderMarkdownWithArtifacts(text, messageIndex) {
 
   const customMarked = new Marked({ renderer, breaks: true, gfm: true })
   const html = customMarked.parse(text)
-  return DOMPurify.sanitize(html, { ADD_ATTR: ['data-artifact-id'] })
+  return fillIconSlots(DOMPurify.sanitize(html, { ADD_ATTR: ['data-artifact-id', 'data-icon-slot'] }))
 }

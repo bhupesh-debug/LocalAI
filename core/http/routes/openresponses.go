@@ -9,16 +9,27 @@ import (
 	"github.com/mudler/LocalAI/core/http/endpoints/openresponses"
 	"github.com/mudler/LocalAI/core/http/middleware"
 	"github.com/mudler/LocalAI/core/schema"
+	"github.com/mudler/xlog"
 )
 
 func RegisterOpenResponsesRoutes(app *echo.Echo,
 	re *middleware.RequestExtractor,
 	application *application.Application) {
 
-	// NATS client for distributed MCP tool routing (nil when not in distributed mode)
-	var natsClient mcpTools.MCPNATSClient
+	// Agent control for distributed MCP tool routing (nil when not in distributed mode)
+	var agentControl mcpTools.AgentControl
 	if d := application.Distributed(); d != nil {
-		natsClient = d.Nats
+		agentControl = d.AgentControl
+
+		// Replicate response metadata across frontend replicas and subscribe to
+		// delegated cancels. Without this a GET, a previous_response_id lookup or
+		// a cancel that the load balancer sends to a replica other than the
+		// creator 404s, and the cancel never reaches the CancelFunc (#10993).
+		// Standalone deployments skip this entirely and stay process-local.
+		if err := openresponses.GetGlobalStore().EnableDistributed(
+			application.ApplicationConfig().Context, d.Nats, application.InstanceID()); err != nil {
+			xlog.Error("Failed to enable cross-replica Open Responses store", "error", err)
+		}
 	}
 
 	// Open Responses API endpoint
@@ -27,14 +38,14 @@ func RegisterOpenResponsesRoutes(app *echo.Echo,
 		application.ModelLoader(),
 		application.TemplatesEvaluator(),
 		application.ApplicationConfig(),
-		natsClient,
+		agentControl,
 	)
 
 	responsesMiddleware := []echo.MiddlewareFunc{
 		// Intercept requests where the model name matches an agent — route directly
 		// to the agent pool without going through the model config resolution pipeline.
 		localai.AgentResponsesInterceptor(application),
-		middleware.UsageMiddleware(application.AuthDB()),
+		middleware.UsageMiddleware(application.StatsRecorder(), application.FallbackUser()),
 		middleware.TraceMiddleware(application),
 		re.BuildFilteredFirstAvailableDefaultModel(config.BuildUsecaseFilterFn(config.FLAG_CHAT)),
 		re.SetModelAndConfig(func() schema.LocalAIRequest { return new(schema.OpenResponsesRequest) }),
@@ -49,8 +60,8 @@ func RegisterOpenResponsesRoutes(app *echo.Echo,
 
 	// WebSocket mode for Responses API
 	wsHandler := openresponses.WebSocketEndpoint(application)
-	app.GET("/v1/responses", wsHandler, middleware.UsageMiddleware(application.AuthDB()), middleware.TraceMiddleware(application))
-	app.GET("/responses", wsHandler, middleware.UsageMiddleware(application.AuthDB()), middleware.TraceMiddleware(application))
+	app.GET("/v1/responses", wsHandler, middleware.UsageMiddleware(application.StatsRecorder(), application.FallbackUser()), middleware.TraceMiddleware(application))
+	app.GET("/responses", wsHandler, middleware.UsageMiddleware(application.StatsRecorder(), application.FallbackUser()), middleware.TraceMiddleware(application))
 
 	// GET /responses/:id - Retrieve a response (for polling background requests)
 	getResponseHandler := openresponses.GetResponseEndpoint()

@@ -16,24 +16,28 @@ import (
 )
 
 const (
-	contextKeyUser = "auth_user"
-	contextKeyRole = "auth_role"
+	contextKeyUser                = "auth_user"
+	contextKeyRole                = "auth_role"
+	contextKeyAPIKey              = "auth_apikey"
+	contextKeySource              = "auth_source"
+	contextKeyHeaderAuthenticated = "auth_header_authenticated"
 )
 
 // Middleware returns an Echo middleware that handles authentication.
 //
 // Resolution order:
 //  1. If auth not enabled AND no legacy API keys → pass through
-//  2. Skip auth for exempt paths (PathWithoutAuth + /api/auth/)
-//  3. If auth enabled (db != nil):
+//  2. If auth enabled (db != nil):
 //     a. Try "session" cookie → DB lookup
 //     b. Try Authorization: Bearer → session ID, then user API key
 //     c. Try x-api-key / xi-api-key → user API key
 //     d. Try "token" cookie → legacy API key check
 //     e. Check all extracted keys against legacy ApiKeys → synthetic admin
-//  4. If auth not enabled → delegate to legacy API key validation
-//  5. If no auth found for /api/ or /v1/ paths → 401
-//  6. Otherwise pass through (static assets, UI pages, etc.)
+//  3. If auth not enabled → delegate to legacy API key validation
+//  4. Allow authenticated requests, public routes, PathWithoutAuth overrides,
+//     and route groups that apply alternative authentication
+//  5. Apply the legacy GET regex override when configured
+//  6. Deny every other request
 func Middleware(db *gorm.DB, appConfig *config.ApplicationConfig) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
@@ -46,7 +50,6 @@ func Middleware(db *gorm.DB, appConfig *config.ApplicationConfig) echo.Middlewar
 			}
 
 			path := c.Request().URL.Path
-			exempt := isExemptPath(path, appConfig)
 			authenticated := false
 
 			// 2. Try to authenticate (populates user in context if possible)
@@ -75,31 +78,31 @@ func Middleware(db *gorm.DB, appConfig *config.ApplicationConfig) echo.Middlewar
 					}
 					c.Set(contextKeyUser, syntheticUser)
 					c.Set(contextKeyRole, RoleAdmin)
+					c.Set(contextKeySource, UsageSourceLegacy)
+					c.Set(contextKeyHeaderAuthenticated, extractHeaderKey(c) != "")
 					authenticated = true
 				}
 			}
 
-			// 4. If authenticated or exempt path, proceed
-			if authenticated || exempt {
+			// 4. Public rules are evaluated after authentication so public handlers
+			// can still observe a valid user when credentials are supplied.
+			public := isPublicRoute(c.Request().Method, path)
+			overridden := isExemptPath(path, appConfig)
+			alternativeAuth := usesAlternativeAuthentication(path)
+			if authenticated || public || overridden || alternativeAuth {
 				return next(c)
 			}
 
-			// 5. Require auth for API paths
-			if isAPIPath(path) {
-				// Check GET exemptions for legacy keys
-				if hasLegacyKeys && appConfig.DisableApiKeyRequirementForHttpGet && c.Request().Method == http.MethodGet {
-					for _, rx := range appConfig.HttpGetExemptedEndpoints {
-						if rx.MatchString(c.Path()) {
-							return next(c)
-						}
+			// 5. Check GET exemptions for legacy keys.
+			if hasLegacyKeys && appConfig.DisableApiKeyRequirementForHttpGet && c.Request().Method == http.MethodGet {
+				for _, rx := range appConfig.HttpGetExemptedEndpoints {
+					if rx.MatchString(c.Path()) {
+						return next(c)
 					}
 				}
-				return authError(c, appConfig)
 			}
 
-			// 6. Non-API paths (UI, static assets) pass through.
-			// The React UI handles login redirects client-side.
-			return next(c)
+			return authError(c, appConfig)
 		}
 	}
 }
@@ -211,6 +214,20 @@ func GetUser(c echo.Context) *User {
 func GetUserRole(c echo.Context) string {
 	role, _ := c.Get(contextKeyRole).(string)
 	return role
+}
+
+// GetAPIKey returns the resolved API key from the echo context, or nil.
+// Nil for session-cookie and legacy-env-key authentication.
+func GetAPIKey(c echo.Context) *UserAPIKey {
+	k, _ := c.Get(contextKeyAPIKey).(*UserAPIKey)
+	return k
+}
+
+// GetSource returns the request's authentication source: UsageSourceAPIKey,
+// UsageSourceWeb, UsageSourceLegacy, or empty if no authentication was performed.
+func GetSource(c echo.Context) string {
+	s, _ := c.Get(contextKeySource).(string)
+	return s
 }
 
 // RequireRouteFeature returns a global middleware that checks the user has access
@@ -421,47 +438,70 @@ func RequireQuota(db *gorm.DB) echo.MiddlewareFunc {
 }
 
 // tryAuthenticate attempts to authenticate the request using the database.
+//
+// On success it returns the user and, as a side effect, sets the following
+// values on the Echo context:
+//   - contextKeySource ("auth_source"): always set, one of UsageSourceWeb /
+//     UsageSourceAPIKey. UsageSourceLegacy is set elsewhere by the parent
+//     Middleware when a legacy env key matches.
+//   - contextKeyAPIKey ("auth_apikey"): set to the resolved *UserAPIKey for
+//     named-key branches (Bearer, x-api-key, xi-api-key, token cookie).
+//   - "_auth_session": session record, used by Middleware to drive cookie
+//     rotation. Only set on the session-cookie branch.
+//
+// contextKeyUser and contextKeyRole are populated by the parent Middleware
+// after this function returns.
 func tryAuthenticate(c echo.Context, db *gorm.DB, appConfig *config.ApplicationConfig) *User {
 	hmacSecret := appConfig.Auth.APIKeyHMACSecret
 
-	// a. Session cookie
+	// a. Session cookie -> web UI
 	if cookie, err := c.Cookie(sessionCookie); err == nil && cookie.Value != "" {
 		if user, session := ValidateSession(db, cookie.Value, hmacSecret); user != nil {
 			// Store session for rotation check in middleware
 			c.Set("_auth_session", session)
+			c.Set(contextKeySource, UsageSourceWeb)
 			return user
 		}
 	}
 
-	// b. Authorization: Bearer token
+	// b. Authorization: Bearer
 	authHeader := c.Request().Header.Get("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
 		token := strings.TrimPrefix(authHeader, "Bearer ")
 
-		// Try as session ID first
+		// b1. Session token via Bearer -> still web UI
 		if user, _ := ValidateSession(db, token, hmacSecret); user != nil {
+			c.Set(contextKeyHeaderAuthenticated, true)
+			c.Set(contextKeySource, UsageSourceWeb)
 			return user
 		}
 
-		// Try as user API key
+		// b2. Named API key
 		if key, err := ValidateAPIKey(db, token, hmacSecret); err == nil {
+			c.Set(contextKeyHeaderAuthenticated, true)
+			c.Set(contextKeySource, UsageSourceAPIKey)
+			c.Set(contextKeyAPIKey, key)
 			return &key.User
 		}
 	}
 
-	// c. x-api-key / xi-api-key headers
+	// c. x-api-key / xi-api-key -> named API key
 	for _, header := range []string{"x-api-key", "xi-api-key"} {
-		if key := c.Request().Header.Get(header); key != "" {
-			if apiKey, err := ValidateAPIKey(db, key, hmacSecret); err == nil {
+		if k := c.Request().Header.Get(header); k != "" {
+			if apiKey, err := ValidateAPIKey(db, k, hmacSecret); err == nil {
+				c.Set(contextKeyHeaderAuthenticated, true)
+				c.Set(contextKeySource, UsageSourceAPIKey)
+				c.Set(contextKeyAPIKey, apiKey)
 				return &apiKey.User
 			}
 		}
 	}
 
-	// d. token cookie (legacy)
+	// d. token cookie -> named API key
 	if cookie, err := c.Cookie("token"); err == nil && cookie.Value != "" {
-		// Try as user API key
 		if key, err := ValidateAPIKey(db, cookie.Value, hmacSecret); err == nil {
+			c.Set(contextKeySource, UsageSourceAPIKey)
+			c.Set(contextKeyAPIKey, key)
 			return &key.User
 		}
 	}
@@ -469,9 +509,18 @@ func tryAuthenticate(c echo.Context, db *gorm.DB, appConfig *config.ApplicationC
 	return nil
 }
 
-// extractKey extracts an API key from the request (all sources).
+// extractKey extracts an API key from headers, falling back to the token cookie.
 func extractKey(c echo.Context) string {
-	// Authorization header
+	if key := extractHeaderKey(c); key != "" || c.Request().Header.Get("Authorization") != "" {
+		return key
+	}
+	if cookie, err := c.Cookie("token"); err == nil && cookie.Value != "" {
+		return cookie.Value
+	}
+	return ""
+}
+
+func extractHeaderKey(c echo.Context) string {
 	auth := c.Request().Header.Get("Authorization")
 	if strings.HasPrefix(auth, "Bearer ") {
 		return strings.TrimPrefix(auth, "Bearer ")
@@ -479,23 +528,10 @@ func extractKey(c echo.Context) string {
 	if auth != "" {
 		return auth
 	}
-
-	// x-api-key
 	if key := c.Request().Header.Get("x-api-key"); key != "" {
 		return key
 	}
-
-	// xi-api-key
-	if key := c.Request().Header.Get("xi-api-key"); key != "" {
-		return key
-	}
-
-	// token cookie
-	if cookie, err := c.Cookie("token"); err == nil && cookie.Value != "" {
-		return cookie.Value
-	}
-
-	return ""
+	return c.Request().Header.Get("xi-api-key")
 }
 
 // isValidLegacyKey checks if the key matches any configured API key
@@ -511,23 +547,6 @@ func isValidLegacyKey(key string, appConfig *config.ApplicationConfig) bool {
 
 // isExemptPath returns true if the path should skip authentication.
 func isExemptPath(path string, appConfig *config.ApplicationConfig) bool {
-	// Auth endpoints are always public
-	if strings.HasPrefix(path, "/api/auth/") {
-		return true
-	}
-
-	// Node self-service endpoints — authenticated via registration token, not global auth.
-	// Only exempt the specific known endpoints, not the entire prefix.
-	if strings.HasPrefix(path, "/api/node/") {
-		if path == "/api/node/register" ||
-			strings.HasSuffix(path, "/heartbeat") ||
-			strings.HasSuffix(path, "/drain") ||
-			strings.HasSuffix(path, "/deregister") {
-			return true
-		}
-	}
-
-	// Check configured exempt paths
 	for _, p := range appConfig.PathWithoutAuth {
 		if strings.HasPrefix(path, p) {
 			return true
@@ -535,31 +554,6 @@ func isExemptPath(path string, appConfig *config.ApplicationConfig) bool {
 	}
 
 	return false
-}
-
-// isAPIPath returns true for paths that always require authentication.
-func isAPIPath(path string) bool {
-	return strings.HasPrefix(path, "/api/") ||
-		strings.HasPrefix(path, "/v1/") ||
-		strings.HasPrefix(path, "/models/") ||
-		strings.HasPrefix(path, "/backends/") ||
-		strings.HasPrefix(path, "/backend/") ||
-		strings.HasPrefix(path, "/tts") ||
-		strings.HasPrefix(path, "/vad") ||
-		strings.HasPrefix(path, "/video") ||
-		strings.HasPrefix(path, "/stores/") ||
-		strings.HasPrefix(path, "/system") ||
-		strings.HasPrefix(path, "/ws/") ||
-		strings.HasPrefix(path, "/generated-") ||
-		strings.HasPrefix(path, "/chat/") ||
-		strings.HasPrefix(path, "/completions") ||
-		strings.HasPrefix(path, "/edits") ||
-		strings.HasPrefix(path, "/embeddings") ||
-		strings.HasPrefix(path, "/audio/") ||
-		strings.HasPrefix(path, "/images/") ||
-		strings.HasPrefix(path, "/messages") ||
-		strings.HasPrefix(path, "/responses") ||
-		path == "/metrics"
 }
 
 // authError returns an appropriate error response.

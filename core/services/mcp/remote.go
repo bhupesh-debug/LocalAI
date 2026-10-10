@@ -1,6 +1,8 @@
 package mcp
 
 import (
+	"context"
+
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/pkg/functions"
 )
@@ -15,6 +17,15 @@ type MCPToolRequest struct {
 	RemoteServers config.MCPGenericConfig[config.MCPRemoteServers] `json:"remote_servers"`
 	StdioServers  config.MCPGenericConfig[config.MCPSTDIOServers]  `json:"stdio_servers"`
 }
+
+// ToolHandler serves one MCP tool request on an agent worker. It returns no
+// error because every failure is an answer: the reply carries it in Error, so
+// the requester never waits out its budget on silence.
+type ToolHandler func(ctx context.Context, req MCPToolRequest) MCPToolResponse
+
+// DiscoveryHandler serves one MCP discovery request on an agent worker, with
+// the same failure contract as ToolHandler.
+type DiscoveryHandler func(ctx context.Context, req MCPDiscoveryRequest) MCPDiscoveryResponse
 
 // MCPToolResponse is the NATS reply for an MCP tool execution.
 type MCPToolResponse struct {
@@ -44,6 +55,7 @@ type MCPServerInfo struct {
 	Tools     []string `json:"tools"`
 	Prompts   []string `json:"prompts,omitempty"`
 	Resources []string `json:"resources,omitempty"`
+	Error     string   `json:"error,omitempty"`
 }
 
 // MCPToolDef is a serializable tool definition (function schema) that can

@@ -581,4 +581,97 @@ var _ = Describe("Gallery", func() {
 			Expect(mergedParams["model"]).To(Equal("nanbeige4.1-3b-q4_k_m.gguf"))
 		})
 	})
+
+	Describe("GetKnownUsecases", func() {
+		It("uses explicit known_usecases from overrides when present", func() {
+			m := &GalleryModel{
+				Metadata: Metadata{Backend: "stablediffusion-ggml"},
+				Overrides: map[string]any{
+					"known_usecases": []any{"chat"},
+				},
+			}
+			u := m.GetKnownUsecases()
+			Expect(u).NotTo(BeNil())
+			// Override wins over the backend's image default.
+			Expect(*u & config.FLAG_CHAT).To(Equal(config.FLAG_CHAT))
+			Expect(*u & config.FLAG_IMAGE).To(Equal(config.ModelConfigUsecase(0)))
+		})
+
+		It("falls back to backend defaults when no override is set", func() {
+			m := &GalleryModel{Metadata: Metadata{Backend: "stablediffusion-ggml"}}
+			u := m.GetKnownUsecases()
+			Expect(u).NotTo(BeNil())
+			Expect(*u & config.FLAG_IMAGE).To(Equal(config.FLAG_IMAGE))
+		})
+
+		It("returns nil when neither overrides nor a known backend provide usecases", func() {
+			m := &GalleryModel{}
+			Expect(m.GetKnownUsecases()).To(BeNil())
+		})
+
+		It("filters models without explicit known_usecases via backend defaults", func() {
+			models := GalleryElements[*GalleryModel]{
+				&GalleryModel{Metadata: Metadata{Name: "sd-model", Backend: "stablediffusion-ggml"}},
+				&GalleryModel{Metadata: Metadata{Name: "whisper-model", Backend: "whisper"}},
+			}
+			filtered := FilterGalleryModelsByUsecase(models, config.FLAG_IMAGE)
+			Expect(filtered).To(HaveLen(1))
+			Expect(filtered[0].Name).To(Equal("sd-model"))
+		})
+	})
+
+	Describe("VoiceCloningCapability", func() {
+		It("derives support from an inline Base model configuration", func() {
+			m := &GalleryModel{
+				Metadata: Metadata{Name: "qwen-base", Backend: "qwen3-tts-cpp"},
+				ConfigFile: map[string]any{
+					"parameters": map[string]any{"model": "Qwen3-TTS-12Hz-0.6B-Base"},
+				},
+			}
+
+			capability := m.VoiceCloningCapability(tempDir)
+			Expect(capability).NotTo(BeNil())
+			Expect(capability.AcceptedAudioFormats).To(Equal([]string{"audio/wav"}))
+		})
+
+		It("uses gallery overrides when deciding between model variants", func() {
+			m := &GalleryModel{
+				Metadata: Metadata{Name: "qwen-custom", Backend: "qwen3-tts-cpp"},
+				ConfigFile: map[string]any{
+					"parameters": map[string]any{"model": "Qwen3-TTS-12Hz-0.6B-Base"},
+				},
+				Overrides: map[string]any{
+					"parameters": map[string]any{"model": "Qwen3-TTS-12Hz-0.6B-CustomVoice"},
+				},
+			}
+
+			Expect(m.VoiceCloningCapability(tempDir)).To(BeNil())
+		})
+
+		It("honors the typed capability override for custom gallery entries", func() {
+			m := &GalleryModel{
+				Metadata: Metadata{Name: "private-voice-model", Backend: "qwen-tts"},
+				Overrides: map[string]any{
+					"parameters": map[string]any{"model": "private-checkpoint"},
+					"tts":        map[string]any{"voice_cloning": true},
+				},
+			}
+
+			Expect(m.VoiceCloningCapability(tempDir)).NotTo(BeNil())
+		})
+
+		It("honors an explicit gallery opt-out", func() {
+			m := &GalleryModel{
+				Metadata: Metadata{Name: "voxcpm-1.5", Backend: "voxcpm"},
+				ConfigFile: map[string]any{
+					"tts": map[string]any{"voice_cloning": true},
+				},
+				Overrides: map[string]any{
+					"tts": map[string]any{"voice_cloning": false},
+				},
+			}
+
+			Expect(m.VoiceCloningCapability(tempDir)).To(BeNil())
+		})
+	})
 })

@@ -3,6 +3,7 @@ package localai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,6 +38,31 @@ func ImportModelURIEndpoint(cl *config.ModelConfigLoader, appConfig *config.Appl
 
 		modelConfig, err := importers.DiscoverModelConfig(input.URI, input.Preferences)
 		if err != nil {
+			var amb *importers.AmbiguousImportError
+			if errors.As(err, &amb) {
+				// Fall back to empty slice so JSON always renders an array,
+				// not null — keeps the UI code a bit simpler.
+				candidates := amb.Candidates
+				if candidates == nil {
+					candidates = []string{}
+				}
+				return c.JSON(http.StatusBadRequest, map[string]any{
+					"error":      "ambiguous import",
+					"detail":     amb.Error(),
+					"modality":   amb.Modality,
+					"candidates": candidates,
+					"hint":       "Pass preferences.backend to pick one of the candidates.",
+				})
+			}
+			if errors.Is(err, importers.ErrAmbiguousImport) {
+				return c.JSON(http.StatusBadRequest, map[string]any{
+					"error":      "ambiguous import",
+					"detail":     err.Error(),
+					"modality":   "",
+					"candidates": []string{},
+					"hint":       "Pass preferences.backend to pick one of the candidates.",
+				})
+			}
 			return fmt.Errorf("failed to discover model config: %w", err)
 		}
 
@@ -51,18 +77,17 @@ func ImportModelURIEndpoint(cl *config.ModelConfigLoader, appConfig *config.Appl
 			}
 			estCtx, cancel := context.WithTimeout(c.Request().Context(), 5*time.Second)
 			defer cancel()
-			result, err := vram.EstimateModel(estCtx, vram.ModelEstimateInput{
-				Files:   files,
-				Options: vram.EstimateOptions{ContextLength: 8192},
-			})
+			result, err := vram.EstimateModelMultiContext(estCtx, vram.ModelEstimateInput{
+				Files: files,
+			}, []uint32{8192})
 			if err == nil {
 				if result.SizeBytes > 0 {
 					resp.EstimatedSizeBytes = result.SizeBytes
 					resp.EstimatedSizeDisplay = result.SizeDisplay
 				}
-				if result.VRAMBytes > 0 {
-					resp.EstimatedVRAMBytes = result.VRAMBytes
-					resp.EstimatedVRAMDisplay = result.VRAMDisplay
+				if v := result.VRAMForContext(8192); v > 0 {
+					resp.EstimatedVRAMBytes = v
+					resp.EstimatedVRAMDisplay = vram.FormatBytes(v)
 				}
 			}
 		}
@@ -83,7 +108,7 @@ func ImportModelURIEndpoint(cl *config.ModelConfigLoader, appConfig *config.Appl
 			opcache.Set(galleryID, uuid.String())
 		}
 
-		galleryService.ModelGalleryChannel <- galleryop.ManagementOp[gallery.GalleryModel, gallery.ModelConfig]{
+		galleryService.EnqueueModelOp(galleryop.ManagementOp[gallery.GalleryModel, gallery.ModelConfig]{
 			Req: gallery.GalleryModel{
 				Overrides: map[string]any{},
 			},
@@ -91,7 +116,7 @@ func ImportModelURIEndpoint(cl *config.ModelConfigLoader, appConfig *config.Appl
 			GalleryElementName: galleryID,
 			GalleryElement:     &modelConfig,
 			BackendGalleries:   appConfig.BackendGalleries,
-		}
+		})
 
 		resp.ID = uuid.String()
 		resp.StatusURL = fmt.Sprintf("%smodels/jobs/%s", httpUtils.BaseURL(c), uuid.String())
@@ -100,7 +125,7 @@ func ImportModelURIEndpoint(cl *config.ModelConfigLoader, appConfig *config.Appl
 }
 
 // ImportModelEndpoint handles creating new model configurations
-func ImportModelEndpoint(cl *config.ModelConfigLoader, appConfig *config.ApplicationConfig) echo.HandlerFunc {
+func ImportModelEndpoint(cl *config.ModelConfigLoader, gs *galleryop.GalleryService, appConfig *config.ApplicationConfig) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		// Get the raw body
 		body, err := io.ReadAll(c.Request().Body)
@@ -148,12 +173,24 @@ func ImportModelEndpoint(cl *config.ModelConfigLoader, appConfig *config.Applica
 		// Validate without calling SetDefaults() — runtime defaults should not
 		// be persisted to disk. SetDefaults() is called when loading configs
 		// for inference via LoadModelConfigsFromPath().
-		if valid, _ := modelConfig.Validate(); !valid {
-			response := ModelResponse{
-				Success: false,
-				Error:   "Invalid configuration",
+		if valid, vErr := modelConfig.Validate(); !valid {
+			msg := "Invalid configuration"
+			if vErr != nil {
+				msg = vErr.Error()
 			}
-			return c.JSON(http.StatusBadRequest, response)
+			return c.JSON(http.StatusBadRequest, ModelResponse{Success: false, Error: msg})
+		}
+
+		// Reject aliases whose target is missing, chained, or disabled so a
+		// dangling alias can't be persisted and surface as a runtime error later.
+		if err := cl.ValidateAliasTarget(&modelConfig); err != nil {
+			return c.JSON(http.StatusBadRequest, ModelResponse{Success: false, Error: err.Error()})
+		}
+
+		// Reject failover chains whose targets are missing or are themselves
+		// chains, for the same reason.
+		if err := cl.ValidateFailoverTargets(&modelConfig); err != nil {
+			return c.JSON(http.StatusBadRequest, ModelResponse{Success: false, Error: err.Error()})
 		}
 
 		// Create the configuration file
@@ -214,6 +251,13 @@ func ImportModelEndpoint(cl *config.ModelConfigLoader, appConfig *config.Applica
 			}
 			return c.JSON(http.StatusInternalServerError, response)
 		}
+		// Tell peer replicas to load the newly-created config from the shared
+		// models dir: this endpoint only reloaded the local loader. No-op in
+		// standalone mode.
+		if gs != nil {
+			gs.BroadcastModelsChanged(modelConfig.Name, "install")
+		}
+
 		// Return success response
 		response := ModelResponse{
 			Success:  true,

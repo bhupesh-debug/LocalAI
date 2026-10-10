@@ -57,11 +57,26 @@ services:
       LOCALAI_AGENT_POOL_VECTOR_ENGINE: "postgres"
       LOCALAI_AGENT_POOL_DATABASE_URL: "postgresql://localai:localai@postgres:5432/localai?sslmode=disable"
       LOCALAI_REGISTRATION_TOKEN: "changeme"  # Change this in production!
+      # Shared-models mode (optional): set when every node mounts the SAME
+      # models directory at the SAME path (see "Shared Volume Mode" below).
+      # The router then skips gRPC file staging and workers load models
+      # directly from the shared volume instead of re-downloading them.
+      # LOCALAI_DISTRIBUTED_SHARED_MODELS: "true"
       # Auth (required for distributed mode — must use PostgreSQL)
       LOCALAI_AUTH: "true"
       LOCALAI_AUTH_DATABASE_URL: "postgresql://localai:localai@postgres:5432/localai?sslmode=disable"
+      # Force pure-Go DNS resolver. The default cgo resolver follows the
+      # container's nsswitch.conf and ends up forwarding to host
+      # systemd-resolved (127.0.0.53), which isn't reachable from inside
+      # the container — failing every postgres/nats hostname lookup at
+      # boot. The pure-Go path reads /etc/resolv.conf directly and uses
+      # Docker's embedded DNS at 127.0.0.11.
+      GODEBUG: "netdns=go"
       # Paths
       MODELS_PATH: /models
+      # Avoid probing remote gallery GGUF metadata during container startup.
+      # Remove this line or set a positive limit to opt back into cache warming.
+      LOCALAI_VRAM_WARM_LIMIT: "0"
     volumes:
       - frontend_models:/models
       - frontend_data:/data
@@ -89,6 +104,13 @@ services:
         - BASE_IMAGE=ubuntu:24.04
     command:
       - worker
+    # No HEALTHCHECK_ENDPOINT override is needed: the image's healthcheck
+    # detects worker mode and derives the port from LOCALAI_SERVE_ADDR below
+    # (gRPC base port - 1 = 50050). The worker's /readyz reports 503 when its
+    # NATS connection is down, and also when a backend process it is already
+    # serving no longer answers a TCP dial on its gRPC address. So `unhealthy`
+    # here means the worker genuinely cannot receive work, or cannot serve the
+    # models it is holding.
     environment:
       LOCALAI_SERVE_ADDR: "0.0.0.0:50051"
       LOCALAI_ADVERTISE_ADDR: "worker-1:50051"
@@ -99,6 +121,7 @@ services:
       LOCALAI_REGISTRATION_TOKEN: "changeme"  # Must match frontend token
       LOCALAI_HEARTBEAT_INTERVAL: "10s"
       LOCALAI_NATS_URL: "nats://nats:4222"
+      GODEBUG: "netdns=go"  # See note in localai service
       MODELS_PATH: /models
     volumes:
       - worker_1_models:/models
@@ -110,15 +133,23 @@ services:
 
     # --- GPU Support (NVIDIA) ---
     # Uncomment the following and change the image to a CUDA variant
-    # (e.g., localai/localai:latest-gpu-nvidia-cuda-12) to enable GPU:
+    # (e.g., localai/localai:latest-gpu-nvidia-cuda-12) to enable GPU.
     #
+    # NVIDIA_DRIVER_CAPABILITIES must include `utility` so nvidia-smi / NVML
+    # are available inside the container; without it the worker cannot report
+    # free VRAM and the Nodes page will show 0 free / total used.
+    # `init: true` avoids zombie-reap races that make nvidia-smi flaky.
+    #
+    # init: true
+    # environment:
+    #   NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
     # deploy:
     #   resources:
     #     reservations:
     #       devices:
     #         - driver: nvidia.com/gpu
     #           count: all
-    #           capabilities: [gpu]
+    #           capabilities: [gpu, utility]
 
   # --- Shared Volume Mode (optional) ---
   # If all services run on the same Docker host, you can skip gRPC file transfer
@@ -136,8 +167,11 @@ services:
   # Then add to the volumes section:
   #   shared_models:
   #
-  # With shared volumes, model files are already available on the backend —
-  # gRPC file staging becomes a no-op (paths match).
+  # With shared volumes the model files are already present on every worker at
+  # the same path. Set LOCALAI_DISTRIBUTED_SHARED_MODELS=true on the frontend
+  # (see its environment above) so the router skips gRPC file staging and the
+  # worker loads the model directly from the shared path instead of
+  # re-downloading it into a per-model subdirectory.
 
   # --- Adding More Workers ---
   # Copy the worker-1 service above and change:
@@ -171,11 +205,15 @@ services:
       - |
         apt-get update -qq && apt-get install -y -qq docker.io >/dev/null 2>&1
         exec /entrypoint.sh agent-worker
+    # The agent worker is NATS-only — no HTTP server to probe. The image's
+    # healthcheck detects that mode and reports healthy rather than probing a
+    # port that will never bind, so no override is needed here.
     environment:
       LOCALAI_NATS_URL: "nats://nats:4222"
       LOCALAI_REGISTER_TO: "http://localai:8080"
       LOCALAI_NODE_NAME: "agent-worker-1"
       LOCALAI_REGISTRATION_TOKEN: "changeme"  # Must match frontend token
+      GODEBUG: "netdns=go"  # See note in localai service
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:

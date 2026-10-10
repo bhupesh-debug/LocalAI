@@ -1,7 +1,7 @@
 +++
 disableToc = false
 title = "Runtime Settings"
-weight = 25
+weight = 82
 url = '/features/runtime-settings'
 +++
 
@@ -9,7 +9,38 @@ LocalAI provides a web-based interface for managing application settings at runt
 
 ## Accessing Runtime Settings
 
-Navigate to the **Settings** page from the management interface at `http://localhost:8080/manage`. The settings page provides a comprehensive interface for configuring various aspects of LocalAI.
+Open **Operate → Settings** in the web UI (`/app/settings`). The page lists every setting below under eight groups by intent, and keeps your edits in a pending bar until you apply them.
+
+### Groups
+
+The groups reorganise the fields the page used to show under fifteen sections. The mapping:
+
+| Group | Settings it holds | Used to be under |
+|---|---|---|
+| Memory and models | Watchdog (idle and busy checks, timeouts, interval), eviction (force when busy, largest first, retries, retry interval), free memory automatically and its threshold, models kept loaded, GPU memory budget | Watchdog, Memory Reclaimer, Backend Management, Performance |
+| Speed and defaults | Default threads, default context size, artifact download concurrency, F16 | Performance |
+| Backends and galleries | Automatic backend upgrades, development backends, gallery loading on boot, the persistent VRAM cache, the model and backend gallery lists | Backend Management, Galleries |
+| Access and security | CORS and allowed origins, CSRF protection, shared API keys | API & CORS, API Keys |
+| Debugging and traces | Verbose debug logging, API traces and their limits, backend logging | Performance, Tracing |
+| Agents and responses | Agent job history, the agent pool, the LocalAI Assistant, the response store TTL | Agent Jobs, Agent Pool, LocalAI Assistant, Open Responses |
+| Swarm and sharing | P2P token, network ID and federated mode, the disk headroom check | P2P Network, Distributed |
+| Look and feel | Instance name, tagline, the three logos | Branding |
+
+Search at the top of the page matches a setting's name, description and key, the group, and the old section name, so a search for "Watchdog" still finds the watchdog settings and each result says where it used to be.
+
+### Editing, applying and undoing
+
+Edits are not sent as you type. A bar at the bottom of the page counts them and offers **Discard**, **Show diff** and **Apply**. The diff lists each old and new value, and runs the checks the browser can make: a duration parses the way the server parses it, a GPU memory budget is one the server accepts, a gallery list is valid JSON with a `url` in each entry, and warnings repeat what the server says (a restart is needed, an empty P2P token stops P2P, evicting while busy can interrupt requests, CSRF protection off). A check that would make the server refuse the value stops **Apply**.
+
+**Apply** sends only the settings that changed. After it, **Undo** (for ten seconds) saves the previous values again. This is a new save, not a rollback: anything that changed in between stays changed.
+
+A setting shows **Changed** and its built-in default, with a **Reset** link, only when the default is known (the defaults of the `local-ai run` flags). Settings without a stated default, such as threads and the context size, never show the marker. An environment variable or flag can change the value the server starts with, so the marker compares with the built-in default, not with the startup value.
+
+A row says **Applies now** when the save handler applies the setting immediately (the watchdog and the memory reclaimer restart with the new values; so do the P2P stack and the agent job service when their settings change), and **Needs restart** for the agent pool settings. A setting without either note is saved, and the code does not say when it takes effect.
+
+**History** lists the settings you applied from this browser, newest first, up to the last 50. LocalAI keeps no settings log of its own, so changes made elsewhere do not appear, and a secret (the P2P token, shared API keys, the agent database URL) is listed as changed without its value. **Revert** puts the old value back as an edit.
+
+`POST /api/settings` accepts a partial body and merges it over the saved settings, so the page sends only the keys it changes. In the request, the `csrf` field carries the **disable** flag: the page shows the inverse as "CSRF protection". The galleries are sent as `galleries` and `backend_galleries`, and the shared API keys as `api_keys`, each as a JSON list.
 
 ## Available Settings
 
@@ -49,7 +80,9 @@ You can configure these settings via the web UI or through environment variables
 
 - **Threads**: Number of threads used for parallel computation (recommended: number of physical cores)
 - **Context Size**: Default context size for models (default: `512`)
+- **Artifact Download Concurrency**: Maximum number of artifact files downloaded at once. `1` downloads sequentially (default: `1`)
 - **F16**: Enable GPU acceleration using 16-bit floating point
+- **VRAM Budget**: Cap on VRAM used for model allocation (for example `80%` or `12GB`; empty means no cap). See [VRAM Management]({{%relref "advanced/vram-management" %}})
 
 ### Debug and Logging
 
@@ -59,7 +92,7 @@ You can configure these settings via the web UI or through environment variables
 
 - **CORS**: Enable Cross-Origin Resource Sharing
 - **CORS Allow Origins**: Comma-separated list of allowed CORS origins
-- **CSRF**: Enable CSRF protection middleware
+- **CSRF**: Enable CSRF protection middleware. Cross-site browser requests are exempt only when the server successfully authenticates a credential from `Authorization`, `x-api-key`, or `xi-api-key`. Supplying an arbitrary header when authentication is disabled does not bypass protection; cookie authentication also does not grant this exemption. Requests without `Sec-Fetch-Site` (such as CLI clients) remain allowed by this middleware.
 - **API Keys**: Manage API keys for authentication (one per line or comma-separated)
 
 For multi-user authentication with roles, OAuth, and usage tracking, see [Authentication & Authorization]({{%relref "features/authentication" %}}).
@@ -78,9 +111,9 @@ Changes to P2P settings automatically restart the P2P stack with the new configu
 
 Manage model and backend galleries:
 
-- **Model Galleries**: JSON array of gallery objects with `url` and `name` fields
-- **Backend Galleries**: JSON array of backend gallery objects
-- **Autoload Galleries**: Automatically load model galleries on startup
+- **Model Galleries**: JSON array of gallery objects with `url` and `name` fields, plus an optional `mirrors` list of fallback URLs (see [Gallery mirrors]({{%relref "features/model-gallery#gallery-mirrors" %}}))
+- **Backend Galleries**: JSON array of backend gallery objects, which accept the same `mirrors` key
+- **Load and pre-warm galleries on boot**: Load model galleries and pre-warm their remote size and VRAM estimates when LocalAI starts. Disable this setting to skip both startup operations.
 - **Autoload Backend Galleries**: Automatically load backend galleries on startup
 
 ### Agent Pool Settings
@@ -101,14 +134,24 @@ Configure the built-in agent platform (see [Agents]({{%relref "features/agents" 
 
 All settings are automatically saved to `runtime_settings.json` in the `LOCALAI_CONFIG_DIR` directory (default: `BASEPATH/configuration`). This file is watched for changes, so modifications made directly to the file will also be applied at runtime.
 
-## Environment Variable Precedence
+## Settings Precedence
 
-Environment variables take precedence over settings configured via the web UI or configuration files. If a setting is controlled by an environment variable, it cannot be modified through the web interface. The settings page will indicate when a setting is controlled by an environment variable.
+Every runtime setting follows a single precedence rule:
 
-The precedence order is:
-1. **Environment variables** (highest priority)
+1. **Environment variables and CLI flags** (highest priority)
 2. **Configuration files** (`runtime_settings.json`, `api_keys.json`)
 3. **Default values** (lowest priority)
+
+The same rule is applied identically in all three places where settings can change:
+
+- **At boot**: values persisted in `runtime_settings.json` fill in every setting that was not explicitly set via an environment variable or CLI flag.
+- **On `POST /api/settings`** (the web UI Settings page): if a setting is controlled by an environment variable, it cannot be modified through the web interface. The settings page will indicate when a setting is controlled by an environment variable.
+- **On manual file edits**: the configuration watcher hot-applies edits to `runtime_settings.json` with the same env-over-file semantics as boot, so editing the file by hand behaves like restarting with that file. For example, hand-editing `vram_budget` installs the new VRAM allocation cap live, without a restart.
+
+### Known Limitations
+
+- An environment variable explicitly set to its default value is indistinguishable from an unset one, so the value from `runtime_settings.json` wins in that case. In particular, an explicit `LOCALAI_THREADS=0` behaves like an unset `LOCALAI_THREADS`.
+- A field previously changed via the API (or the web UI) looks environment-set to the file watcher, so a manual file edit of that same field is not hot-applied: it takes effect on the next restart.
 
 ## Example Configuration
 
@@ -127,6 +170,7 @@ The `runtime_settings.json` file follows this structure:
   "lru_eviction_retry_interval": "1s",
   "threads": 8,
   "context_size": 2048,
+  "artifact_download_concurrency": 4,
   "f16": false,
   "debug": false,
   "cors": true,
@@ -137,18 +181,21 @@ The `runtime_settings.json` file follows this structure:
   "federated": false,
   "galleries": [
     {
-      "url": "github:mudler/LocalAI/gallery/index.yaml@master",
+      "url": "https://index.localai.io/models",
+      "mirrors": ["github:mudler/LocalAI/gallery/index.yaml@master"],
       "name": "localai"
     }
   ],
   "backend_galleries": [
     {
-      "url": "github:mudler/LocalAI/backend/index.yaml@master",
+      "url": "https://index.localai.io/backends",
+      "mirrors": ["github:mudler/LocalAI/backend/index.yaml@master"],
       "name": "localai"
     }
   ],
   "autoload_galleries": true,
   "autoload_backend_galleries": true,
+  "vram_persistent_cache": true,
   "api_keys": []
 }
 ```
@@ -171,7 +218,7 @@ The runtime settings system supports dynamic configuration file watching. When `
 - `api_keys.json` - API keys (for backward compatibility)
 - `external_backends.json` - External backend configurations
 
-Changes to these files are automatically detected and applied without requiring a restart.
+Changes to these files are automatically detected and applied without requiring a restart, using the same precedence rule described in [Settings Precedence](#settings-precedence).
 
 ## Best Practices
 
@@ -210,4 +257,3 @@ If P2P is not starting:
 2. Check network connectivity
 3. Ensure the P2P network ID matches across nodes (if using federated mode)
 4. Review logs for P2P-related errors
-

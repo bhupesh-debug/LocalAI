@@ -33,8 +33,18 @@ type OpenAIUsage struct {
 	OutputTokens       int                 `json:"output_tokens,omitempty"`
 	InputTokensDetails *InputTokensDetails `json:"input_tokens_details,omitempty"`
 	// Extra timing data, disabled by default as is't not a part of OpenAI specification
-	TimingPromptProcessing float64 `json:"timing_prompt_processing,omitempty"`
-	TimingTokenGeneration  float64 `json:"timing_token_generation,omitempty"`
+	TimingPromptProcessing float64              `json:"timing_prompt_processing,omitempty"`
+	TimingTokenGeneration  float64              `json:"timing_token_generation,omitempty"`
+	CompressionMeta        *CompressionMetadata `json:"compression_meta,omitempty"`
+}
+
+type CompressionMetadata struct {
+	OriginalTokens     int    `json:"original_tokens"`
+	CompressedTokens   int    `json:"compressed_tokens"`
+	DroppedTurns       int    `json:"dropped_turns"`
+	Compressor         string `json:"compressor"`
+	SummaryTokens      int    `json:"summary_tokens"`
+	OverflowRecoveries int    `json:"overflow_recoveries"`
 }
 
 type Item struct {
@@ -82,7 +92,22 @@ type OpenAIResponse struct {
 	Choices []Choice `json:"choices,omitempty"`
 	Data    []Item   `json:"data,omitempty"`
 
-	Usage OpenAIUsage `json:"usage"`
+	// Usage is intentionally a pointer with omitempty: per the OpenAI
+	// chat-completion streaming spec, intermediate chunks must not carry
+	// a `usage` field. Marshalling a value-typed usage would emit
+	// `"usage":{"prompt_tokens":0,...}` on every chunk and break
+	// OpenAI-SDK consumers that filter on a truthy `result.usage`
+	// (continuedev/continue, Kilo Code, Roo Code, etc.).
+	Usage    *OpenAIUsage    `json:"usage,omitempty"`
+	Metadata json.RawMessage `json:"metadata,omitempty" swaggertype:"object"`
+}
+
+// StreamOptions mirrors OpenAI's `stream_options` request field. The only
+// member currently honored is IncludeUsage; when true, the streaming
+// chat-completion response emits a trailing chunk with `choices:[]` and a
+// populated `usage` object.
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty" yaml:"include_usage,omitempty"`
 }
 
 type Choice struct {
@@ -162,13 +187,23 @@ type JsonSchema struct {
 }
 
 type OpenAIRequest struct {
+	IncludeSpeakerProfiles bool `json:"include_speaker_profiles,omitempty"`
+	IncludeText            bool `json:"include_text,omitempty"`
+	IncludeSounds          bool `json:"include_sounds,omitempty"`
 	PredictionOptions
 
 	Context context.Context    `json:"-"`
 	Cancel  context.CancelFunc `json:"-"`
 
+	// OpenAIRequest is a union over chat / completion / embedding /
+	// edit / image / whisper endpoints. Most fields apply to only one
+	// endpoint family — they MUST be omitempty so the re-marshal path
+	// in cloud-proxy passthrough doesn't ship whisper's `file:""` or
+	// embedding's `input:null` to an upstream chat endpoint, which
+	// strict providers (OpenAI) reject as unknown parameters.
+
 	// whisper
-	File string `json:"file" validate:"required"`
+	File string `json:"file,omitempty" validate:"required"`
 	// Multiple input images for img2img or inpainting
 	Files []string `json:"files,omitempty"`
 	// Reference images for models that support them (e.g., Flux Kontext)
@@ -176,47 +211,92 @@ type OpenAIRequest struct {
 	//whisper/image
 	ResponseFormat any `json:"response_format,omitempty"`
 	// image
-	Size string `json:"size"`
+	Size string `json:"size,omitempty"`
 	// Prompt is read only by completion/image API calls
-	Prompt any `json:"prompt" yaml:"prompt"`
+	Prompt any `json:"prompt,omitempty" yaml:"prompt"`
+	// NegativePrompt for image generation (matches Stable Diffusion WebUI /
+	// vLLM-Omni conventions). Combined, comma-separated, with any "|"-suffixed
+	// negative tags in Prompt.
+	NegativePrompt string `json:"negative_prompt,omitempty" yaml:"negative_prompt"`
 
 	// Edit endpoint
-	Instruction string `json:"instruction" yaml:"instruction"`
-	Input       any    `json:"input" yaml:"input"`
+	Instruction string `json:"instruction,omitempty" yaml:"instruction"`
+	Input       any    `json:"input,omitempty" yaml:"input"`
 
-	Stop any `json:"stop" yaml:"stop"`
+	Stop any `json:"stop,omitempty" yaml:"stop"`
 
 	// Messages is read only by chat/completion API calls
-	Messages []Message `json:"messages" yaml:"messages"`
+	Messages []Message `json:"messages,omitempty" yaml:"messages"`
 
 	// A list of available functions to call
-	Functions    functions.Functions `json:"functions" yaml:"functions"`
-	FunctionCall any                 `json:"function_call" yaml:"function_call"` // might be a string or an object
+	Functions    functions.Functions `json:"functions,omitempty" yaml:"functions"`
+	FunctionCall any                 `json:"function_call,omitempty" yaml:"function_call"` // might be a string or an object
 
 	Tools       []functions.Tool `json:"tools,omitempty" yaml:"tools"`
 	ToolsChoice any              `json:"tool_choice,omitempty" yaml:"tool_choice"`
 
-	Stream bool `json:"stream"`
+	Stream bool `json:"stream,omitempty"`
+
+	// StreamOptions opts into OpenAI streaming extensions, e.g. include_usage.
+	StreamOptions *StreamOptions `json:"stream_options,omitempty" yaml:"stream_options,omitempty"`
 
 	// Image (not supported by OpenAI)
-	Quality string `json:"quality"`
-	Step    int    `json:"step"`
+	Quality string `json:"quality,omitempty"`
+	Step    int    `json:"step,omitempty"`
+
+	// LocalAI-specific request fields below. They carry server-side
+	// routing/templating hints and are NOT part of the OpenAI surface
+	// — leaking them upstream as zero values trips strict providers
+	// (e.g. OpenAI 400s with "Unknown parameter: 'backend'."), so
+	// they must use omitempty to disappear from re-marshaled bodies
+	// in the cloud-proxy passthrough path.
 
 	// A grammar to constrain the LLM output
-	Grammar string `json:"grammar" yaml:"grammar"`
+	Grammar string `json:"grammar,omitempty" yaml:"grammar"`
 
-	JSONFunctionGrammarObject *functions.JSONFunctionStructure `json:"grammar_json_functions" yaml:"grammar_json_functions"`
+	JSONFunctionGrammarObject *functions.JSONFunctionStructure `json:"grammar_json_functions,omitempty" yaml:"grammar_json_functions"`
 
-	Backend string `json:"backend" yaml:"backend"`
+	Backend string `json:"backend,omitempty" yaml:"backend"`
 
-	ModelBaseName string `json:"model_base_name" yaml:"model_base_name"`
+	ModelBaseName string `json:"model_base_name,omitempty" yaml:"model_base_name"`
 
-	ReasoningEffort string `json:"reasoning_effort" yaml:"reasoning_effort"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty" yaml:"reasoning_effort"`
 
-	Metadata map[string]string `json:"metadata" yaml:"metadata"`
+	Metadata map[string]string `json:"metadata,omitempty" yaml:"metadata"`
 }
 
 type ModelsDataResponse struct {
 	Object string        `json:"object"`
 	Data   []OpenAIModel `json:"data"`
+}
+
+// ModelCapabilities is a strict superset of OpenAIModel that additionally
+// describes what a model can do and which modalities it accepts/produces. It is
+// served by the LocalAI-specific /v1/models/capabilities endpoint so clients can
+// route attachments (image/audio/video) to a model only when it can handle them.
+type ModelCapabilities struct {
+	UpscaleScale     int               `json:"upscale_scale,omitempty"`
+	ThreeDOperations []ThreeDOperation `json:"three_d_operations,omitempty"`
+	ID               string            `json:"id"`
+	Object           string            `json:"object"`
+	// Capabilities are canonical usecase strings (e.g. chat, vision, transcript,
+	// tts, embeddings, image, video) plus the modifiers "tools" and "thinking".
+	Capabilities []string `json:"capabilities"`
+	// InputModalities is the subset of {text,image,audio,video} the model accepts.
+	InputModalities []string `json:"input_modalities"`
+	// OutputModalities is the subset of {text,image,audio,video} the model produces.
+	OutputModalities []string `json:"output_modalities"`
+	// ContextSize is the effective context window in tokens the backend will
+	// run with: the configured context_size, or the default when unset. 0 means
+	// the value is unknown (e.g. a loose file with no config). Clients can use
+	// this to size their context budget for auto-compaction and pruning.
+	ContextSize int `json:"context_size,omitempty"`
+}
+
+// ModelCapabilitiesResponse is the envelope returned by /v1/models/capabilities.
+// It mirrors ModelsDataResponse so a client can treat it as an enriched
+// drop-in for /v1/models.
+type ModelCapabilitiesResponse struct {
+	Object string              `json:"object"`
+	Data   []ModelCapabilities `json:"data"`
 }

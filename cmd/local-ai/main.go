@@ -1,12 +1,14 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 
 	"github.com/alecthomas/kong"
 	"github.com/joho/godotenv"
 	"github.com/mudler/LocalAI/core/cli"
+	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/internal"
 	"github.com/mudler/xlog"
 
@@ -57,10 +59,17 @@ For documentation and support:
 		),
 		kong.UsageOnError(),
 		kong.Vars{
-			"basepath":  kong.ExpandPath("."),
-			"galleries": `[{"name":"localai", "url":"github:mudler/LocalAI/gallery/index.yaml@master"}]`,
-			"backends":  `[{"name":"localai", "url":"github:mudler/LocalAI/backend/index.yaml@master"}]`,
-			"version":   internal.PrintableVersion(),
+			"basepath": kong.ExpandPath("."),
+			// Per-user temp locations for ephemeral writable content. A fixed
+			// shared name under /tmp collides across accounts on multi-user hosts
+			// (notably macOS, where /tmp is the shared /private/tmp for everyone),
+			// failing startup with "mkdir /tmp/generated/content: permission
+			// denied". See cli.DefaultGeneratedContentPath.
+			"generatedcontentpath": cli.DefaultGeneratedContentPath(),
+			"uploadpath":           cli.DefaultUploadPath(),
+			"galleries":            config.DefaultGalleriesJSON,
+			"backends":             config.DefaultBackendGalleriesJSON,
+			"version":              internal.PrintableVersion(),
 		},
 	)
 	ctx, err := k.Parse(os.Args[1:])
@@ -96,9 +105,22 @@ For documentation and support:
 
 	xlog.SetLogger(xlog.NewLogger(xlog.LogLevel(*cli.CLI.LogLevel), *cli.CLI.LogFormat, logOpts...))
 
+	// Loaded here rather than in RunCMD so `worker`, `backends install` and
+	// `models install` authenticate the same way the server does.
+	if err := cli.LoadCredentials(cli.CLI.CredentialsFile); err != nil {
+		xlog.Fatal("Error loading credentials", "error", err)
+	}
+
 	// Run the thing!
 	err = ctx.Run(&cli.CLI.Context)
 	if err != nil {
+		// A command that has already told the user what went wrong returns
+		// only a status. Logging it as well would print a bare "exit status 1"
+		// underneath the explanation they just read.
+		var reported cli.ExitCodeError
+		if errors.As(err, &reported) {
+			os.Exit(reported.Code)
+		}
 		xlog.Fatal("Error running the application", "error", err)
 	}
 }

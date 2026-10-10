@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
+import Icon from './Icon'
 
 export default function FieldBrowser({ fields, activeFieldPaths, onAddField }) {
   const [query, setQuery] = useState('')
@@ -92,7 +93,7 @@ export default function FieldBrowser({ fields, activeFieldPaths, onAddField }) {
   return (
     <div ref={wrapperRef} style={{ position: 'relative', marginBottom: 'var(--spacing-md)' }}>
       <div style={{ position: 'relative' }}>
-        <i className="fas fa-search" style={{
+        <Icon name="search" style={{
           position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)',
           color: 'var(--color-text-muted)', fontSize: '0.75rem', pointerEvents: 'none',
         }} />
@@ -158,7 +159,7 @@ export default function FieldBrowser({ fields, activeFieldPaths, onAddField }) {
                       {field.description}
                     </div>
                   )}
-                  <div style={{ fontSize: '0.6875rem', color: 'var(--color-text-muted)', marginTop: 1, fontFamily: 'monospace' }}>
+                  <div style={{ fontSize: '0.6875rem', color: 'var(--color-text-muted)', marginTop: 1, fontFamily: 'var(--font-mono)' }}>
                     {field.path}
                   </div>
                 </div>

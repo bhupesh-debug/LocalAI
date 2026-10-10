@@ -1,34 +1,65 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { useParams, useOutletContext, useNavigate } from 'react-router-dom'
+import { useParams, useOutletContext, useNavigate, useLocation } from 'react-router-dom'
+import { useTranslation } from 'react-i18next'
+import { fromState } from '../utils/editorNav'
 import { useChat } from '../hooks/useChat'
-import ModelSelector from '../components/ModelSelector'
-import { renderMarkdown, highlightAll } from '../utils/markdown'
+import { renderMarkdown, highlightAll, enhanceCodeBlocks } from '../utils/markdown'
 import { extractCodeArtifacts, renderMarkdownWithArtifacts } from '../utils/artifacts'
+// eslint-disable-next-line no-unused-vars
 import CanvasPanel from '../components/CanvasPanel'
+// eslint-disable-next-line no-unused-vars
 import { fileToBase64, modelsApi, mcpApi } from '../utils/api'
+import { readAttachmentText } from '../utils/pdf'
 import { CAP_CHAT } from '../utils/capabilities'
 import { useMCPClient } from '../hooks/useMCPClient'
-import MCPAppFrame from '../components/MCPAppFrame'
+// eslint-disable-next-line no-unused-vars
 import UnifiedMCPDropdown from '../components/UnifiedMCPDropdown'
+// eslint-disable-next-line no-unused-vars
+import HomeComposer from '../components/home/HomeComposer'
+// eslint-disable-next-line no-unused-vars
+import HomeModelPicker from '../components/home/HomeModelPicker'
+import { useModels } from '../hooks/useModels'
+import { useModelFit } from '../hooks/useModelFit'
+import { fillStyle, hostMemory, memoryFigure } from '../components/home/memory'
+import { gbLabel, gbNumber } from '../utils/modelLedger'
+import { CHAT_SLASH_GROUPS, availableChatActions } from '../components/chat/chatActions'
+import { isTyping } from '../components/chat/chatText'
+// eslint-disable-next-line no-unused-vars
+import ChatHeader from '../components/chat/ChatHeader'
+// eslint-disable-next-line no-unused-vars
+import ShortcutsDialog from '../components/chat/ShortcutsDialog'
+// eslint-disable-next-line no-unused-vars
+import ChatSettingsSheet from '../components/chat/ChatSettingsSheet'
+// eslint-disable-next-line no-unused-vars
+import FindBar from '../components/chat/FindBar'
+// eslint-disable-next-line no-unused-vars
+import LoadCard from '../components/chat/LoadCard'
+// eslint-disable-next-line no-unused-vars
+import { EmptyHead, EmptyUnder } from '../components/chat/EmptyChat'
+import { conversationsFromChats } from '../utils/homeConversations'
+import { applyFind, clearFind } from '../components/chat/findInThread'
+// eslint-disable-next-line no-unused-vars
+import HomeUndoToast from '../components/home/HomeUndoToast'
 import { loadClientMCPServers } from '../utils/mcpClientStorage'
+// eslint-disable-next-line no-unused-vars
 import ConfirmDialog from '../components/ConfirmDialog'
+// eslint-disable-next-line no-unused-vars
+import ChatsMenu from '../components/ChatsMenu'
 import { useAuth } from '../context/AuthContext'
 import { useOperations } from '../hooks/useOperations'
-import { relativeTime } from '../utils/format'
+import { useLoadedModels } from '../hooks/useLoadedModels'
+import { copyToClipboard } from '../utils/clipboard'
+import Icon from '../components/Icon'
+// eslint-disable-next-line no-unused-vars
+import Lightbox from '../components/Lightbox'
+// eslint-disable-next-line no-unused-vars
+import ChatMessage, { ActivityRow, StreamingTurn } from '../components/chat/ChatMessage'
+import { editableMessageText, withEditedMessageText, isActivityRole } from '../components/chat/chatText'
+import './chat.css'
 
-function getLastMessagePreview(chat) {
-  if (!chat.history || chat.history.length === 0) return ''
-  for (let i = chat.history.length - 1; i >= 0; i--) {
-    const msg = chat.history[i]
-    if (msg.role === 'user' || msg.role === 'assistant') {
-      const text = typeof msg.content === 'string' ? msg.content : msg.content?.[0]?.text || ''
-      return text.slice(0, 40).replace(/\n/g, ' ')
-    }
-  }
-  return ''
-}
+const FOCUS_MODE_KEY = 'localai_chat_focus_mode'
 
-function exportChatAsMarkdown(chat) {
+function serializeChatAsMarkdown(chat) {
   let md = `# ${chat.name}\n\n`
   md += `Model: ${chat.model || 'Unknown'}\n`
   md += `Date: ${new Date(chat.createdAt).toLocaleString()}\n\n---\n\n`
@@ -42,7 +73,11 @@ function exportChatAsMarkdown(chat) {
       md += `<details><summary>Thinking</summary>\n\n${msg.content}\n\n</details>\n\n`
     }
   }
-  const blob = new Blob([md], { type: 'text/markdown' })
+  return md
+}
+
+function downloadChatAsMarkdown(chat) {
+  const blob = new Blob([serializeChatAsMarkdown(chat)], { type: 'text/markdown' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
@@ -51,238 +86,29 @@ function exportChatAsMarkdown(chat) {
   URL.revokeObjectURL(url)
 }
 
-function formatToolContent(raw) {
-  try {
-    const data = JSON.parse(raw)
-    const name = data.name || 'unknown'
-    let params = data.arguments || data.input || data.result || data.parameters || {}
-    if (typeof params === 'string') {
-      try { params = JSON.parse(params) } catch (_) { /* keep as string */ }
-    }
-    const entries = typeof params === 'object' && params !== null ? Object.entries(params) : []
-    return { name, entries, fallback: null }
-  } catch (_e) {
-    return { name: null, entries: [], fallback: raw }
-  }
-}
-
-function ToolParams({ entries, fallback }) {
-  if (fallback) {
-    return <span className="chat-activity-item-text">{fallback}</span>
-  }
-  if (entries.length === 0) return null
-  return (
-    <div className="chat-activity-params">
-      {entries.map(([k, v]) => {
-        const val = typeof v === 'string' ? v : JSON.stringify(v, null, 2)
-        const isLong = val.length > 120
-        return (
-          <div key={k} className="chat-activity-param">
-            <span className="chat-activity-param-key">{k}:</span>
-            <span className={`chat-activity-param-val${isLong ? ' chat-activity-param-val-long' : ''}`}>{val}</span>
-          </div>
-        )
-      })}
-    </div>
-  )
-}
-
-function ActivityGroup({ items, updateChatSettings, activeChat, getClientForTool }) {
-  const [expanded, setExpanded] = useState(false)
-  const contentRef = useRef(null)
-
-  useEffect(() => {
-    if (expanded && contentRef.current) highlightAll(contentRef.current)
-  }, [expanded])
-
-  if (!items || items.length === 0) return null
-
-  // Separate out tool_result items that have appUI — they render outside the collapsed group
-  const appUIItems = items.filter(item => item.role === 'tool_result' && item.appUI)
-  const regularItems = items.filter(item => !(item.role === 'tool_result' && item.appUI))
-
-  const labels = regularItems.map(item => {
-    if (item.role === 'thinking' || item.role === 'reasoning') return 'Thought'
-    if (item.role === 'tool_call') {
-      try { return JSON.parse(item.content)?.name || 'Tool' } catch (_e) { return 'Tool' }
-    }
-    if (item.role === 'tool_result') {
-      try { return `${JSON.parse(item.content)?.name || 'Tool'} result` } catch (_e) { return 'Result' }
-    }
-    return item.role
-  })
-  const summary = labels.join(' → ')
-
-  return (
-    <>
-      {regularItems.length > 0 && (
-        <div className="chat-message chat-message-assistant">
-          <div className="chat-message-avatar">
-            <i className="fas fa-cogs" />
-          </div>
-          <div className="chat-activity-group">
-            <button className="chat-activity-toggle" onClick={() => setExpanded(!expanded)}>
-              <span className="chat-activity-summary">{summary}</span>
-              <i className={`fas fa-chevron-${expanded ? 'up' : 'down'}`} />
-            </button>
-            {expanded && (
-              <div className="chat-activity-details" ref={contentRef}>
-                {regularItems.map((item, idx) => {
-                  if (item.role === 'thinking' || item.role === 'reasoning') {
-                    return (
-                      <div key={idx} className="chat-activity-item chat-activity-thinking">
-                        <span className="chat-activity-item-label">Thought</span>
-                        <div className="chat-activity-item-content"
-                          dangerouslySetInnerHTML={{ __html: renderMarkdown(item.content || '') }} />
-                      </div>
-                    )
-                  }
-                  const isCall = item.role === 'tool_call'
-                  const parsed = formatToolContent(item.content)
-                  return (
-                    <div key={idx} className={`chat-activity-item ${isCall ? 'chat-activity-tool-call' : 'chat-activity-tool-result'}`}>
-                      <span className="chat-activity-item-label">{labels[idx]}</span>
-                      <ToolParams entries={parsed.entries} fallback={parsed.fallback} />
-                    </div>
-                  )
-                })}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-      {appUIItems.map((item, idx) => (
-        <div key={`appui-${idx}`} className="chat-message chat-message-assistant">
-          <div className="chat-message-avatar">
-            <i className="fas fa-puzzle-piece" />
-          </div>
-          <div className="chat-message-bubble">
-            <span className="chat-message-model">{item.appUI.toolName}</span>
-            <MCPAppFrame
-              toolName={item.appUI.toolName}
-              toolInput={item.appUI.toolInput}
-              toolResult={item.appUI.toolResult}
-              mcpClient={getClientForTool?.(item.appUI.toolName) || null}
-              toolDefinition={item.appUI.toolDefinition}
-              appHtml={item.appUI.html}
-              resourceMeta={item.appUI.meta}
-            />
-          </div>
-        </div>
-      ))}
-    </>
-  )
-}
-
-function StreamingActivity({ reasoning, toolCalls, hasResponse }) {
-  const hasContent = reasoning || (toolCalls && toolCalls.length > 0)
-  if (!hasContent) return null
-
-  const contentRef = useRef(null)
-  const [manualCollapse, setManualCollapse] = useState(null)
-
-  // Auto-expand while thinking or tool-calling, auto-collapse when response starts
-  const autoExpanded = (reasoning || (toolCalls && toolCalls.length > 0)) && !hasResponse
-  const expanded = manualCollapse !== null ? !manualCollapse : autoExpanded
-
-  // Scroll to bottom of thinking content as it streams
-  useEffect(() => {
-    if (expanded && contentRef.current) {
-      contentRef.current.scrollTop = contentRef.current.scrollHeight
-    }
-  }, [reasoning, expanded])
-
-  // Reset manual override when streaming state changes significantly
-  useEffect(() => {
-    setManualCollapse(null)
-  }, [hasResponse])
-
-  const lastTool = toolCalls && toolCalls.length > 0 ? toolCalls[toolCalls.length - 1] : null
-  const label = reasoning
-    ? 'Thinking...'
-    : lastTool
-      ? (lastTool.type === 'tool_call' ? lastTool.name : `${lastTool.name} result`)
-      : ''
-
-  return (
-    <div className="chat-message chat-message-assistant">
-      <div className="chat-message-avatar">
-        <i className="fas fa-cogs" />
-      </div>
-      <div className="chat-activity-group chat-activity-streaming">
-        <button className="chat-activity-toggle" onClick={() => setManualCollapse(expanded)}>
-          <span className={`chat-activity-summary${!expanded ? ' chat-activity-shimmer' : ''}`}>
-            {label}
-          </span>
-          <i className={`fas fa-chevron-${expanded ? 'up' : 'down'}`} />
-        </button>
-        {expanded && reasoning && (
-          <div className="chat-activity-details">
-            <div className="chat-activity-item chat-activity-thinking">
-              <div className="chat-activity-item-content chat-activity-live" ref={contentRef}
-                dangerouslySetInnerHTML={{ __html: renderMarkdown(reasoning) }} />
-            </div>
-          </div>
-        )}
-        {expanded && toolCalls && toolCalls.length > 0 && (
-          <div className="chat-activity-details">
-            {toolCalls.map((tc, idx) => {
-              if (tc.type === 'tool_result') {
-                return (
-                  <div key={idx} className="chat-activity-item chat-activity-tool-result">
-                    <span className="chat-activity-item-label">{tc.name} result</span>
-                    <div className="chat-activity-item-content"
-                      dangerouslySetInnerHTML={{ __html: renderMarkdown(tc.result || '') }} />
-                  </div>
-                )
-              }
-              const parsed = formatToolContent(JSON.stringify(tc, null, 2))
-              return (
-                <div key={idx} className="chat-activity-item chat-activity-tool-call">
-                  <span className="chat-activity-item-label">{tc.name || tc.type}</span>
-                  <ToolParams entries={parsed.entries} fallback={parsed.fallback} />
-                </div>
-              )
-            })}
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
-
-function UserMessageContent({ content, files }) {
-  const text = typeof content === 'string' ? content : content?.[0]?.text || ''
-  return (
-    <>
-      <div dangerouslySetInnerHTML={{ __html: text.replace(/\n/g, '<br>') }} />
-      {files && files.length > 0 && (
-        <div className="chat-message-files">
-          {files.map((f, i) => (
-            <span key={i} className="chat-file-inline">
-              <i className={`fas ${f.type === 'image' ? 'fa-image' : f.type === 'audio' ? 'fa-headphones' : 'fa-file'}`} />
-              {f.name}
-            </span>
-          ))}
-        </div>
-      )}
-      {Array.isArray(content) && content.filter(c => c.type === 'image_url').map((img, i) => (
-        <img key={i} src={img.image_url.url} alt="attached" className="chat-inline-image" />
-      ))}
-    </>
-  )
+// formatLoadEta renders the server's remaining-seconds estimate. The server
+// omits it entirely until its observed transfer rate is meaningful, so anything
+// arriving here is worth showing.
+function formatLoadEta(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return ''
+  if (seconds < 60) return `${Math.round(seconds)}s`
+  const minutes = Math.round(seconds / 60)
+  if (minutes < 60) return `${minutes} min`
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
 }
 
 export default function Chat() {
   const { model: urlModel } = useParams()
   const { addToast } = useOutletContext()
   const navigate = useNavigate()
+  const location = useLocation()
+  const { t } = useTranslation('chat')
   const { isAdmin } = useAuth()
   const { operations } = useOperations()
   const {
     chats, activeChat, activeChatId, isStreaming, streamingChatId, streamingContent,
-    streamingReasoning, streamingToolCalls, tokensPerSecond, maxTokensPerSecond,
-    addChat, switchChat, deleteChat, deleteAllChats, renameChat, updateChatSettings,
+    streamingReasoning, streamingToolCalls, tokensPerSecond, maxTokensPerSecond, modelLoading,
+    addChat, forkChat, switchChat, deleteChat, deleteAllChats, renameChat, updateChatSettings,
     sendMessage, stopGeneration, clearHistory, getContextUsagePercent, addMessage,
   } = useChat(urlModel || '')
 
@@ -292,32 +118,65 @@ export default function Chat() {
     return operations.find(op => op.taskType === 'staging' && op.name === activeChat.model) || null
   }, [operations, isStreaming, activeChat?.model])
 
+  // What to show instead of the thinking dots while the model is not up yet.
+  // The load job wins over the staging operation: it is authoritative across
+  // frontend replicas and names the phase (installing / staging / loading),
+  // where the operation only knows about a byte transfer this replica is
+  // performing. The operation stays as the fallback for a transfer with no job
+  // attached to this request (a reconciler scale-up, for instance).
+  const loadProgress = useMemo(() => {
+    if (modelLoading) {
+      const eta = formatLoadEta(modelLoading.eta_seconds)
+      return {
+        label: t(`streaming.modelState.${modelLoading.state}`, t('streaming.transferring'))
+          + (modelLoading.node ? ` ${t('streaming.onNode', { node: modelLoading.node })}` : ''),
+        progress: modelLoading.progress || 0,
+        detail: eta ? t('streaming.eta', { value: eta }) : '',
+        sent: modelLoading.bytes_sent || 0,
+        total: modelLoading.total_bytes || 0,
+      }
+    }
+    if (stagingOp) {
+      return {
+        label: stagingOp.nodeName
+          ? t('streaming.transferringTo', { node: stagingOp.nodeName })
+          : t('streaming.transferring'),
+        progress: stagingOp.progress || 0,
+        detail: stagingOp.message || '',
+      }
+    }
+    return null
+  }, [modelLoading, stagingOp, t])
+
   const [input, setInput] = useState('')
   const [files, setFiles] = useState([])
   const [showSettings, setShowSettings] = useState(false)
-  const [editingName, setEditingName] = useState(null)
-  const [editName, setEditName] = useState('')
   const [mcpAvailable, setMcpAvailable] = useState(false)
   const [mcpServerList, setMcpServerList] = useState([])
   const [mcpServersLoading, setMcpServersLoading] = useState(false)
-  const [mcpServerCache, setMcpServerCache] = useState({})
+  const [mcpServerListError, setMcpServerListError] = useState('')
   const [mcpPromptList, setMcpPromptList] = useState([])
   const [mcpPromptsLoading, setMcpPromptsLoading] = useState(false)
   const [mcpPromptArgsDialog, setMcpPromptArgsDialog] = useState(null)
   const [mcpPromptArgsValues, setMcpPromptArgsValues] = useState({})
   const [mcpResourceList, setMcpResourceList] = useState([])
   const [mcpResourcesLoading, setMcpResourcesLoading] = useState(false)
-  const [chatSearch, setChatSearch] = useState('')
   const [modelInfo, setModelInfo] = useState(null)
-  const [showModelInfo, setShowModelInfo] = useState(false)
-  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [find, setFind] = useState({ open: false, query: '', index: 0, count: 0, token: 0 })
   const [canvasMode, setCanvasMode] = useState(false)
   const [canvasOpen, setCanvasOpen] = useState(false)
   const [selectedArtifactId, setSelectedArtifactId] = useState(null)
   const [clientMCPServers, setClientMCPServers] = useState(() => loadClientMCPServers())
   const [confirmDialog, setConfirmDialog] = useState(null)
-  const [completionGlowIdx, setCompletionGlowIdx] = useState(-1)
-  const prevStreamingRef = useRef(false)
+  const [lightbox, setLightbox] = useState(null)
+  const [renaming, setRenaming] = useState(false)
+  const [showShortcuts, setShowShortcuts] = useState(false)
+  const [pendingDelete, setPendingDelete] = useState(null)
+  const pendingDeleteRef = useRef(null)
+  const [editingMessageIndex, setEditingMessageIndex] = useState(null)
+  const [messageEditDraft, setMessageEditDraft] = useState('')
+  const pendingArtifactRef = useRef(null)
+  const { ids: loadedIds } = useLoadedModels()
   const {
     connect: mcpConnect, disconnect: mcpDisconnect, disconnectAll: mcpDisconnectAll,
     getToolsForLLM, isClientTool, executeTool, connectionStatuses, getConnectedTools,
@@ -327,11 +186,46 @@ export default function Chat() {
   const fileInputRef = useRef(null)
   const messagesRef = useRef(null)
   const textareaRef = useRef(null)
+  const stickToBottomRef = useRef(true)
+  const [scrolledUp, setScrolledUp] = useState(false)
+  const chatsMenuRef = useRef(null)
+  const pickerRef = useRef(null)
+  const { models: chatModels, loading: chatModelsLoading } = useModels(CAP_CHAT)
+  const [fitOpenCount, setFitOpenCount] = useState(0)
+  const modelNames = useMemo(() => chatModels.map(m => m.id), [chatModels])
+  const modelFit = useModelFit({ openCount: fitOpenCount, names: modelNames, contextSize: activeChat?.contextSize })
+  const onPickerOpen = useCallback(() => setFitOpenCount(n => n + 1), [])
+  const hasThread = (activeChat?.history?.length || 0) > 0
+  const slashConfig = useMemo(() => ({
+    actions: availableChatActions({ isAdmin, hasModels: chatModels.length > 0, hasThread }),
+    groups: CHAT_SLASH_GROUPS,
+    label: (a) => t(`slash.${a.id}.label`),
+    desc: (a) => t(`slash.${a.id}.desc`),
+    groupLabel: (g) => t(`slash.group.${g}`),
+  }), [isAdmin, chatModels.length, hasThread, t])
+
+  // Focus mode: once a conversation has at least one message we slim the
+  // surrounding chrome (collapse the global app rail, fade non-essential
+  // header items). Esc gives the user back the full chrome for the rest of
+  // this session. The settings drawer offers a persistent opt-out.
+  const isInConversation = (activeChat?.history?.length || 0) > 0
+  const [focusOverride, setFocusOverride] = useState(false)
+  const [focusModeEnabled, setFocusModeEnabled] = useState(() => {
+    try { return localStorage.getItem(FOCUS_MODE_KEY) !== 'false' } catch (_) { return true }
+  })
+  const focusActive = focusModeEnabled && isInConversation && !focusOverride
+  const prevAppCollapseRef = useRef(null)
+
+  const toggleFocusMode = (next) => {
+    setFocusModeEnabled(next)
+    try { localStorage.setItem(FOCUS_MODE_KEY, String(next)) } catch (_) {}
+  }
 
   const artifacts = useMemo(
     () => canvasMode ? extractCodeArtifacts(activeChat?.history, 'role', 'assistant') : [],
     [activeChat?.history, canvasMode]
   )
+  const modelWarm = !!activeChat?.model && loadedIds.has(activeChat.model)
 
   const prevArtifactCountRef = useRef(0)
   useEffect(() => {
@@ -339,24 +233,13 @@ export default function Chat() {
   }, [activeChat?.id])
   useEffect(() => {
     if (artifacts.length > prevArtifactCountRef.current && artifacts.length > 0) {
-      setSelectedArtifactId(artifacts[artifacts.length - 1].id)
+      // A block opened from its own Canvas button is the one to show.
+      setSelectedArtifactId(pendingArtifactRef.current || artifacts[artifacts.length - 1].id)
+      pendingArtifactRef.current = null
       if (!canvasOpen) setCanvasOpen(true)
     }
     prevArtifactCountRef.current = artifacts.length
   }, [artifacts])
-
-  // Completion glow: when streaming finishes, briefly highlight last assistant message
-  useEffect(() => {
-    if (prevStreamingRef.current && !isStreaming && activeChat?.history?.length > 0) {
-      const lastIdx = activeChat.history.length - 1
-      if (activeChat.history[lastIdx]?.role === 'assistant') {
-        setCompletionGlowIdx(lastIdx)
-        const timer = setTimeout(() => setCompletionGlowIdx(-1), 600)
-        return () => clearTimeout(timer)
-      }
-    }
-    prevStreamingRef.current = isStreaming
-  }, [isStreaming, activeChat?.history?.length])
 
   // Check MCP availability and fetch model config (admin-only endpoint)
   useEffect(() => {
@@ -381,22 +264,30 @@ export default function Chat() {
   const fetchMcpServers = useCallback(async () => {
     const model = activeChat?.model
     if (!model) return
-    if (mcpServerCache[model]) {
-      setMcpServerList(mcpServerCache[model])
-      return
-    }
     setMcpServersLoading(true)
+    setMcpServerListError('')
     try {
       const data = await mcpApi.listServers(model)
       const servers = data?.servers || []
       setMcpServerList(servers)
-      setMcpServerCache(prev => ({ ...prev, [model]: servers }))
-    } catch (_e) {
+
+      // A previously selected server may become unavailable between requests.
+      // Remove it from request metadata while leaving it visible with its error.
+      if (activeChat) {
+        const unavailable = new Set(servers.filter(server => server.error).map(server => server.name))
+        const current = activeChat.mcpServers || []
+        const availableSelection = current.filter(name => !unavailable.has(name))
+        if (availableSelection.length !== current.length) {
+          updateChatSettings(activeChat.id, { mcpServers: availableSelection })
+        }
+      }
+    } catch (e) {
       setMcpServerList([])
+      setMcpServerListError(e.body?.message || e.message || 'Failed to discover MCP servers')
     } finally {
       setMcpServersLoading(false)
     }
-  }, [activeChat?.model, mcpServerCache])
+  }, [activeChat, updateChatSettings])
 
   const toggleMcpServer = useCallback((serverName) => {
     if (!activeChat) return
@@ -521,6 +412,33 @@ export default function Chat() {
     updateChatSettings(activeChat.id, { clientMCPServers: next })
   }, [activeChat, updateChatSettings])
 
+  const startMessageEdit = useCallback((index, message) => {
+    const text = editableMessageText(message)
+    if (text === null) return
+    setEditingMessageIndex(index)
+    setMessageEditDraft(text)
+  }, [])
+
+  const cancelMessageEdit = useCallback(() => {
+    setEditingMessageIndex(null)
+    setMessageEditDraft('')
+  }, [])
+
+  const saveMessageEdit = useCallback(() => {
+    if (!activeChat || isStreaming || editingMessageIndex === null || !messageEditDraft.trim()) return
+    const message = activeChat.history[editingMessageIndex]
+    if (!message || editableMessageText(message) === null) return
+    const history = activeChat.history.map((item, index) =>
+      index === editingMessageIndex ? withEditedMessageText(item, messageEditDraft) : item
+    )
+    updateChatSettings(activeChat.id, { history })
+    cancelMessageEdit()
+  }, [activeChat, isStreaming, editingMessageIndex, messageEditDraft, updateChatSettings, cancelMessageEdit])
+
+  useEffect(() => {
+    cancelMessageEdit()
+  }, [activeChat?.id, isStreaming, cancelMessageEdit])
+
   // Load initial message from home page
   const homeDataProcessed = useRef(false)
   useEffect(() => {
@@ -531,8 +449,19 @@ export default function Chat() {
       try {
         const data = JSON.parse(stored)
         localStorage.removeItem('localai_index_chat_data')
-        if (data.message) {
-          // Create a new chat when coming from home
+
+        // Three entry shapes from Home:
+        //   - "compose-and-send": data.message present → open new chat,
+        //     prefill the composer, click submit.
+        //   - "open-assistant": no message, just data.localaiAssistant → open
+        //     a fresh chat already in admin mode so the wizard can fire.
+        //   - "new-chat": no message, data.newChat only → open an empty chat
+        //     on the chosen model (the /new action on the command bar).
+        const hasMessage = !!data.message
+        const wantsAssistant = !!data.localaiAssistant
+        const wantsNewChat = !!data.newChat
+
+        if (hasMessage || wantsAssistant || wantsNewChat) {
           let targetChat = activeChat
           if (data.newChat) {
             targetChat = addChat(data.model || '', '', data.mcpMode || false)
@@ -550,28 +479,167 @@ export default function Chat() {
           if (data.clientMCPServers?.length > 0 && targetChat) {
             updateChatSettings(targetChat.id, { clientMCPServers: data.clientMCPServers })
           }
-          setInput(data.message)
-          if (data.files) setFiles(data.files)
-          setTimeout(() => {
-            const submitBtn = document.getElementById('chat-submit-btn')
-            submitBtn?.click()
-          }, 100)
+          if (wantsAssistant && targetChat) {
+            updateChatSettings(targetChat.id, { localaiAssistant: true })
+          }
+          if (hasMessage) {
+            setInput(data.message)
+            if (data.files) setFiles(data.files)
+            setTimeout(() => {
+              const submitBtn = document.getElementById('chat-submit-btn')
+              submitBtn?.click()
+            }, 100)
+          }
         }
       } catch (_e) { /* ignore */ }
     }
   }, [])
 
-  // Auto-scroll
+  // Track whether the user is pinned to the bottom. If they scroll up
+  // while a response is streaming, stop forcing them back down.
   useEffect(() => {
+    const el = messagesRef.current
+    if (!el) return
+    const onScroll = () => {
+      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+      stickToBottomRef.current = distanceFromBottom < 80
+      setScrolledUp(distanceFromBottom > 160)
+    }
+    el.addEventListener('scroll', onScroll, { passive: true })
+    return () => el.removeEventListener('scroll', onScroll)
+  }, [])
+
+  // Auto-scroll only when the user hasn't scrolled away from the bottom.
+  useEffect(() => {
+    if (!stickToBottomRef.current) return
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [activeChat?.history, streamingContent, streamingReasoning, streamingToolCalls])
 
-  // Highlight code blocks
+  // When switching chats, snap to bottom and re-pin. Also reset the
+  // user's focus-mode override — each chat starts fresh.
   useEffect(() => {
-    if (messagesRef.current) {
-      highlightAll(messagesRef.current)
+    stickToBottomRef.current = true
+    setScrolledUp(false)
+    messagesEndRef.current?.scrollIntoView({ behavior: 'auto' })
+    setFocusOverride(false)
+  }, [activeChat?.id])
+
+  // Auto-collapse the global app rail when a conversation begins, and
+  // restore the previous collapsed state when the user goes back to an
+  // empty chat (or overrides focus with Esc). We feed into the existing
+  // sidebar-collapse event bus so App.jsx needs no awareness of focus mode.
+  useEffect(() => {
+    if (focusActive) {
+      if (prevAppCollapseRef.current === null) {
+        try {
+          prevAppCollapseRef.current = localStorage.getItem('localai_sidebar_collapsed') === 'true'
+        } catch (_) { prevAppCollapseRef.current = false }
+      }
+      window.dispatchEvent(new CustomEvent('sidebar-collapse', { detail: { collapsed: true } }))
+    } else if (prevAppCollapseRef.current !== null) {
+      window.dispatchEvent(new CustomEvent('sidebar-collapse', { detail: { collapsed: prevAppCollapseRef.current } }))
+      prevAppCollapseRef.current = null
     }
-  }, [activeChat?.history, streamingContent])
+  }, [focusActive])
+
+  // Global keybindings: Cmd/Ctrl+K opens the chats menu and Cmd/Ctrl+Shift+F
+  // searches this chat. Esc stops a reply that is streaming, else closes the
+  // search, else closes the canvas; it also exits focus mode while that is
+  // engaged. None of that fires while a menu or dialog is open: those take
+  // their own Esc first.
+  const escapeRef = useRef({})
+  escapeRef.current = { streaming: isStreaming, stop: stopGeneration, findOpen: find.open, canvasOpen }
+  useEffect(() => {
+    const onKey = (e) => {
+      const isMod = e.metaKey || e.ctrlKey
+      if (isMod && (e.key === 'k' || e.key === 'K')) {
+        e.preventDefault()
+        chatsMenuRef.current?.toggle()
+        return
+      }
+      if (isMod && e.shiftKey && (e.key === 'f' || e.key === 'F')) {
+        e.preventDefault()
+        setFind(f => ({ ...f, open: true, token: f.token + 1 }))
+        return
+      }
+      // "/" from anywhere that is not a text field starts a command, as on Home.
+      if (e.key === '/' && !isMod && !e.altKey && !isTyping(document.activeElement) && !document.querySelector('[role="dialog"], [role="alertdialog"]')) {
+        const el = textareaRef.current
+        if (el) {
+          e.preventDefault()
+          setInput('/')
+          el.focus()
+        }
+        return
+      }
+      const overlay = document.querySelector('.home-menu, .cx-menu, .dk-cmdlist, [role="dialog"], [role="alertdialog"]')
+      if (e.key === 'Escape' && !overlay) {
+        const cur = escapeRef.current
+        if (cur.streaming) cur.stop()
+        else if (cur.findOpen) setFind(f => ({ ...f, open: false, query: '', index: 0, count: 0 }))
+        else if (cur.canvasOpen) setCanvasOpen(false)
+      }
+      if (e.key === 'Escape' && focusActive) {
+        // Don't fight the chats menu / settings sheet / dialogs: they
+        // each handle their own Esc and stop propagation when open.
+        setFocusOverride(true)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [focusActive])
+
+  // Find in chat: mark the matches in the thread, then show the current one.
+  // The search is the browser's own, over what this page has loaded.
+  useEffect(() => {
+    const root = messagesRef.current
+    if (!root) return
+    if (!find.open || !find.query) {
+      clearFind(root)
+      setFind(f => (f.count === 0 ? f : { ...f, count: 0 }))
+      return
+    }
+    const marks = applyFind(root, find.query)
+    setFind(f => (f.count === marks.length ? f : { ...f, count: marks.length, index: Math.min(f.index, Math.max(0, marks.length - 1)) }))
+  }, [find.open, find.query, activeChat?.history, canvasMode, isStreaming])
+
+  useEffect(() => {
+    const root = messagesRef.current
+    if (!root) return
+    root.querySelectorAll('mark.cx-hit').forEach((mark, i) => {
+      if (i === find.index) {
+        mark.setAttribute('data-cur', '')
+        mark.scrollIntoView({ block: 'center' })
+      } else {
+        mark.removeAttribute('data-cur')
+      }
+    })
+  }, [find.index, find.count, find.query])
+
+  // Highlight code blocks + add per-block copy buttons. A MutationObserver on
+  // the messages container is more reliable than render-keyed effects: it fires
+  // for loaded/switched chats AND for streaming token updates, regardless of
+  // render timing. The observer is disconnected while we mutate so our own
+  // highlight/enhance edits don't retrigger it.
+  useEffect(() => {
+    const el = messagesRef.current
+    if (!el) return
+    let obs
+    const labels = {
+      copyLabel: t('actions.copy'),
+      canvasLabel: canvasMode ? undefined : t('input.canvasLabel'),
+      selector: '.cx-prose pre:not([data-enhanced])',
+    }
+    const run = () => {
+      obs?.disconnect()
+      highlightAll(el)
+      enhanceCodeBlocks(el, labels)
+      obs?.observe(el, { childList: true, subtree: true })
+    }
+    obs = new MutationObserver(run)
+    run()
+    return () => obs.disconnect()
+  }, [activeChat?.id, canvasMode, t])
 
   // Auto-grow textarea
   const autoGrowTextarea = useCallback(() => {
@@ -585,11 +653,26 @@ export default function Chat() {
     autoGrowTextarea()
   }, [input, autoGrowTextarea])
 
-  // Event delegation for artifact cards
+  // Event delegation for artifact cards and the Canvas button on a code block.
   useEffect(() => {
     const el = messagesRef.current
-    if (!el || !canvasMode) return
+    if (!el) return
     const handler = (e) => {
+      const canvasBtn = e.target.closest('.code-canvas-btn')
+      if (canvasBtn) {
+        const text = canvasBtn.closest('.code-block')?.querySelector('pre code')?.textContent || ''
+        const at = Number(canvasBtn.closest('[data-index]')?.dataset.index)
+        const all = extractCodeArtifacts(activeChat?.history, 'role', 'assistant')
+        const same = (a) => a.code.trim() === text.trim()
+        const match = all.find(a => a.messageIndex === at && same(a)) || all.find(same)
+        if (!match) return
+        pendingArtifactRef.current = match.id
+        setSelectedArtifactId(match.id)
+        setCanvasMode(true)
+        setCanvasOpen(true)
+        return
+      }
+      if (!canvasMode) return
       const openBtn = e.target.closest('.artifact-card-open')
       const downloadBtn = e.target.closest('.artifact-card-download')
       const card = e.target.closest('.artifact-card')
@@ -618,27 +701,55 @@ export default function Chat() {
     }
     el.addEventListener('click', handler)
     return () => el.removeEventListener('click', handler)
-  }, [canvasMode, artifacts])
+  }, [canvasMode, artifacts, activeChat?.history])
 
-  const handleFileChange = useCallback(async (e) => {
+  // Files from any of the three attach buttons. Text and PDF files carry their
+  // extracted text with them; a file that cannot be read is skipped with a toast.
+  const attachFiles = useCallback(async (_kind, list) => {
     const newFiles = []
-    for (const file of e.target.files) {
+    for (const file of list) {
       const base64 = await fileToBase64(file)
       const entry = { name: file.name, type: file.type, base64 }
-      if (!file.type.startsWith('image/') && !file.type.startsWith('audio/')) {
-        entry.textContent = await file.text().catch(() => '')
+      if (!file.type.startsWith('image/') && !file.type.startsWith('audio/') && !file.type.startsWith('video/')) {
+        try {
+          entry.textContent = await readAttachmentText(file)
+        } catch {
+          addToast(t('toasts.pdfReadFailed', { name: file.name }), 'error')
+          continue
+        }
       }
       newFiles.push(entry)
     }
     setFiles(prev => [...prev, ...newFiles])
-    e.target.value = ''
+  }, [addToast, t])
+
+  const handlePaste = useCallback(async (e) => {
+    const items = e.clipboardData?.items
+    if (!items) return
+    const images = Array.from(items)
+      .filter(item => item.kind === 'file' && item.type.startsWith('image/'))
+      .map(item => item.getAsFile())
+      .filter(Boolean)
+    if (images.length === 0) return
+    // A pasted image attaches as a file rather than inserting into the text.
+    e.preventDefault()
+    // Clipboard images arrive unnamed or as a generic "image.png"; give each
+    // a unique, typed name so multiple pastes don't collide.
+    const newFiles = await Promise.all(images.map(async (file, i) => {
+      const name = (file.name && file.name !== 'image.png')
+        ? file.name
+        : `pasted-image-${i + 1}.${(file.type.split('/')[1] || 'png').replace('+xml', '')}`
+      return { name, type: file.type, base64: await fileToBase64(file) }
+    }))
+    setFiles(prev => [...prev, ...newFiles])
   }, [])
 
   const handleSend = useCallback(async () => {
+    if (isStreaming) return
     const msg = input.trim()
     if (!msg && files.length === 0) return
     if (!activeChat?.model) {
-      addToast('Please select a model', 'warning')
+      addToast(t('toasts.selectModel'), 'warning')
       return
     }
     setInput('')
@@ -664,653 +775,498 @@ export default function Chat() {
       },
     } : {}
     await sendMessage(msg, files, mcpOptions)
-  }, [input, files, activeChat, sendMessage, addToast, getToolsForLLM, isClientTool, executeTool, hasAppUI, getAppResource, getToolDefinition])
+  }, [isStreaming, input, files, activeChat, sendMessage, addToast, getToolsForLLM, isClientTool, executeTool, hasAppUI, getAppResource, getToolDefinition])
 
-  const handleRegenerate = useCallback(async () => {
+  const handleRegenerate = useCallback(async (targetIndex) => {
     if (!activeChat || isStreaming) return
     const history = activeChat.history
-    let lastUserMsg = null
-    let lastUserFiles = null
-    for (let i = history.length - 1; i >= 0; i--) {
-      if (history[i].role === 'user') {
-        lastUserMsg = typeof history[i].content === 'string' ? history[i].content : history[i].content?.[0]?.text || ''
-        lastUserFiles = history[i].files || []
-        break
-      }
+    const end = typeof targetIndex === 'number' ? targetIndex : history.length
+    // Nearest user message at or before the target answer.
+    let userIdx = -1
+    for (let i = Math.min(end, history.length) - 1; i >= 0; i--) {
+      if (history[i].role === 'user') { userIdx = i; break }
     }
-    if (!lastUserMsg) return
-
-    // Remove everything after and including the last user message
-    const newHistory = []
-    let foundLastUser = false
-    for (let i = history.length - 1; i >= 0; i--) {
-      if (!foundLastUser && history[i].role === 'user') {
-        foundLastUser = true
-        continue
-      }
-      if (foundLastUser) {
-        newHistory.unshift(history[i])
-      }
-    }
-    updateChatSettings(activeChat.id, { history: newHistory })
-    await sendMessage(lastUserMsg, lastUserFiles)
+    if (userIdx === -1) return
+    // Reuse the original message's content verbatim (not re-extracted text):
+    // it already has any file text / image_url / audio_url / video_url parts
+    // embedded from when it was first sent, which display-only file metadata
+    // can't reconstruct.
+    const userContent = history[userIdx].content
+    const userFiles = history[userIdx].files || []
+    // Drop the user turn and everything after it; sendMessage re-appends it.
+    // Thread the truncated history through explicitly: updateChatSettings only
+    // schedules a state update, so sendMessage's closure would otherwise read
+    // the stale pre-truncation history for the outbound API payload.
+    const baseHistory = history.slice(0, userIdx)
+    updateChatSettings(activeChat.id, { history: baseHistory })
+    await sendMessage(userContent, userFiles, { baseHistory, prebuiltContent: true })
   }, [activeChat, isStreaming, sendMessage, updateChatSettings])
 
-  const handleKeyDown = (e) => {
-    // Only Enter (no modifiers, no IME composition) sends.
-    // Shift+Enter, Ctrl+Enter, Meta+Enter, Alt+Enter all fall through to default textarea behavior (newline).
-    if (
-      e.key === 'Enter' &&
-      !e.shiftKey &&
-      !e.ctrlKey &&
-      !e.metaKey &&
-      !e.altKey &&
-      !e.nativeEvent?.isComposing &&
-      e.keyCode !== 229
-    ) {
-      e.preventDefault()
-      handleSend()
+  // Up in an empty box edits your last message, as in most chat apps.
+  const onComposerKey = (e) => {
+    if (e.key !== 'ArrowUp' || input || e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return false
+    if (isStreaming || !activeChat) return false
+    for (let i = activeChat.history.length - 1; i >= 0; i--) {
+      const msg = activeChat.history[i]
+      if (msg.role === 'user' && editableMessageText(msg) !== null) {
+        e.preventDefault()
+        startMessageEdit(i, msg)
+        return true
+      }
     }
+    return false
   }
 
-  const startRename = (chatId, currentName) => {
-    setEditingName(chatId)
-    setEditName(currentName)
-  }
-
-  const finishRename = () => {
-    if (editingName && editName.trim()) {
-      renameChat(editingName, editName.trim())
-    }
-    setEditingName(null)
-  }
-
-  const copyMessage = (content) => {
+  const copyMessage = async (content) => {
     const text = typeof content === 'string' ? content : content?.[0]?.text || ''
-    navigator.clipboard.writeText(text)
-    addToast('Copied to clipboard', 'success', 2000)
+    const ok = await copyToClipboard(text)
+    if (ok) {
+      addToast(t('toasts.copied'), 'success', 2000)
+    } else {
+      addToast(t('toasts.copyFailed'), 'error', 3000)
+    }
   }
 
-  // Filter chats by search
-  const filteredChats = chatSearch.trim()
-    ? chats.filter(c => {
-      const q = chatSearch.toLowerCase()
-      if ((c.name || '').toLowerCase().includes(q)) return true
-      return c.history?.some(m => {
-        const t = typeof m.content === 'string' ? m.content : m.content?.[0]?.text || ''
-        return t.toLowerCase().includes(q)
-      })
+  const copyChatAsMarkdown = async (chat) => {
+    const ok = await copyToClipboard(serializeChatAsMarkdown(chat))
+    addToast(ok ? t('toasts.chatCopied') : t('toasts.copyFailed'), ok ? 'success' : 'error', ok ? 2000 : 3000)
+  }
+
+  // The thread as rows: a run of reasoning and tool entries folds into the
+  // assistant message that follows it, or stands alone when none does yet.
+  const history = activeChat?.history
+  const rows = useMemo(() => {
+    const out = []
+    let buf = []
+    ;(history || []).forEach((msg, i) => {
+      if (isActivityRole(msg.role)) { buf.push(msg); return }
+      if (buf.length > 0 && msg.role !== 'assistant') {
+        out.push({ kind: 'activity', key: i, items: buf })
+        buf = []
+      }
+      out.push({ kind: 'msg', index: i, msg, activity: buf.length > 0 ? buf : null })
+      buf = []
     })
-    : chats
+    if (buf.length > 0) out.push({ kind: 'activity', key: 'end', items: buf })
+    return out
+  }, [history])
+
+  // Deleting a chat is final when its undo time ends. Until then the chat stays
+  // in storage and only its row is hidden; if it was the open one, the next
+  // chat opens in its place.
+  const deleteRef = useRef(deleteChat)
+  deleteRef.current = deleteChat
+  const commitDelete = useCallback(() => {
+    const pending = pendingDeleteRef.current
+    if (!pending) return
+    pendingDeleteRef.current = null
+    setPendingDelete(null)
+    deleteRef.current(pending.id)
+  }, [])
+  const commitRef = useRef(commitDelete)
+  commitRef.current = commitDelete
+  useEffect(() => () => commitRef.current(), [])
+
+  const visibleChats = useMemo(
+    () => chats.filter(c => c.id !== pendingDelete?.id),
+    [chats, pendingDelete],
+  )
+
+  const requestDelete = (chat) => {
+    commitDelete()
+    const wasActive = chat.id === activeChatId
+    if (wasActive) {
+      const next = chats.find(c => c.id !== chat.id)
+      if (next) switchChat(next.id)
+    }
+    const pending = { id: chat.id, name: chat.name, wasActive }
+    pendingDeleteRef.current = pending
+    setPendingDelete(pending)
+  }
+
+  const undoDelete = () => {
+    const pending = pendingDeleteRef.current
+    pendingDeleteRef.current = null
+    setPendingDelete(null)
+    if (pending?.wasActive) switchChat(pending.id)
+  }
+
+  // The message component is memoised, so it gets one stable set of actions
+  // that always call the latest handlers.
+  const actionsRef = useRef(null)
+  actionsRef.current = {
+    copyMessage, startMessageEdit, saveMessageEdit, cancelMessageEdit,
+    handleRegenerate, forkChat, addToast, t, activeChat,
+  }
+  const messageActions = useMemo(() => ({
+    copy: (content) => actionsRef.current.copyMessage(content),
+    startEdit: (index, message) => actionsRef.current.startMessageEdit(index, message),
+    saveEdit: () => actionsRef.current.saveMessageEdit(),
+    cancelEdit: () => actionsRef.current.cancelMessageEdit(),
+    regenerate: (index) => actionsRef.current.handleRegenerate(index),
+    branch: (index) => {
+      const a = actionsRef.current
+      a.forkChat(a.activeChat.id, index + 1)
+      a.addToast(a.t('toasts.forked'), 'success', 2000)
+    },
+    focusRelative: (index, delta) => {
+      const els = Array.from(messagesRef.current?.querySelectorAll('[data-testid="chat-message"]') || [])
+      const at = els.findIndex(el => Number(el.dataset.index) === index)
+      const next = els[at + delta]
+      if (next) { next.focus(); next.scrollIntoView({ block: 'nearest' }) }
+    },
+  }), [])
+  const openImage = useCallback((images, index) => setLightbox({ images, index }), [])
 
   const contextPercent = getContextUsagePercent()
 
+  const promptDeleteAll = () => setConfirmDialog({
+    title: t('deleteAllDialog.title'),
+    message: t('deleteAllDialog.message'),
+    confirmLabel: t('deleteAllDialog.confirm'),
+    danger: true,
+    onConfirm: () => { setConfirmDialog(null); deleteAllChats() },
+  })
+
+  const promptClear = () => setConfirmDialog({
+    title: t('clearDialog.title'),
+    message: t('clearDialog.message'),
+    confirmLabel: t('clearDialog.confirm'),
+    danger: true,
+    onConfirm: () => { setConfirmDialog(null); clearHistory(activeChat.id) },
+  })
+
   if (!activeChat) return null
 
+  const openFind = () => setFind(f => ({ ...f, open: true, token: f.token + 1 }))
+  const closeFind = () => {
+    clearFind(messagesRef.current)
+    setFind(f => ({ ...f, open: false, query: '', index: 0, count: 0 }))
+    textareaRef.current?.focus()
+  }
+  const stepFind = (delta) => setFind(f => (f.count === 0 ? f : { ...f, index: (f.index + delta + f.count) % f.count }))
+
+  const isEmpty = activeChat.history.length === 0 && !isStreaming
+  const noModel = !activeChat.model && !chatModelsLoading && chatModels.length === 0
+  const conversations = isEmpty
+    ? conversationsFromChats(visibleChats.filter(c => c.id !== activeChatId))
+    : []
+
+  const toggleCanvasMode = () => {
+    const next = !canvasMode
+    setCanvasMode(next)
+    if (!next) setCanvasOpen(false)
+  }
+
+  // What a row of the model list says: whether it is loaded, what it can do and,
+  // where the server can estimate it, how it fits this machine. A model with no
+  // estimate gets no fit text.
+  const describeModel = (name, warm) => {
+    const vision = chatModels.find(m => m.id === name)?.capabilities?.includes('FLAG_VISION')
+    const reading = modelFit.reading(name)
+    let fit = null
+    if (warm) fit = { tone: 'ok', text: t('picker.readyNow') }
+    else if (reading?.fit) {
+      const f = reading.fit
+      fit = f.state === 'fits'
+        ? { tone: 'ok', text: t('picker.fits', { amount: gbNumber(f.amount) }) }
+        : f.state === 'spill'
+          ? { tone: 'warn', text: t('picker.spill', { amount: gbNumber(f.amount) }) }
+          : { tone: 'err', text: t('picker.over', { amount: gbNumber(f.amount) }) }
+    }
+    return { vision: !!vision, size: reading?.bytes ? gbLabel(reading.bytes) : null, fit }
+  }
+  const memory = hostMemory(modelFit.resources)
+  const memoryNumbers = memory ? memoryFigure(memory.used, memory.total) : null
+  const picker = (
+    <HomeModelPicker
+      ref={pickerRef}
+      value={activeChat.model}
+      onChange={(model) => updateChatSettings(activeChat.id, { model })}
+      capability={CAP_CHAT}
+      models={chatModels}
+      loading={chatModelsLoading}
+      loadedIds={loadedIds}
+      grouped
+      describe={describeModel}
+      onOpen={onPickerOpen}
+      footer={memoryNumbers && (
+        <div className="home-menu__foot" data-testid="chat-model-memory">
+          <span>{memory.isGpu ? t('picker.gpuMemory') : t('picker.memory')}</span>
+          <span className="cx-ctx__bar" aria-hidden="true"><i style={fillStyle(memory.pct)} /></span>
+          <span>{t('picker.memoryUsed', { used: memoryNumbers.used, total: memoryNumbers.total, unit: memoryNumbers.unit })}</span>
+        </div>
+      )}
+    />
+  )
+
+  const mcp = (
+    <UnifiedMCPDropdown
+      serverMCPAvailable={mcpAvailable}
+      mcpServerList={mcpServerList}
+      mcpServersLoading={mcpServersLoading}
+      serverListError={mcpServerListError}
+      selectedServers={activeChat.mcpServers || []}
+      onToggleServer={toggleMcpServer}
+      onSelectAllServers={() => {
+        const allNames = mcpServerList.filter(s => !s.error).map(s => s.name)
+        const allSelected = allNames.every(n => (activeChat.mcpServers || []).includes(n))
+        updateChatSettings(activeChat.id, { mcpServers: allSelected ? [] : allNames })
+      }}
+      onFetchServers={fetchMcpServers}
+      clientMCPActiveIds={activeChat.clientMCPServers || []}
+      onClientToggle={handleClientMCPToggle}
+      onClientAdded={handleClientMCPServerAdded}
+      onClientRemoved={handleClientMCPServerRemoved}
+      connectionStatuses={connectionStatuses}
+      getConnectedTools={getConnectedTools}
+      promptsAvailable={mcpAvailable}
+      mcpPromptList={mcpPromptList}
+      mcpPromptsLoading={mcpPromptsLoading}
+      onFetchPrompts={fetchMcpPrompts}
+      onSelectPrompt={handleSelectPrompt}
+      promptArgsDialog={mcpPromptArgsDialog}
+      promptArgsValues={mcpPromptArgsValues}
+      onPromptArgsChange={(name, value) => setMcpPromptArgsValues(prev => ({ ...prev, [name]: value }))}
+      onPromptArgsSubmit={handleExpandPromptWithArgs}
+      onPromptArgsCancel={() => setMcpPromptArgsDialog(null)}
+      resourcesAvailable={mcpAvailable}
+      mcpResourceList={mcpResourceList}
+      mcpResourcesLoading={mcpResourcesLoading}
+      onFetchResources={fetchMcpResources}
+      selectedResources={activeChat.mcpResources || []}
+      onToggleResource={toggleMcpResource}
+    />
+  )
+
+  const canvasChip = (
+    <span className="cx-chipset">
+      <button
+        type="button"
+        className="home-chip cx-chip-toggle"
+        aria-pressed={canvasMode}
+        onClick={toggleCanvasMode}
+        title={t('input.canvasTitle')}
+        data-testid="chat-canvas-chip"
+      >
+        <Icon name="columns" />
+        <span className="home-chip__text">{t('input.canvasLabel')}</span>
+      </button>
+      {canvasMode && artifacts.length > 0 && !canvasOpen && (
+        <button
+          type="button"
+          className="home-chip cx-chip-count"
+          title={t('input.openCanvas')}
+          aria-label={t('input.openCanvas')}
+          onClick={() => { setSelectedArtifactId(artifacts[0]?.id); setCanvasOpen(true) }}
+        >
+          {artifacts.length}
+        </button>
+      )}
+    </span>
+  )
+
+  const moreItems = [
+    { key: 'rename', icon: 'pencil', label: t('menu.rename'), onClick: () => setRenaming(true) },
+    { key: 'duplicate', icon: 'copy', label: t('menu.duplicate'), onClick: () => { if (forkChat(activeChat.id)) addToast(t('toasts.forked'), 'success', 2000) } },
+    { key: 'copy', icon: 'clipboard', label: t('menu.copyChat'), hidden: !hasThread, onClick: () => copyChatAsMarkdown(activeChat) },
+    { key: 'export', icon: 'export', label: t('menu.exportMarkdown'), hidden: !hasThread, onClick: () => downloadChatAsMarkdown(activeChat) },
+    { key: 'info', icon: 'info', label: t('header.modelInfo'), hidden: !(activeChat.model && isAdmin), onClick: () => setShowSettings(true) },
+    { key: 'keys', icon: 'keyboard', label: t('shortcuts.title'), onClick: () => setShowShortcuts(true) },
+    { divider: true },
+    { key: 'clear', icon: 'trash', label: t('clearDialog.confirm'), danger: true, hidden: !hasThread, onClick: promptClear },
+  ]
+
+  const runSlash = (id) => {
+    switch (id) {
+      case 'model': pickerRef.current?.open(); break
+      case 'new': addChat(activeChat.model); break
+      case 'chats': chatsMenuRef.current?.open(); break
+      case 'assistant': updateChatSettings(activeChat.id, { localaiAssistant: !activeChat.localaiAssistant }); break
+      case 'canvas': toggleCanvasMode(); break
+      case 'settings': setShowSettings(true); break
+      case 'find': openFind(); break
+      case 'export': downloadChatAsMarkdown(activeChat); break
+      case 'clear': promptClear(); break
+      default: break
+    }
+  }
+
   return (
-    <div className={`chat-layout${sidebarOpen ? '' : ' chat-sidebar-collapsed'}`}>
-      {/* Chat sidebar */}
-      <div className={`chat-sidebar${sidebarOpen ? '' : ' hidden'}`}>
-        <div className="chat-sidebar-header">
-          <button className="btn btn-primary btn-sm" style={{ flex: 1 }} onClick={() => addChat(activeChat.model)}>
-            <i className="fas fa-plus" /> New Chat
-          </button>
-          <button
-            className="btn btn-secondary btn-sm"
-            onClick={() => setConfirmDialog({
-              title: 'Delete All Chats',
-              message: 'Delete all chats? This cannot be undone.',
-              confirmLabel: 'Delete all',
-              danger: true,
-              onConfirm: () => { setConfirmDialog(null); deleteAllChats() },
-            })}
-            title="Delete all chats"
-            style={{ padding: '6px 8px' }}
-          >
-            <i className="fas fa-trash" />
-          </button>
-        </div>
-
-        {/* Chat search */}
-        <div style={{ padding: '0 var(--spacing-sm)' }}>
-          <div className="chat-search-wrapper">
-            <i className="fas fa-search chat-search-icon" />
-            <input
-              className="chat-search-input"
-              type="text"
-              value={chatSearch}
-              onChange={(e) => setChatSearch(e.target.value)}
-              placeholder="Search conversations..."
+    <div className="cx-page">
+      {/* Conversation column */}
+      <div className="cx-conv" data-empty={isEmpty || undefined}>
+        <ChatHeader
+          historyMenu={(
+            <ChatsMenu
+              ref={chatsMenuRef}
+              chats={visibleChats}
+              activeChatId={activeChatId}
+              streamingChatId={streamingChatId}
+              onSelect={switchChat}
+              onNew={() => addChat(activeChat.model)}
+              onDelete={requestDelete}
+              onDeleteAll={promptDeleteAll}
+              onRename={renameChat}
+              onExport={(chat) => downloadChatAsMarkdown(chat)}
+              onCopyChat={(chat) => copyChatAsMarkdown(chat)}
+              onDuplicate={(chat) => { if (forkChat(chat.id)) addToast(t('toasts.forked'), 'success', 2000) }}
             />
-            {chatSearch && (
-              <button className="chat-search-clear" onClick={() => setChatSearch('')}>
-                <i className="fas fa-times" />
-              </button>
-            )}
-          </div>
-        </div>
-
-        <div className="chat-list">
-          {filteredChats.map(chat => (
-            <div
-              key={chat.id}
-              className={`chat-list-item ${chat.id === activeChatId ? 'active' : ''}`}
-              onClick={() => switchChat(chat.id)}
-            >
-              <i className="fas fa-message" style={{ fontSize: '0.7rem', flexShrink: 0, marginTop: '2px' }} />
-              {editingName === chat.id ? (
-                <input
-                  className="input"
-                  value={editName}
-                  onChange={(e) => setEditName(e.target.value)}
-                  onBlur={finishRename}
-                  onKeyDown={(e) => e.key === 'Enter' && finishRename()}
-                  autoFocus
-                  onClick={(e) => e.stopPropagation()}
-                  style={{ padding: '2px 4px', fontSize: '0.8125rem' }}
-                />
-              ) : (
-                <div className="chat-list-item-info">
-                  <div className="chat-list-item-top">
-                    <span
-                      className="chat-list-item-name"
-                      onDoubleClick={() => startRename(chat.id, chat.name)}
-                    >
-                      {streamingChatId === chat.id && <i className="fas fa-circle-notch fa-spin" style={{ marginRight: '6px', fontSize: '0.7rem', opacity: 0.7 }} />}
-                      {chat.name}
-                    </span>
-                    <span className="chat-list-item-time">{relativeTime(chat.updatedAt)}</span>
-                  </div>
-                  <span className="chat-list-item-preview">
-                    {getLastMessagePreview(chat) || 'No messages yet'}
-                  </span>
-                </div>
-              )}
-              <div className="chat-list-item-actions">
-                <button
-                  onClick={(e) => { e.stopPropagation(); startRename(chat.id, chat.name) }}
-                  title="Rename"
-                >
-                  <i className="fas fa-edit" />
-                </button>
-                {chats.length > 1 && (
-                  <button
-                    className="chat-list-item-delete"
-                    onClick={(e) => { e.stopPropagation(); deleteChat(chat.id) }}
-                    title="Delete chat"
-                  >
-                    <i className="fas fa-trash" />
-                  </button>
-                )}
-              </div>
-            </div>
-          ))}
-          {filteredChats.length === 0 && chatSearch && (
-            <div style={{ padding: 'var(--spacing-sm)', textAlign: 'center', color: 'var(--color-text-muted)', fontSize: '0.8rem' }}>
-              No conversations match your search
-            </div>
           )}
-        </div>
-      </div>
+          manageMode={!!activeChat.localaiAssistant}
+          name={activeChat.name}
+          onRename={(name) => renameChat(activeChat.id, name)}
+          renaming={renaming}
+          setRenaming={setRenaming}
+          contextPercent={contextPercent}
+          contextTokens={activeChat.tokenUsage?.total || 0}
+          contextSize={activeChat.contextSize}
+          onFind={() => openFind()}
+          findOpen={find.open}
+          onSettings={() => setShowSettings(v => !v)}
+          settingsOpen={showSettings}
+          moreItems={moreItems}
+        />
 
-      {/* Chat main area */}
-      <div className="chat-main">
-        {/* Header */}
-        <div className="chat-header">
-          <button
-            className="btn btn-secondary btn-sm"
-            onClick={() => setSidebarOpen(prev => !prev)}
-            title={sidebarOpen ? 'Hide chat list' : 'Show chat list'}
-            style={{ flexShrink: 0 }}
-          >
-            <i className={`fas fa-${sidebarOpen ? 'angles-left' : 'angles-right'}`} />
-          </button>
-          <span className="chat-header-title">{activeChat.name}</span>
-          <UnifiedMCPDropdown
-            serverMCPAvailable={mcpAvailable}
-            mcpServerList={mcpServerList}
-            mcpServersLoading={mcpServersLoading}
-            selectedServers={activeChat.mcpServers || []}
-            onToggleServer={toggleMcpServer}
-            onSelectAllServers={() => {
-              const allNames = mcpServerList.map(s => s.name)
-              const allSelected = allNames.every(n => (activeChat.mcpServers || []).includes(n))
-              updateChatSettings(activeChat.id, { mcpServers: allSelected ? [] : allNames })
-            }}
-            onFetchServers={fetchMcpServers}
-            clientMCPActiveIds={activeChat.clientMCPServers || []}
-            onClientToggle={handleClientMCPToggle}
-            onClientAdded={handleClientMCPServerAdded}
-            onClientRemoved={handleClientMCPServerRemoved}
-            connectionStatuses={connectionStatuses}
-            getConnectedTools={getConnectedTools}
-            promptsAvailable={mcpAvailable}
-            mcpPromptList={mcpPromptList}
-            mcpPromptsLoading={mcpPromptsLoading}
-            onFetchPrompts={fetchMcpPrompts}
-            onSelectPrompt={handleSelectPrompt}
-            promptArgsDialog={mcpPromptArgsDialog}
-            promptArgsValues={mcpPromptArgsValues}
-            onPromptArgsChange={(name, value) => setMcpPromptArgsValues(prev => ({ ...prev, [name]: value }))}
-            onPromptArgsSubmit={handleExpandPromptWithArgs}
-            onPromptArgsCancel={() => setMcpPromptArgsDialog(null)}
-            resourcesAvailable={mcpAvailable}
-            mcpResourceList={mcpResourceList}
-            mcpResourcesLoading={mcpResourcesLoading}
-            onFetchResources={fetchMcpResources}
-            selectedResources={activeChat.mcpResources || []}
-            onToggleResource={toggleMcpResource}
+        {find.open && (
+          <FindBar
+            query={find.query}
+            index={find.index}
+            count={find.count}
+            focusToken={find.token}
+            onQuery={(query) => setFind(f => ({ ...f, query, index: 0 }))}
+            onStep={stepFind}
+            onClose={closeFind}
           />
-          <ModelSelector
-            value={activeChat.model}
-            onChange={(model) => updateChatSettings(activeChat.id, { model })}
-            capability={CAP_CHAT}
-            style={{ flex: '1 1 0', minWidth: 120 }}
-          />
-          <div className="chat-header-actions">
-            {activeChat.model && isAdmin && (
-              <>
-                <button
-                  className="btn btn-secondary btn-sm"
-                  onClick={() => setShowModelInfo(!showModelInfo)}
-                  title="Model info"
-                >
-                  <i className="fas fa-info-circle" />
-                </button>
-                <button
-                  className="btn btn-secondary btn-sm"
-                  onClick={() => navigate(`/app/model-editor/${encodeURIComponent(activeChat.model)}`)}
-                  title="Edit model config"
-                >
-                  <i className="fas fa-edit" />
-                </button>
-              </>
-            )}
-            <label className="canvas-mode-toggle" title="Extract code blocks and media into a side panel for preview, copy, and download">
-              <i className="fas fa-columns" />
-              <span className="canvas-mode-label">Canvas</span>
-              <span className="toggle">
-                <input
-                  type="checkbox"
-                  checked={canvasMode}
-                  onChange={(e) => {
-                    setCanvasMode(e.target.checked)
-                    if (!e.target.checked) setCanvasOpen(false)
-                  }}
-                />
-                <span className="toggle-slider" />
-              </span>
-            </label>
-            {canvasMode && artifacts.length > 0 && !canvasOpen && (
-              <button
-                className="btn btn-secondary btn-sm"
-                onClick={() => { setSelectedArtifactId(artifacts[0]?.id); setCanvasOpen(true) }}
-                title="Open canvas panel"
-              >
-                <i className="fas fa-layer-group" /> {artifacts.length}
-              </button>
-            )}
-            <button
-              className="btn btn-secondary btn-sm"
-              onClick={() => exportChatAsMarkdown(activeChat)}
-              title="Export chat as Markdown"
-            >
-              <i className="fas fa-download" />
-            </button>
-            <button
-              className="btn btn-secondary btn-sm"
-              onClick={() => clearHistory(activeChat.id)}
-              title="Clear chat history"
-            >
-              <i className="fas fa-eraser" />
-            </button>
-            <button
-              className={`btn btn-secondary btn-sm${showSettings ? ' active' : ''}`}
-              onClick={() => setShowSettings(!showSettings)}
-              title="Settings"
-            >
-              <i className="fas fa-sliders-h" />
-            </button>
-          </div>
-        </div>
-
-        {/* Model info panel */}
-        {showModelInfo && modelInfo && (
-          <div className="chat-model-info-panel">
-            <div className="chat-model-info-header">
-              <span>Model Info: {activeChat.model}</span>
-              <button className="btn btn-secondary btn-sm" onClick={() => setShowModelInfo(false)}>
-                <i className="fas fa-times" />
-              </button>
-            </div>
-            <div className="chat-model-info-body">
-              {modelInfo.backend && <div className="chat-model-info-row"><span>Backend</span><span>{modelInfo.backend}</span></div>}
-              {modelInfo.parameters?.model && <div className="chat-model-info-row"><span>Model file</span><span>{modelInfo.parameters.model}</span></div>}
-              {modelInfo.context_size > 0 && <div className="chat-model-info-row"><span>Context size</span><span>{modelInfo.context_size}</span></div>}
-              {modelInfo.threads > 0 && <div className="chat-model-info-row"><span>Threads</span><span>{modelInfo.threads}</span></div>}
-              {(modelInfo.mcp?.remote || modelInfo.mcp?.stdio) && <div className="chat-model-info-row"><span>MCP</span><span className="badge badge-success">Configured</span></div>}
-              {modelInfo.template?.chat_message && <div className="chat-model-info-row"><span>Chat template</span><span>Yes</span></div>}
-              {modelInfo.gpu_layers > 0 && <div className="chat-model-info-row"><span>GPU layers</span><span>{modelInfo.gpu_layers}</span></div>}
-            </div>
-          </div>
         )}
 
-        {/* Context window progress bar */}
-        {contextPercent !== null && (
-          <div className="chat-context-bar">
-            <div className="chat-context-progress"
-              style={{
-                width: `${contextPercent}%`,
-                background: contextPercent > 90 ? 'var(--color-error)' : contextPercent > 70 ? 'var(--color-warning)' : 'var(--color-primary)',
-              }}
-            />
-            <span className="chat-context-label">
-              Context: {Math.round(contextPercent)}%
-              {activeChat.tokenUsage.total > 0 && ` (${activeChat.tokenUsage.total} tokens)`}
-            </span>
-          </div>
-        )}
+        {/* Thread */}
+        <div className="cx-stage">
+        <div className="cx-body" ref={messagesRef}>
+          {isEmpty && <EmptyHead name={activeChat.name} manage={!!activeChat.localaiAssistant} />}
+          <div className="cx-thread" data-testid="chat-thread" hidden={isEmpty}>
+            {rows.map((row) => (row.kind === 'activity' ? (
+              <ActivityRow key={`a${row.key}`} id={`cx-act-${row.key}`} items={row.items} getClientForTool={getClientForTool} />
+            ) : (
+              <ChatMessage
+                key={row.index}
+                msg={row.msg}
+                index={row.index}
+                isLast={row.index === activeChat.history.length - 1}
+                model={activeChat.model}
+                warm={modelWarm}
+                canvasMode={canvasMode}
+                busy={isStreaming}
+                editing={editingMessageIndex === row.index}
+                draft={editingMessageIndex === row.index ? messageEditDraft : ''}
+                onDraft={setMessageEditDraft}
+                activityItems={row.activity}
+                getClientForTool={row.activity ? getClientForTool : undefined}
+                actions={messageActions}
+                onOpenImage={openImage}
+              />
+            )))}
 
-        {/* Settings slide-out panel */}
-        <div className={`chat-settings-overlay${showSettings ? ' open' : ''}`} onClick={() => setShowSettings(false)} />
-        <div className={`chat-settings-drawer${showSettings ? ' open' : ''}`}>
-          <div className="chat-settings-drawer-header">
-            <span>Chat Settings</span>
-            <button className="btn btn-secondary btn-sm" onClick={() => setShowSettings(false)}>
-              <i className="fas fa-times" />
-            </button>
-          </div>
-          <div className="chat-settings-drawer-body">
-            <div className="form-group">
-              <label className="form-label">System Prompt</label>
-              <textarea
-                className="textarea"
-                value={activeChat.systemPrompt || ''}
-                onChange={(e) => updateChatSettings(activeChat.id, { systemPrompt: e.target.value })}
-                rows={3}
-                placeholder="You are a helpful assistant..."
-              />
-            </div>
-            <div className="form-group">
-              <label className="form-label">
-                Temperature {activeChat.temperature !== null ? `(${activeChat.temperature})` : ''}
-              </label>
-              <input
-                type="range" min="0" max="2" step="0.1"
-                value={activeChat.temperature ?? 0.7}
-                onChange={(e) => updateChatSettings(activeChat.id, { temperature: parseFloat(e.target.value) })}
-                className="chat-slider"
-              />
-              <div className="chat-slider-labels"><span>0</span><span>2</span></div>
-            </div>
-            <div className="form-group">
-              <label className="form-label">
-                Top P {activeChat.topP !== null ? `(${activeChat.topP})` : ''}
-              </label>
-              <input
-                type="range" min="0" max="1" step="0.05"
-                value={activeChat.topP ?? 0.9}
-                onChange={(e) => updateChatSettings(activeChat.id, { topP: parseFloat(e.target.value) })}
-                className="chat-slider"
-              />
-              <div className="chat-slider-labels"><span>0</span><span>1</span></div>
-            </div>
-            <div className="form-group">
-              <label className="form-label">
-                Top K {activeChat.topK !== null ? `(${activeChat.topK})` : ''}
-              </label>
-              <input
-                type="range" min="1" max="100" step="1"
-                value={activeChat.topK ?? 40}
-                onChange={(e) => updateChatSettings(activeChat.id, { topK: parseInt(e.target.value) })}
-                className="chat-slider"
-              />
-              <div className="chat-slider-labels"><span>1</span><span>100</span></div>
-            </div>
-            <div className="form-group">
-              <label className="form-label">Context Size</label>
-              <input
-                type="number"
-                className="input"
-                value={activeChat.contextSize || ''}
-                onChange={(e) => updateChatSettings(activeChat.id, { contextSize: parseInt(e.target.value) || null })}
-                placeholder="2048"
-              />
-            </div>
-          </div>
-        </div>
-
-        {/* Messages */}
-        <div className="chat-messages" ref={messagesRef}>
-          {activeChat.history.length === 0 && !isStreaming && (
-            <div className="chat-empty-state">
-              <div className="chat-empty-icon">
-                <i className="fas fa-comments" />
-              </div>
-              <h2 className="chat-empty-title">Start a conversation</h2>
-              <p className="chat-empty-text">{activeChat.model ? `Ready to chat with ${activeChat.model}` : 'Select a model above to get started'}</p>
-              <div className="chat-empty-suggestions">
-                {['Explain how this works', 'Help me write code', 'Summarize a document', 'Brainstorm ideas'].map((prompt) => (
-                  <button
-                    key={prompt}
-                    className="chat-empty-suggestion"
-                    onClick={() => { setInput(prompt); textareaRef.current?.focus() }}
-                  >
-                    {prompt}
-                  </button>
-                ))}
-              </div>
-              <div className="chat-empty-hints">
-                <span><i className="fas fa-keyboard" /> Enter to send</span>
-                <span><i className="fas fa-level-down-alt" /> Shift+Enter for newline</span>
-                <span><i className="fas fa-paperclip" /> Attach files</span>
-              </div>
-            </div>
-          )}
-          {(() => {
-            const elements = []
-            let activityBuf = []
-            const flushActivity = (key) => {
-              if (activityBuf.length > 0) {
-                elements.push(
-                  <ActivityGroup key={`ag-${key}`} items={[...activityBuf]}
-                    updateChatSettings={updateChatSettings} activeChat={activeChat}
-                    getClientForTool={getClientForTool} />
-                )
-                activityBuf = []
-              }
-            }
-            activeChat.history.forEach((msg, i) => {
-              const isActivity = msg.role === 'thinking' || msg.role === 'reasoning' ||
-                msg.role === 'tool_call' || msg.role === 'tool_result'
-              if (isActivity) {
-                activityBuf.push(msg)
-                return
-              }
-              flushActivity(i)
-              elements.push(
-                <div key={i} className={`chat-message chat-message-${msg.role}${i === completionGlowIdx ? ' chat-message-new' : ''}`}>
-                  <div className="chat-message-avatar">
-                    <i className={`fas ${msg.role === 'user' ? 'fa-user' : 'fa-robot'}`} />
-                  </div>
-                  <div className="chat-message-bubble">
-                    {msg.role === 'assistant' && activeChat.model && (
-                      <span className="chat-message-model">{activeChat.model}</span>
-                    )}
-                    <div className="chat-message-content">
-                      {msg.role === 'user' ? (
-                        <UserMessageContent content={msg.content} files={msg.files} />
-                      ) : (
-                        <div dangerouslySetInnerHTML={{
-                          __html: canvasMode
-                            ? renderMarkdownWithArtifacts(typeof msg.content === 'string' ? msg.content : '', i)
-                            : renderMarkdown(typeof msg.content === 'string' ? msg.content : '')
-                        }} />
-                      )}
-                    </div>
-                    {msg.role === 'assistant' && typeof msg.content === 'string' && msg.content.includes('Error:') && (
-                      <a href="/app/traces?tab=backend" className="chat-error-trace-link">
-                        <i className="fas fa-wave-square" /> View traces for details
-                      </a>
-                    )}
-                    <div className="chat-message-actions">
-                      <button onClick={() => copyMessage(msg.content)} title="Copy">
-                        <i className="fas fa-copy" />
-                      </button>
-                      {msg.role === 'assistant' && i === activeChat.history.length - 1 && !isStreaming && (
-                        <button onClick={handleRegenerate} title="Regenerate">
-                          <i className="fas fa-rotate" />
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              )
-            })
-            flushActivity('end')
-            return elements
-          })()}
-
-          {/* Streaming activity (thinking + tools) */}
-          {isStreaming && (streamingReasoning || streamingToolCalls.length > 0) && (
-            <StreamingActivity reasoning={streamingReasoning} toolCalls={streamingToolCalls} hasResponse={!!streamingContent} />
-          )}
-
-          {/* Streaming message */}
-          {isStreaming && streamingContent && (
-            <div className="chat-message chat-message-assistant">
-              <div className="chat-message-avatar">
-                <i className="fas fa-robot" />
-              </div>
-              <div className="chat-message-bubble">
-                {activeChat.model && (
-                  <span className="chat-message-model">{activeChat.model}</span>
+            {isStreaming && (
+              <StreamingTurn
+                model={activeChat.model}
+                warm={modelWarm}
+                content={streamingContent}
+                reasoning={streamingReasoning}
+                toolCalls={streamingToolCalls}
+                waiting={(loadProgress || !modelWarm) ? (
+                  <LoadCard model={activeChat.model} progress={loadProgress} />
+                ) : (
+                  <span className="cx-dots" aria-label={t('streaming.waiting')}><span /><span /><span /></span>
                 )}
-                <div className="chat-message-content">
-                  <span dangerouslySetInnerHTML={{ __html: renderMarkdown(streamingContent) }} />
-                  <span className="chat-streaming-cursor" />
-                </div>
-                {tokensPerSecond !== null && (
-                  <div className="chat-streaming-speed">
-                    <i className="fas fa-tachometer-alt" /> {tokensPerSecond} tok/s
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-          {isStreaming && !streamingContent && !streamingReasoning && streamingToolCalls.length === 0 && (
-            <div className="chat-message chat-message-assistant">
-              <div className="chat-message-avatar">
-                <i className="fas fa-robot" />
-              </div>
-              <div className="chat-message-bubble">
-                <div className="chat-message-content chat-thinking-indicator">
-                  {stagingOp ? (
-                    <div className="chat-staging-progress">
-                      <div className="chat-staging-label">
-                        <i className="fas fa-cloud-arrow-up" /> Transferring model{stagingOp.nodeName ? ` to ${stagingOp.nodeName}` : ''}...
-                      </div>
-                      {stagingOp.progress > 0 && (
-                        <div className="chat-staging-detail">
-                          <div className="chat-staging-bar-container">
-                            <div className="chat-staging-bar" style={{ width: `${stagingOp.progress}%` }} />
-                          </div>
-                          <span className="chat-staging-pct">{Math.round(stagingOp.progress)}%</span>
-                        </div>
-                      )}
-                      {stagingOp.message && (
-                        <div className="chat-staging-file">{stagingOp.message}</div>
-                      )}
-                    </div>
-                  ) : (
-                    <span className="chat-thinking-dots">
-                      <span /><span /><span />
-                    </span>
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
+              />
+            )}
+          </div>
           <div ref={messagesEndRef} />
         </div>
-
-        {/* Token info bar */}
-        {(tokensPerSecond || maxTokensPerSecond || activeChat.tokenUsage?.total > 0) && (
-          <div className="chat-token-info">
-            {tokensPerSecond !== null && <span><i className="fas fa-tachometer-alt" /> {tokensPerSecond} tok/s</span>}
-            {maxTokensPerSecond !== null && !isStreaming && (
-              <span className="chat-max-tps-badge">
-                <i className="fas fa-bolt" /> Peak: {maxTokensPerSecond} tok/s
-              </span>
-            )}
-            {activeChat.tokenUsage?.total > 0 && (
-              <span>
-                <i className="fas fa-coins" /> {activeChat.tokenUsage.prompt}p + {activeChat.tokenUsage.completion}c = {activeChat.tokenUsage.total}
-              </span>
-            )}
-          </div>
+        {scrolledUp && (
+          <button
+            type="button"
+            className="cx-jump"
+            data-testid="chat-jump-latest"
+            onClick={() => {
+              stickToBottomRef.current = true
+              setScrolledUp(false)
+              messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+            }}
+          >
+            <Icon name="arrow-down" /> {t('actions.jumpToLatest')}
+          </button>
         )}
+        </div>
 
-        {/* File badges */}
-        {files.length > 0 && (
-          <div className="chat-files">
-            {files.map((f, i) => (
-              <span key={i} className="chat-file-badge">
-                <i className={`fas ${f.type?.startsWith('image/') ? 'fa-image' : f.type?.startsWith('audio/') ? 'fa-headphones' : 'fa-file'}`} />
-                {f.name}
-                <button onClick={() => setFiles(prev => prev.filter((_, idx) => idx !== i))}>
-                  <i className="fas fa-xmark" />
-                </button>
-              </span>
-            ))}
-          </div>
-        )}
-
-        {/* Input area */}
-        <div className="chat-input-area">
-          <div className="chat-input-wrapper">
-            <button
-              type="button"
-              className="btn btn-secondary btn-sm chat-attach-btn"
-              onClick={() => fileInputRef.current?.click()}
-              title="Attach file"
-            >
-              <i className="fas fa-paperclip" />
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              accept="image/*,audio/*,application/pdf,.txt,.md,.csv,.json"
-              style={{ display: 'none' }}
-              onChange={handleFileChange}
-            />
-            <textarea
-              ref={textareaRef}
-              className="chat-input"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="Message..."
+        {/* Dock: the Home command bar under the thread */}
+        <div className="cx-dock">
+          <div className="cx-dock__in">
+            <HomeComposer
+              message={input}
+              onMessage={setInput}
+              onSubmit={handleSend}
+              canSend={!!activeChat.model && (input.trim().length > 0 || files.length > 0)}
+              sendTitle={activeChat.model ? t('input.send') : t('input.selectModelFirst')}
+              textareaRef={textareaRef}
+              picker={picker}
+              mcp={mcp}
+              chips={canvasChip}
+              files={files}
+              onRemoveFile={(f) => setFiles(prev => prev.filter(x => x !== f))}
+              onAttach={attachFiles}
+              placeholder={activeChat.model ? t('input.placeholderModel', { model: activeChat.model }) : (noModel ? t('input.placeholderNoModel') : t('input.placeholderPick'))}
+              slash={slashConfig}
+              onRunAction={runSlash}
+              streaming={isStreaming}
+              onStop={stopGeneration}
+              stopTitle={t('input.stopGenerating')}
+              onPaste={handlePaste}
+              onKeyDownExtra={onComposerKey}
+              fileAccept="video/*,application/pdf,.txt,.md,.csv,.json"
               rows={1}
-              disabled={isStreaming}
+              strictEnter
+              testId="chat-composer"
+              textareaTestId="chat-input"
+              sendId="chat-submit-btn"
+              sendTestId="chat-send"
             />
-            {isStreaming ? (
-              <button className="chat-stop-btn" onClick={stopGeneration} title="Stop generating">
-                <i className="fas fa-stop" />
-              </button>
-            ) : (
-              <button
-                id="chat-submit-btn"
-                className="chat-send-btn"
-                onClick={handleSend}
-                disabled={!input.trim() && files.length === 0}
-              >
-                <i className="fas fa-paper-plane" />
-              </button>
-            )}
+            <div className="cx-foot" data-testid="chat-foot">
+              <span data-warn={(!isStreaming && contextPercent !== null && contextPercent > 90) || undefined}>
+                {isStreaming
+                  ? (tokensPerSecond !== null ? `${t('tokens.perSec', { count: tokensPerSecond })} · ${t('tokens.generating')}` : t('tokens.generating'))
+                  : (contextPercent !== null && contextPercent > 90
+                    ? t('context.nearlyFull')
+                    : (maxTokensPerSecond !== null ? t('tokens.peak', { count: maxTokensPerSecond }) : ''))}
+              </span>
+              <span className="cx-foot__tokens">
+                {activeChat.tokenUsage?.total > 0 && (activeChat.contextSize
+                  ? t('tokens.ofContext', { used: activeChat.tokenUsage.total, size: activeChat.contextSize })
+                  : t('tokens.usage', { prompt: activeChat.tokenUsage.prompt, completion: activeChat.tokenUsage.completion, total: activeChat.tokenUsage.total }))}
+              </span>
+            </div>
           </div>
         </div>
+        {isEmpty && (
+          <div className="cx-under" data-testid="chat-under">
+            <EmptyUnder
+              noModel={noModel}
+              isAdmin={isAdmin}
+              addToast={addToast}
+              onInstallStarted={() => setFitOpenCount(n => n)}
+              manage={!!activeChat.localaiAssistant}
+              model={activeChat.model}
+              warm={modelWarm}
+              starters={t(activeChat.localaiAssistant ? 'empty.suggestionsManage' : 'empty.suggestionsChat', { returnObjects: true })}
+              onStarter={(prompt) => { setInput(prompt); textareaRef.current?.focus() }}
+              conversations={conversations}
+              leavingId={null}
+              onResume={(conv) => switchChat(conv.id)}
+              onDelete={(conv) => { const chat = chats.find(c => c.id === conv.id); if (chat) requestDelete(chat) }}
+            />
+          </div>
+        )}
       </div>
       {canvasOpen && artifacts.length > 0 && (
         <CanvasPanel
@@ -1318,6 +1274,39 @@ export default function Chat() {
           selectedId={selectedArtifactId}
           onSelect={setSelectedArtifactId}
           onClose={() => setCanvasOpen(false)}
+        />
+      )}
+      {lightbox && (
+        <Lightbox
+          images={lightbox.images}
+          index={lightbox.index}
+          onIndex={(index) => setLightbox(prev => ({ ...prev, index }))}
+          onClose={() => setLightbox(null)}
+        />
+      )}
+      {showSettings && (
+        <ChatSettingsSheet
+          chat={activeChat}
+          isAdmin={isAdmin}
+          onUpdate={(patch) => updateChatSettings(activeChat.id, patch)}
+          focusMode={focusModeEnabled}
+          onFocusMode={toggleFocusMode}
+          modelInfo={modelInfo}
+          onEditConfig={() => navigate(`/app/model-editor/${encodeURIComponent(activeChat.model)}`, { state: fromState(location, 'Chat') })}
+          onClear={() => { setShowSettings(false); promptClear() }}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
+      {showShortcuts && <ShortcutsDialog onClose={() => setShowShortcuts(false)} canFind />}
+      {pendingDelete && (
+        <HomeUndoToast
+          key={pendingDelete.id}
+          message={t('menu.deleted', { title: pendingDelete.name })}
+          onUndo={undoDelete}
+          onExpire={commitDelete}
+          undoLabel={t('menu.undo')}
+          dismissLabel={t('menu.dismiss')}
+          testId="chat-undo-toast"
         />
       )}
       <ConfirmDialog

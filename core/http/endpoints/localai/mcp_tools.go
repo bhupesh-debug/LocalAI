@@ -3,6 +3,7 @@ package localai
 import (
 	"fmt"
 	"net/http"
+	"sort"
 
 	"github.com/labstack/echo/v4"
 	"github.com/mudler/LocalAI/core/config"
@@ -12,7 +13,7 @@ import (
 
 // MCPServersEndpoint returns the list of MCP servers and their tools for a given model.
 // GET /v1/mcp/servers/:model
-func MCPServersEndpoint(cl *config.ModelConfigLoader, appConfig *config.ApplicationConfig, natsClient mcpTools.MCPNATSClient) echo.HandlerFunc {
+func MCPServersEndpoint(cl *config.ModelConfigLoader, appConfig *config.ApplicationConfig, agentControl mcpTools.AgentControl) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		modelName := c.Param("model")
 		if modelName == "" {
@@ -37,15 +38,22 @@ func MCPServersEndpoint(cl *config.ModelConfigLoader, appConfig *config.Applicat
 
 		remote, stdio, err := cfg.MCP.MCPConfigFromYAML()
 		if err != nil {
-			return fmt.Errorf("failed to parse MCP config: %w", err)
+			return c.JSON(http.StatusUnprocessableEntity, map[string]any{
+				"model":   modelName,
+				"servers": []any{},
+				"error":   fmt.Sprintf("failed to parse MCP config: %v", err),
+			})
 		}
 
 		// In distributed mode, route discovery through NATS to an agent worker
 		// that can actually connect to the MCP servers.
-		if natsClient != nil {
-			resp, err := mcpTools.DiscoverMCPToolsRemote(c.Request().Context(), natsClient, cfg.Name, remote, stdio)
+		if agentControl != nil {
+			resp, err := mcpTools.DiscoverMCPToolsRemote(c.Request().Context(), agentControl, cfg.Name, remote, stdio)
 			if err != nil {
-				return fmt.Errorf("remote MCP discovery failed: %w", err)
+				return c.JSON(http.StatusOK, map[string]any{
+					"model":   modelName,
+					"servers": unavailableMCPServers(remote, stdio, fmt.Sprintf("remote discovery failed: %v", err)),
+				})
 			}
 			return c.JSON(200, map[string]any{
 				"model":   modelName,
@@ -72,7 +80,7 @@ func MCPServersEndpoint(cl *config.ModelConfigLoader, appConfig *config.Applicat
 
 // MCPServersEndpointFromMiddleware is a version that uses the middleware-resolved model config.
 // This allows it to use the same middleware chain as other endpoints.
-func MCPServersEndpointFromMiddleware(natsClient mcpTools.MCPNATSClient) echo.HandlerFunc {
+func MCPServersEndpointFromMiddleware(agentControl mcpTools.AgentControl) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		cfg, ok := c.Get(middleware.CONTEXT_LOCALS_KEY_MODEL_CONFIG).(*config.ModelConfig)
 		if !ok || cfg == nil {
@@ -88,14 +96,21 @@ func MCPServersEndpointFromMiddleware(natsClient mcpTools.MCPNATSClient) echo.Ha
 
 		remote, stdio, err := cfg.MCP.MCPConfigFromYAML()
 		if err != nil {
-			return fmt.Errorf("failed to parse MCP config: %w", err)
+			return c.JSON(http.StatusUnprocessableEntity, map[string]any{
+				"model":   cfg.Name,
+				"servers": []any{},
+				"error":   fmt.Sprintf("failed to parse MCP config: %v", err),
+			})
 		}
 
 		// In distributed mode, route discovery through NATS to an agent worker.
-		if natsClient != nil {
-			resp, err := mcpTools.DiscoverMCPToolsRemote(c.Request().Context(), natsClient, cfg.Name, remote, stdio)
+		if agentControl != nil {
+			resp, err := mcpTools.DiscoverMCPToolsRemote(c.Request().Context(), agentControl, cfg.Name, remote, stdio)
 			if err != nil {
-				return fmt.Errorf("remote MCP discovery failed: %w", err)
+				return c.JSON(http.StatusOK, map[string]any{
+					"model":   cfg.Name,
+					"servers": unavailableMCPServers(remote, stdio, fmt.Sprintf("remote discovery failed: %v", err)),
+				})
 			}
 			return c.JSON(200, map[string]any{
 				"model":   cfg.Name,
@@ -118,4 +133,25 @@ func MCPServersEndpointFromMiddleware(natsClient mcpTools.MCPNATSClient) echo.Ha
 			"servers": servers,
 		})
 	}
+}
+
+func unavailableMCPServers(
+	remote config.MCPGenericConfig[config.MCPRemoteServers],
+	stdio config.MCPGenericConfig[config.MCPSTDIOServers],
+	errMessage string,
+) []mcpTools.MCPServerInfo {
+	servers := make([]mcpTools.MCPServerInfo, 0, len(remote.Servers)+len(stdio.Servers))
+	for name := range remote.Servers {
+		servers = append(servers, mcpTools.MCPServerInfo{Name: name, Type: "remote", Tools: []string{}, Error: errMessage})
+	}
+	for name := range stdio.Servers {
+		servers = append(servers, mcpTools.MCPServerInfo{Name: name, Type: "stdio", Tools: []string{}, Error: errMessage})
+	}
+	sort.Slice(servers, func(i, j int) bool {
+		if servers[i].Type != servers[j].Type {
+			return servers[i].Type < servers[j].Type
+		}
+		return servers[i].Name < servers[j].Name
+	})
+	return servers
 }

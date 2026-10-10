@@ -15,6 +15,10 @@ var _ Importer = &TransformersImporter{}
 
 type TransformersImporter struct{}
 
+func (i *TransformersImporter) Name() string      { return "transformers" }
+func (i *TransformersImporter) Modality() string  { return "text" }
+func (i *TransformersImporter) AutoDetects() bool { return true }
+
 func (i *TransformersImporter) Match(details Details) bool {
 	preferences, err := details.Preferences.MarshalJSON()
 	if err != nil {
@@ -83,11 +87,11 @@ func (i *TransformersImporter) Import(details Details) (gallery.ModelConfig, err
 	modelConfig := config.ModelConfig{
 		Name:                name,
 		Description:         description,
-		KnownUsecaseStrings: []string{"chat"},
+		KnownUsecaseStrings: []string{config.UsecaseChat},
 		Backend:             backend,
 		PredictionOptions: schema.PredictionOptions{
 			BasicModelRequest: schema.BasicModelRequest{
-				Model: details.URI,
+				Model: LocalModelPath(details.URI),
 			},
 		},
 		TemplateConfig: config.TemplateConfig{

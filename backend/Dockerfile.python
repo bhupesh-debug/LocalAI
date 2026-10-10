@@ -1,4 +1,6 @@
 ARG BASE_IMAGE=ubuntu:24.04
+ARG APT_MIRROR=""
+ARG APT_PORTS_MIRROR=""
 
 FROM ${BASE_IMAGE} AS builder
 ARG BACKEND=rerankers
@@ -13,8 +15,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 ARG TARGETARCH
 ARG TARGETVARIANT
 ARG UBUNTU_VERSION=2404
+ARG APT_MIRROR
+ARG APT_PORTS_MIRROR
 
-RUN apt-get update && \
+RUN --mount=type=bind,source=.docker/apt-mirror.sh,target=/usr/local/sbin/apt-mirror \
+    APT_MIRROR="${APT_MIRROR}" APT_PORTS_MIRROR="${APT_PORTS_MIRROR}" sh /usr/local/sbin/apt-mirror && \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
         ccache \
@@ -60,7 +66,12 @@ RUN <<EOT bash
             libwayland-dev libxrandr-dev libxcb-randr0-dev libxcb-ewmh-dev \
             git python-is-python3 bison libx11-xcb-dev liblz4-dev libzstd-dev \
             ocaml-core ninja-build pkg-config libxml2-dev wayland-protocols python3-jsonschema \
-            clang-format qtbase5-dev qt6-base-dev libxcb-glx0-dev sudo xz-utils
+            clang-format qtbase5-dev qt6-base-dev libxcb-glx0-dev sudo xz-utils && \
+        apt-get install -y mesa-vulkan-drivers libdrm2
+        # Mesa Vulkan ICD drivers (ANV/RADV/lavapipe) + their manifests. The
+        # LunarG SDK below only provides the loader and shader tooling, not
+        # hardware drivers — without Mesa, package-gpu-libs.sh has no ICD to
+        # bundle and the packaged backend finds no GPU at runtime.
         if [ "amd64" = "$TARGETARCH" ]; then
             wget "https://sdk.lunarg.com/sdk/download/1.4.335.0/linux/vulkansdk-linux-x86_64-1.4.335.0.tar.xz" && \
             tar -xf vulkansdk-linux-x86_64-1.4.335.0.tar.xz && \
@@ -120,6 +131,7 @@ RUN <<EOT bash
         apt-get update && \
         apt-get install -y --no-install-recommends \
             cuda-nvcc-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} \
+            cuda-nvrtc-dev-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} \
             libcufft-dev-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} \
             libcurand-dev-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} \
             libcublas-dev-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} \
@@ -162,6 +174,7 @@ RUN if [ "${BUILD_TYPE}" = "hipblas" ] && [ "${SKIP_DRIVERS}" = "false" ]; then 
         apt-get update && \
         apt-get install -y --no-install-recommends \
             hipblas-dev \
+            hipblaslt-dev \
             rocblas-dev && \
         apt-get clean && \
         rm -rf /var/lib/apt/lists/* && \
@@ -202,9 +215,20 @@ COPY scripts/build/package-gpu-libs.sh /package-gpu-libs.sh
 ARG FROM_SOURCE=""
 ENV FROM_SOURCE=${FROM_SOURCE}
 
+# Cache-buster for the per-backend `make` step. Most Python backends list
+# unpinned deps (torch, transformers, vllm, ...), so a warm registry cache
+# would otherwise freeze upstream versions indefinitely. CI passes a value
+# that rolls weekly so the install layer is rebuilt at most once per week
+# and picks up newer wheels from PyPI / nightly indexes.
+ARG DEPS_REFRESH=initial
+
 RUN cd /${BACKEND} && PORTABLE_PYTHON=true make
 
-# Package GPU libraries into the backend's lib directory
+# Package GPU libraries into the backend's lib directory.
+#
+# Must stay after the venv is built above: package-gpu-libs.sh inspects
+# /${BACKEND}/venv to decide whether this backend already carries a complete
+# cuDNN from pip, and bundles one only when it does not (issue #10905).
 RUN mkdir -p /${BACKEND}/lib && \
     TARGET_LIB_DIR="/${BACKEND}/lib" BUILD_TYPE="${BUILD_TYPE}" CUDA_MAJOR_VERSION="${CUDA_MAJOR_VERSION}" \
     bash /package-gpu-libs.sh "/${BACKEND}/lib"

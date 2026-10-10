@@ -8,6 +8,7 @@ import (
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/core/gallery"
 	"github.com/mudler/LocalAI/core/services/advisorylock"
+	"github.com/mudler/LocalAI/core/services/galleryop"
 	"github.com/mudler/LocalAI/pkg/model"
 	"github.com/mudler/LocalAI/pkg/system"
 	"github.com/mudler/xlog"
@@ -26,6 +27,12 @@ type UpgradeChecker struct {
 	galleries   []config.Gallery
 	systemState *system.SystemState
 	db          *gorm.DB // non-nil in distributed mode
+	// backendManagerFn lazily returns the current backend manager (may be
+	// swapped from Local to Distributed after startup). Pulled through each
+	// check so the UpgradeChecker uses whichever is active. In distributed
+	// mode this ensures CheckUpgrades asks workers instead of the (empty)
+	// frontend filesystem — fixing the bug where upgrades never surfaced.
+	backendManagerFn func() galleryop.BackendManager
 
 	checkInterval time.Duration
 	stop          chan struct{}
@@ -40,18 +47,22 @@ type UpgradeChecker struct {
 // NewUpgradeChecker creates a new UpgradeChecker service.
 // Pass db=nil for standalone mode, or a *gorm.DB for distributed mode
 // (uses advisory locks so only one instance runs periodic checks).
-func NewUpgradeChecker(appConfig *config.ApplicationConfig, ml *model.ModelLoader, db *gorm.DB) *UpgradeChecker {
+// backendManagerFn is optional; when set, CheckUpgrades is routed through
+// the active backend manager — required in distributed mode so the check
+// aggregates from workers rather than the empty frontend filesystem.
+func NewUpgradeChecker(appConfig *config.ApplicationConfig, ml *model.ModelLoader, db *gorm.DB, backendManagerFn func() galleryop.BackendManager) *UpgradeChecker {
 	return &UpgradeChecker{
-		appConfig:     appConfig,
-		modelLoader:   ml,
-		galleries:     appConfig.BackendGalleries,
-		systemState:   appConfig.SystemState,
-		db:            db,
-		checkInterval: 6 * time.Hour,
-		stop:          make(chan struct{}),
-		done:          make(chan struct{}),
-		triggerCh:     make(chan struct{}, 1),
-		lastUpgrades:  make(map[string]gallery.UpgradeInfo),
+		appConfig:        appConfig,
+		modelLoader:      ml,
+		galleries:        appConfig.BackendGalleries,
+		systemState:      appConfig.SystemState,
+		db:               db,
+		backendManagerFn: backendManagerFn,
+		checkInterval:    6 * time.Hour,
+		stop:             make(chan struct{}),
+		done:             make(chan struct{}),
+		triggerCh:        make(chan struct{}, 1),
+		lastUpgrades:     make(map[string]gallery.UpgradeInfo),
 	}
 }
 
@@ -64,13 +75,16 @@ func NewUpgradeChecker(appConfig *config.ApplicationConfig, ml *model.ModelLoade
 func (uc *UpgradeChecker) Run(ctx context.Context) {
 	defer close(uc.done)
 
-	// Initial delay: don't slow down startup
+	// Initial delay: don't slow down startup. Short enough that operators
+	// don't stare at an empty upgrade banner for long; long enough that
+	// workers have registered and reported their installed backends.
+	initialDelay := 10 * time.Second
 	select {
 	case <-ctx.Done():
 		return
 	case <-uc.stop:
 		return
-	case <-time.After(30 * time.Second):
+	case <-time.After(initialDelay):
 	}
 
 	// First check always runs locally (to warm the cache on this instance)
@@ -144,7 +158,18 @@ func (uc *UpgradeChecker) GetAvailableUpgrades() map[string]gallery.UpgradeInfo 
 }
 
 func (uc *UpgradeChecker) runCheck(ctx context.Context) {
-	upgrades, err := gallery.CheckBackendUpgrades(ctx, uc.galleries, uc.systemState)
+	var (
+		upgrades map[string]gallery.UpgradeInfo
+		err      error
+	)
+	if uc.backendManagerFn != nil {
+		if bm := uc.backendManagerFn(); bm != nil {
+			upgrades, err = bm.CheckUpgrades(ctx)
+		}
+	}
+	if upgrades == nil && err == nil {
+		upgrades, err = gallery.CheckBackendUpgrades(ctx, uc.galleries, uc.systemState)
+	}
 
 	uc.mu.Lock()
 	uc.lastCheckTime = time.Now()
@@ -174,13 +199,32 @@ func (uc *UpgradeChecker) runCheck(ctx context.Context) {
 		}
 	}
 
-	// Auto-upgrade if enabled
+	// Auto-upgrade if enabled. Route through the active BackendManager so
+	// distributed-mode upgrades fan out to workers via NATS — calling
+	// gallery.UpgradeBackend directly would look up the backend on the
+	// frontend filesystem, which is empty in distributed mode and produces
+	// "backend not found" while the cluster still reports an upgrade.
 	if uc.appConfig.AutoUpgradeBackends {
+		var bm galleryop.BackendManager
+		if uc.backendManagerFn != nil {
+			bm = uc.backendManagerFn()
+		}
 		for name, info := range upgrades {
 			xlog.Info("Auto-upgrading backend", "backend", name,
 				"from", info.InstalledVersion, "to", info.AvailableVersion)
-			if err := gallery.UpgradeBackend(ctx, uc.systemState, uc.modelLoader,
-				uc.galleries, name, nil); err != nil {
+			var err error
+			if bm != nil {
+				// Background auto-upgrade: no live admin watching a progress bar,
+				// so op.ID is empty and the distributed path skips progress streaming.
+				err = bm.UpgradeBackend(ctx, &galleryop.ManagementOp[gallery.GalleryBackend, any]{
+					GalleryElementName: name,
+					Upgrade:            true,
+				}, nil)
+			} else {
+				err = gallery.UpgradeBackend(ctx, uc.systemState, uc.modelLoader,
+					uc.galleries, name, nil, uc.appConfig.RequireBackendIntegrity)
+			}
+			if err != nil {
 				xlog.Error("Failed to auto-upgrade backend",
 					"backend", name, "error", err)
 			} else {
@@ -188,8 +232,16 @@ func (uc *UpgradeChecker) runCheck(ctx context.Context) {
 					"version", info.AvailableVersion)
 			}
 		}
-		// Re-check to update cache after upgrades
-		if freshUpgrades, err := gallery.CheckBackendUpgrades(ctx, uc.galleries, uc.systemState); err == nil {
+		// Re-check to update cache after upgrades. Route through the same
+		// BackendManager so distributed mode reflects the worker view.
+		var freshUpgrades map[string]gallery.UpgradeInfo
+		var freshErr error
+		if bm != nil {
+			freshUpgrades, freshErr = bm.CheckUpgrades(ctx)
+		} else {
+			freshUpgrades, freshErr = gallery.CheckBackendUpgrades(ctx, uc.galleries, uc.systemState)
+		}
+		if freshErr == nil {
 			uc.mu.Lock()
 			uc.lastUpgrades = freshUpgrades
 			uc.mu.Unlock()

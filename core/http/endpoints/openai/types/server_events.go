@@ -18,36 +18,48 @@ const (
 	ServerEventTypeConversationItemInputAudioTranscriptionDelta     ServerEventType = "conversation.item.input_audio_transcription.delta"
 	ServerEventTypeConversationItemInputAudioTranscriptionSegment   ServerEventType = "conversation.item.input_audio_transcription.segment"
 	ServerEventTypeConversationItemInputAudioTranscriptionFailed    ServerEventType = "conversation.item.input_audio_transcription.failed"
+	ServerEventTypeConversationItemSoundDetection                   ServerEventType = "conversation.item.sound_detection"
 	ServerEventTypeConversationItemTruncated                        ServerEventType = "conversation.item.truncated"
 	ServerEventTypeConversationItemDeleted                          ServerEventType = "conversation.item.deleted"
-	ServerEventTypeInputAudioBufferCommitted                        ServerEventType = "input_audio_buffer.committed"
-	ServerEventTypeInputAudioBufferCleared                          ServerEventType = "input_audio_buffer.cleared"
-	ServerEventTypeInputAudioBufferSpeechStarted                    ServerEventType = "input_audio_buffer.speech_started"
-	ServerEventTypeInputAudioBufferSpeechStopped                    ServerEventType = "input_audio_buffer.speech_stopped"
-	ServerEventTypeInputAudioBufferTimeoutTriggered                 ServerEventType = "input_audio_buffer.timeout_triggered"
-	ServerEventTypeResponseCreated                                  ServerEventType = "response.created"
-	ServerEventTypeResponseDone                                     ServerEventType = "response.done"
-	ServerEventTypeResponseOutputItemAdded                          ServerEventType = "response.output_item.added"
-	ServerEventTypeResponseOutputItemDone                           ServerEventType = "response.output_item.done"
-	ServerEventTypeResponseContentPartAdded                         ServerEventType = "response.content_part.added"
-	ServerEventTypeResponseContentPartDone                          ServerEventType = "response.content_part.done"
-	ServerEventTypeResponseOutputTextDelta                          ServerEventType = "response.output_text.delta"
-	ServerEventTypeResponseOutputTextDone                           ServerEventType = "response.output_text.done"
-	ServerEventTypeResponseOutputAudioTranscriptDelta               ServerEventType = "response.output_audio_transcript.delta"
-	ServerEventTypeResponseOutputAudioTranscriptDone                ServerEventType = "response.output_audio_transcript.done"
-	ServerEventTypeResponseOutputAudioDelta                         ServerEventType = "response.output_audio.delta"
-	ServerEventTypeResponseOutputAudioDone                          ServerEventType = "response.output_audio.done"
-	ServerEventTypeResponseFunctionCallArgumentsDelta               ServerEventType = "response.function_call_arguments.delta"
-	ServerEventTypeResponseFunctionCallArgumentsDone                ServerEventType = "response.function_call_arguments.done"
-	ServerEventTypeResponseMcpCallArgumentsDelta                    ServerEventType = "response.mcp_call_arguments.delta"
-	ServerEventTypeResponseMcpCallArgumentsDone                     ServerEventType = "response.mcp_call_arguments.done"
-	ServerEventTypeResponseMcpCallInProgress                        ServerEventType = "response.mcp_call.in_progress"
-	ServerEventTypeResponseMcpCallCompleted                         ServerEventType = "response.mcp_call.completed"
-	ServerEventTypeResponseMcpCallFailed                            ServerEventType = "response.mcp_call.failed"
-	ServerEventTypeMcpListToolsInProgress                           ServerEventType = "mcp_list_tools.in_progress"
-	ServerEventTypeMcpListToolsCompleted                            ServerEventType = "mcp_list_tools.completed"
-	ServerEventTypeMcpListToolsFailed                               ServerEventType = "mcp_list_tools.failed"
-	ServerEventTypeRateLimitsUpdated                                ServerEventType = "rate_limits.updated"
+	// ServerEventTypeConversationItemSpeaker is a LocalAI extension: it reports
+	// the recognized speaker for a user audio item. OpenAI clients ignore it.
+	ServerEventTypeConversationItemSpeaker ServerEventType = "conversation.item.speaker"
+	// ServerEventTypeClassifierResult is a LocalAI extension: it carries the
+	// classifier-mode score distribution and decision for a response. OpenAI
+	// clients ignore it.
+	ServerEventTypeClassifierResult ServerEventType = "localai.classifier.result"
+	// ServerEventTypeModelFailover is a LocalAI extension: it names the target
+	// that serves a pipeline stage backed by a failover chain, at session start
+	// and on every chain switch. OpenAI clients ignore it.
+	ServerEventTypeModelFailover                      ServerEventType = "localai.model.failover"
+	ServerEventTypeInputAudioBufferCommitted          ServerEventType = "input_audio_buffer.committed"
+	ServerEventTypeInputAudioBufferCleared            ServerEventType = "input_audio_buffer.cleared"
+	ServerEventTypeInputAudioBufferSpeechStarted      ServerEventType = "input_audio_buffer.speech_started"
+	ServerEventTypeInputAudioBufferSpeechStopped      ServerEventType = "input_audio_buffer.speech_stopped"
+	ServerEventTypeInputAudioBufferTimeoutTriggered   ServerEventType = "input_audio_buffer.timeout_triggered"
+	ServerEventTypeResponseCreated                    ServerEventType = "response.created"
+	ServerEventTypeResponseDone                       ServerEventType = "response.done"
+	ServerEventTypeResponseOutputItemAdded            ServerEventType = "response.output_item.added"
+	ServerEventTypeResponseOutputItemDone             ServerEventType = "response.output_item.done"
+	ServerEventTypeResponseContentPartAdded           ServerEventType = "response.content_part.added"
+	ServerEventTypeResponseContentPartDone            ServerEventType = "response.content_part.done"
+	ServerEventTypeResponseOutputTextDelta            ServerEventType = "response.output_text.delta"
+	ServerEventTypeResponseOutputTextDone             ServerEventType = "response.output_text.done"
+	ServerEventTypeResponseOutputAudioTranscriptDelta ServerEventType = "response.output_audio_transcript.delta"
+	ServerEventTypeResponseOutputAudioTranscriptDone  ServerEventType = "response.output_audio_transcript.done"
+	ServerEventTypeResponseOutputAudioDelta           ServerEventType = "response.output_audio.delta"
+	ServerEventTypeResponseOutputAudioDone            ServerEventType = "response.output_audio.done"
+	ServerEventTypeResponseFunctionCallArgumentsDelta ServerEventType = "response.function_call_arguments.delta"
+	ServerEventTypeResponseFunctionCallArgumentsDone  ServerEventType = "response.function_call_arguments.done"
+	ServerEventTypeResponseMcpCallArgumentsDelta      ServerEventType = "response.mcp_call_arguments.delta"
+	ServerEventTypeResponseMcpCallArgumentsDone       ServerEventType = "response.mcp_call_arguments.done"
+	ServerEventTypeResponseMcpCallInProgress          ServerEventType = "response.mcp_call.in_progress"
+	ServerEventTypeResponseMcpCallCompleted           ServerEventType = "response.mcp_call.completed"
+	ServerEventTypeResponseMcpCallFailed              ServerEventType = "response.mcp_call.failed"
+	ServerEventTypeMcpListToolsInProgress             ServerEventType = "mcp_list_tools.in_progress"
+	ServerEventTypeMcpListToolsCompleted              ServerEventType = "mcp_list_tools.completed"
+	ServerEventTypeMcpListToolsFailed                 ServerEventType = "mcp_list_tools.failed"
+	ServerEventTypeRateLimitsUpdated                  ServerEventType = "rate_limits.updated"
 )
 
 // ServerEvent is the interface for server events.
@@ -335,6 +347,33 @@ func (m ConversationItemAddedEvent) MarshalJSON() ([]byte, error) {
 	return json.Marshal(shadow)
 }
 
+// ConversationItemSpeakerEvent reports the recognized speaker for a user audio
+// item. LocalAI extension; not part of the OpenAI Realtime API.
+type ConversationItemSpeakerEvent struct {
+	ServerEventBase
+	// ItemID is the conversation item this speaker belongs to.
+	ItemID string `json:"item_id"`
+	// Speaker is the recognized identity.
+	Speaker Speaker `json:"speaker"`
+}
+
+func (m ConversationItemSpeakerEvent) ServerEventType() ServerEventType {
+	return ServerEventTypeConversationItemSpeaker
+}
+
+func (m ConversationItemSpeakerEvent) MarshalJSON() ([]byte, error) {
+	type typeAlias ConversationItemSpeakerEvent
+	type typeWrapper struct {
+		typeAlias
+		Type ServerEventType `json:"type"`
+	}
+	shadow := typeWrapper{
+		typeAlias: typeAlias(m),
+		Type:      m.ServerEventType(),
+	}
+	return json.Marshal(shadow)
+}
+
 // Returned when a conversation item is finalized.
 //
 // The event will include the full content of the Item except for audio data, which can be retrieved separately with a `conversation.item.retrieve` event if needed.
@@ -443,6 +482,64 @@ func (m ConversationItemInputAudioTranscriptionCompletedEvent) MarshalJSON() ([]
 	return json.Marshal(shadow)
 }
 
+// SoundDetectionTag is one scored sound-event tag from the sound-event
+// classifier. Label is the human-readable AudioSet class name, Score is the
+// per-class probability (multi-label, independent), and Index is the class
+// index in the model ontology.
+type SoundDetectionTag struct {
+	// The human-readable AudioSet class name (e.g. "Baby cry, infant cry").
+	Label string `json:"label"`
+
+	// The per-class probability for this tag.
+	Score float32 `json:"score"`
+
+	// The class index in the model ontology.
+	Index int `json:"index"`
+}
+
+// Returned when a committed input audio window has been classified by a
+// sound-event-detection model. This is a LocalAI extension to the OpenAI
+// Realtime API: when a pipeline configures sound_detection, each VAD-committed
+// utterance is run through the classifier and the scored AudioSet tags are
+// emitted as this event, independent of (and alongside) transcription.
+type ConversationItemSoundDetectionEvent struct {
+	ServerEventBase
+	// The ID of the item.
+	ItemID string `json:"item_id"`
+
+	// The index of the content part in the item's content array.
+	ContentIndex int `json:"content_index"`
+
+	// The scored sound-event tags, in score-descending order.
+	Detections []SoundDetectionTag `json:"detections"`
+
+	// The start time of the detection window in seconds, when known. Set by
+	// the live scene-event path (a companion sound stream alongside live
+	// transcription); omitted by the unary/windowed sound-detection paths,
+	// which have no per-event timing.
+	Start *float64 `json:"start,omitempty"`
+
+	// The end time of the detection window in seconds, when known.
+	End *float64 `json:"end,omitempty"`
+}
+
+func (m ConversationItemSoundDetectionEvent) ServerEventType() ServerEventType {
+	return ServerEventTypeConversationItemSoundDetection
+}
+
+func (m ConversationItemSoundDetectionEvent) MarshalJSON() ([]byte, error) {
+	type typeAlias ConversationItemSoundDetectionEvent
+	type typeWrapper struct {
+		typeAlias
+		Type ServerEventType `json:"type"`
+	}
+	shadow := typeWrapper{
+		typeAlias: typeAlias(m),
+		Type:      m.ServerEventType(),
+	}
+	return json.Marshal(shadow)
+}
+
 // Returned when the text value of an input audio transcription content part is updated with incremental transcription results.
 //
 // See https://platform.openai.com/docs/api-reference/realtime-server-events/conversation/item/input_audio_transcription/delta
@@ -498,11 +595,17 @@ type ConversationItemInputAudioTranscriptionSegmentEvent struct {
 	// The speaker label for the segment, if available.
 	Speaker string `json:"speaker,omitempty"`
 
-	// The start time of the segment in seconds.
-	Start float64 `json:"start,omitempty"`
+	// The registered name of the speaker, when the backend recognised a
+	// voice registered through /v1/voice/register.
+	SpeakerName string `json:"speaker_name,omitempty"`
 
-	// The end time of the segment in seconds.
-	End float64 `json:"end,omitempty"`
+	// The start time of the segment in seconds. Always present (not
+	// omitempty: a segment starting at 0.0s must still carry "start").
+	Start float64 `json:"start"`
+
+	// The end time of the segment in seconds. Always present (not
+	// omitempty: see Start).
+	End float64 `json:"end"`
 
 	// The text content of the segment.
 	Text string `json:"text,omitempty"`

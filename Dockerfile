@@ -1,16 +1,27 @@
 ARG BASE_IMAGE=ubuntu:24.04
-ARG GRPC_BASE_IMAGE=${BASE_IMAGE}
 ARG INTEL_BASE_IMAGE=${BASE_IMAGE}
 ARG UBUNTU_CODENAME=noble
+# Optional alternate Ubuntu apt mirror(s). Empty = use upstream.
+# See .docker/apt-mirror.sh for accepted values.
+ARG APT_MIRROR=""
+ARG APT_PORTS_MIRROR=""
 
 FROM ${BASE_IMAGE} AS requirements
 
+ARG APT_MIRROR
+ARG APT_PORTS_MIRROR
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && \
+# hwdata ships /usr/share/hwdata/pci.ids. Without it, the ghw library we use
+# for hardware detection cannot resolve PCI vendor IDs and fails to enumerate
+# GPUs at all, so the image reports "No GPU detected" (see issue #10941).
+RUN --mount=type=bind,source=.docker/apt-mirror.sh,target=/usr/local/sbin/apt-mirror \
+    APT_MIRROR="${APT_MIRROR}" APT_PORTS_MIRROR="${APT_PORTS_MIRROR}" sh /usr/local/sbin/apt-mirror && \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates curl wget espeak-ng libgomp1 \
-        ffmpeg libopenblas0 libopenblas-dev libopus0 sox && \
+        ffmpeg libopenblas0 libopenblas-dev libopus0 sox \
+        hwdata && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -101,6 +112,7 @@ RUN <<EOT bash
         apt-get update && \
         apt-get install -y --no-install-recommends \
             cuda-nvcc-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} \
+            cuda-nvrtc-dev-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} \
             libcufft-dev-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} \
             libcurand-dev-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} \
             libcublas-dev-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} \
@@ -149,6 +161,7 @@ RUN if [ "${BUILD_TYPE}" = "hipblas" ] && [ "${SKIP_DRIVERS}" = "false" ]; then 
         apt-get update && \
         apt-get install -y --no-install-recommends \
             hipblas-dev \
+            hipblaslt-dev \
             rocblas-dev && \
         apt-get clean && \
         rm -rf /var/lib/apt/lists/* && \
@@ -160,6 +173,17 @@ RUN if [ "${BUILD_TYPE}" = "hipblas" ] && [ "${SKIP_DRIVERS}" = "false" ]; then 
 
 RUN if [ "${BUILD_TYPE}" = "hipblas" ]; then \
     ln -s /opt/rocm-**/lib/llvm/lib/libomp.so /usr/lib/libomp.so \
+    ; fi
+
+# ROCm's bundled libdrm_amdgpu is built with a hardcoded fallback lookup path
+# for the ASIC ID table (/opt/amdgpu/share/libdrm/amdgpu.ids), which only exists
+# if AMD's full amdgpu graphics/DKMS stack is installed. This compute-only image
+# doesn't have it, so hipblas/rocBLAS log "No such file or directory" on every
+# model load and can fail to identify the GPU. Point it at the equivalent file
+# Ubuntu's libdrm-common package already ships.
+RUN if [ "${BUILD_TYPE}" = "hipblas" ] && [ -f /usr/share/libdrm/amdgpu.ids ] && [ ! -e /opt/amdgpu/share/libdrm/amdgpu.ids ]; then \
+    mkdir -p /opt/amdgpu/share/libdrm && \
+    ln -s /usr/share/libdrm/amdgpu.ids /opt/amdgpu/share/libdrm/amdgpu.ids \
     ; fi
 
 RUN expr "${BUILD_TYPE}" = intel && echo "intel" > /run/localai/capability || echo "not intel"
@@ -240,10 +264,14 @@ WORKDIR /build
 # This is a temporary workaround until Intel fixes their repository
 FROM ${INTEL_BASE_IMAGE} AS intel
 ARG UBUNTU_CODENAME=noble
+ARG APT_MIRROR
+ARG APT_PORTS_MIRROR
 RUN wget -qO - https://repositories.intel.com/gpu/intel-graphics.key | \
 gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg
 RUN echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu ${UBUNTU_CODENAME}/lts/2350 unified" > /etc/apt/sources.list.d/intel-graphics.list
-RUN apt-get update && \
+RUN --mount=type=bind,source=.docker/apt-mirror.sh,target=/usr/local/sbin/apt-mirror \
+    APT_MIRROR="${APT_MIRROR}" APT_PORTS_MIRROR="${APT_PORTS_MIRROR}" sh /usr/local/sbin/apt-mirror && \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
         intel-oneapi-runtime-libs && \
     apt-get clean && \
@@ -293,7 +321,7 @@ EOT
 ###################################
 
 # Build React UI
-FROM node:25-slim AS react-ui-builder
+FROM node:26-slim AS react-ui-builder
 WORKDIR /app
 COPY core/http/react-ui/package*.json ./
 RUN npm install
@@ -365,7 +393,12 @@ RUN go install github.com/mikefarah/yq/v4@latest
 # If you cannot find a more suitable place for an addition, this layer is a suitable place for it.
 FROM requirements-drivers
 
-ENV HEALTHCHECK_ENDPOINT=http://localhost:8080/readyz
+# Optional override for the HEALTHCHECK target. Left empty so healthcheck.sh
+# derives the endpoint from the mode the container is actually running — the
+# same image runs `local-ai run` (HTTP on 8080) and `local-ai worker` (HTTP on
+# the gRPC base port minus one), and a hardcoded default marked every worker
+# permanently unhealthy (#10987). Set it to pin an explicit URL.
+ENV HEALTHCHECK_ENDPOINT=""
 
 ARG CUDA_MAJOR_VERSION=12
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -375,6 +408,7 @@ ENV NVIDIA_VISIBLE_DEVICES=all
 WORKDIR /
 
 COPY ./entrypoint.sh .
+COPY ./scripts/build/healthcheck.sh .
 
 # Copy the binary
 COPY --from=builder /build/local-ai ./
@@ -385,9 +419,22 @@ RUN --mount=from=builder,src=/build/,dst=/mnt/build \
 # Make sure the models directory exists
 RUN mkdir -p /models /backends /data
 
-# Define the health check command
-HEALTHCHECK --interval=1m --timeout=10m --retries=10 \
-  CMD curl -f ${HEALTHCHECK_ENDPOINT} || exit 1
+# Define the health check command.
+#
+# --start-period is the knob for slow starts, not --timeout/--retries. Since
+# #10949 a frontend's startup preload materializes HuggingFace artifacts before
+# the HTTP server binds (31 GB observed on a live cluster), so a healthy replica
+# can legitimately fail probes for a long time. Failures inside the start period
+# leave the container `starting` instead of burning retries, and the period ends
+# early on the first success — so a generous value costs a fast-starting
+# container nothing. A process that actually died is handled by the restart
+# policy, not by health.
+#
+# --timeout is a per-probe deadline: 10m meant a wedged probe could hang for ten
+# minutes and stretch detection without bound. A localhost curl that has not
+# answered in 10s is itself the fault being detected.
+HEALTHCHECK --start-period=60m --interval=1m --timeout=10s --retries=3 \
+  CMD /healthcheck.sh
 
 VOLUME /models /backends /configuration /data
 EXPOSE 8080

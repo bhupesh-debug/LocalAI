@@ -97,10 +97,10 @@ func (t *SoundGenerationCMD) Run(ctx *cliContext.Context) error {
 		inputFile = &t.InputFile
 	}
 
-	filePath, _, err := backend.SoundGeneration(text,
+	filePath, _, err := backend.SoundGeneration(context.Background(), text,
 		parseToFloat32Ptr(t.Duration), parseToFloat32Ptr(t.Temperature), &t.DoSample,
 		inputFile, parseToInt32Ptr(t.InputFileSampleDivisor),
-		nil, "", "", nil, "", "", "", nil,
+		nil, "", "", nil, "", "", "", nil, nil,
 		ml, opts, options)
 
 	if err != nil {

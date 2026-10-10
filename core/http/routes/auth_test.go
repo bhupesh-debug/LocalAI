@@ -5,9 +5,11 @@ package routes_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
@@ -216,9 +218,11 @@ func newTestAuthApp(db *gorm.DB, appConfig *config.ApplicationConfig) *echo.Echo
 		result := make([]map[string]any, 0, len(keys))
 		for _, k := range keys {
 			result = append(result, map[string]any{
-				"id":        k.ID,
-				"name":      k.Name,
-				"keyPrefix": k.KeyPrefix,
+				"id":          k.ID,
+				"name":        k.Name,
+				"keyPrefix":   k.KeyPrefix,
+				"disabled":    k.Disabled,
+				"pausedUntil": k.PausedUntil,
 			})
 		}
 		return c.JSON(http.StatusOK, map[string]any{"keys": result})
@@ -235,6 +239,40 @@ func newTestAuthApp(db *gorm.DB, appConfig *config.ApplicationConfig) *echo.Echo
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "API key not found"})
 		}
 		return c.JSON(http.StatusOK, map[string]string{"message": "API key revoked"})
+	})
+
+	// PATCH /api/auth/api-keys/:id - pause or resume an API key
+	e.PATCH("/api/auth/api-keys/:id", func(c echo.Context) error {
+		user := auth.GetUser(c)
+		if user == nil {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "not authenticated"})
+		}
+
+		var body struct {
+			Disabled    bool    `json:"disabled"`
+			PausedUntil *string `json:"paused_until"`
+		}
+		if err := c.Bind(&body); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		}
+
+		var pausedUntil *time.Time
+		if body.PausedUntil != nil && *body.PausedUntil != "" {
+			t, err := time.Parse(time.RFC3339, *body.PausedUntil)
+			if err != nil {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid paused_until format, use RFC3339"})
+			}
+			pausedUntil = &t
+		}
+
+		if err := auth.SetAPIKeyPause(db, c.Param("id"), user.ID, body.Disabled, pausedUntil); err != nil {
+			if errors.Is(err, auth.ErrPauseInPast) {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			}
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "API key not found"})
+		}
+
+		return c.JSON(http.StatusOK, map[string]string{"message": "API key updated"})
 	})
 
 	// Admin: GET /api/auth/admin/users
@@ -276,13 +314,52 @@ func newTestAuthApp(db *gorm.DB, appConfig *config.ApplicationConfig) *echo.Echo
 		if currentUser.ID == targetID {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "cannot delete yourself"})
 		}
-		db.Where("user_id = ?", targetID).Delete(&auth.Session{})
-		db.Where("user_id = ?", targetID).Delete(&auth.UserAPIKey{})
-		result := db.Where("id = ?", targetID).Delete(&auth.User{})
-		if result.RowsAffected == 0 {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+		if err := auth.DeleteUserCascade(db, targetID); err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+			}
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete user: " + err.Error()})
 		}
 		return c.JSON(http.StatusOK, map[string]string{"message": "user deleted"})
+	}, adminMw)
+
+	// Mirror of production handler in routes/auth.go GET /api/auth/usage/sources.
+	// Keep this body in sync with the real handler; this test app cannot call
+	// RegisterAuthRoutes because it needs a *application.Application.
+	e.GET("/api/auth/usage/sources", func(c echo.Context) error {
+		user := auth.GetUser(c)
+		if user == nil {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "not authenticated"})
+		}
+		period := c.QueryParam("period")
+		if period == "" {
+			period = "month"
+		}
+		buckets, totals, err := auth.GetUserUsageBySource(db, user.ID, period)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get usage"})
+		}
+		return c.JSON(http.StatusOK, map[string]any{
+			"buckets": buckets, "totals": totals, "truncated": false,
+		})
+	})
+
+	// Mirror of production handler in routes/auth.go GET /api/auth/admin/usage/sources.
+	// Keep this body in sync with the real handler.
+	e.GET("/api/auth/admin/usage/sources", func(c echo.Context) error {
+		period := c.QueryParam("period")
+		if period == "" {
+			period = "month"
+		}
+		userID := c.QueryParam("user_id")
+		apiKeyID := c.QueryParam("api_key_id")
+		buckets, totals, truncated, err := auth.GetAllUsageBySource(db, period, userID, apiKeyID)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get usage"})
+		}
+		return c.JSON(http.StatusOK, map[string]any{
+			"buckets": buckets, "totals": totals, "truncated": truncated,
+		})
 	}, adminMw)
 
 	// Regular API endpoint for testing
@@ -579,6 +656,97 @@ var _ = Describe("Auth Routes", Label("auth"), func() {
 		})
 	})
 
+	Context("PATCH /api/auth/api-keys/:id", func() {
+		patchKey := func(app *echo.Echo, id, sessionID string, body map[string]any) *httptest.ResponseRecorder {
+			b, _ := json.Marshal(body)
+			return doAuthRequest(app, "PATCH", "/api/auth/api-keys/"+id, b, withSession(sessionID))
+		}
+
+		It("pauses a key indefinitely and resumes it", func() {
+			user := createRouteTestUser(db, "pause@test.com", auth.RoleUser)
+			plaintext, record, err := auth.CreateAPIKey(db, user.ID, "pausable", auth.RoleUser, "", nil)
+			Expect(err).ToNot(HaveOccurred())
+			sessionID, _ := auth.CreateSession(db, user.ID, "")
+			app := newTestAuthApp(db, appConfig)
+
+			rec := patchKey(app, record.ID, sessionID, map[string]any{"disabled": true, "paused_until": nil})
+			Expect(rec.Code).To(Equal(http.StatusOK))
+
+			rec = doAuthRequest(app, "GET", "/v1/models", nil, withBearer(plaintext))
+			Expect(rec.Code).To(Equal(http.StatusUnauthorized))
+
+			rec = doAuthRequest(app, "GET", "/api/auth/api-keys", nil, withSession(sessionID))
+			var resp map[string]any
+			Expect(json.Unmarshal(rec.Body.Bytes(), &resp)).To(Succeed())
+			entry := resp["keys"].([]any)[0].(map[string]any)
+			Expect(entry["disabled"]).To(BeTrue())
+
+			rec = patchKey(app, record.ID, sessionID, map[string]any{"disabled": false, "paused_until": nil})
+			Expect(rec.Code).To(Equal(http.StatusOK))
+
+			rec = doAuthRequest(app, "GET", "/v1/models", nil, withBearer(plaintext))
+			Expect(rec.Code).To(Equal(http.StatusOK))
+		})
+
+		It("pauses a key until a future time and lists the resume time", func() {
+			user := createRouteTestUser(db, "pause-until@test.com", auth.RoleUser)
+			plaintext, record, _ := auth.CreateAPIKey(db, user.ID, "timed", auth.RoleUser, "", nil)
+			sessionID, _ := auth.CreateSession(db, user.ID, "")
+			app := newTestAuthApp(db, appConfig)
+
+			until := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+			rec := patchKey(app, record.ID, sessionID, map[string]any{"disabled": false, "paused_until": until})
+			Expect(rec.Code).To(Equal(http.StatusOK))
+
+			rec = doAuthRequest(app, "GET", "/v1/models", nil, withBearer(plaintext))
+			Expect(rec.Code).To(Equal(http.StatusUnauthorized))
+
+			rec = doAuthRequest(app, "GET", "/api/auth/api-keys", nil, withSession(sessionID))
+			var resp map[string]any
+			Expect(json.Unmarshal(rec.Body.Bytes(), &resp)).To(Succeed())
+			entry := resp["keys"].([]any)[0].(map[string]any)
+			Expect(entry["pausedUntil"]).ToNot(BeNil())
+		})
+
+		It("rejects a pause time in the past", func() {
+			user := createRouteTestUser(db, "pause-past@test.com", auth.RoleUser)
+			_, record, _ := auth.CreateAPIKey(db, user.ID, "k", auth.RoleUser, "", nil)
+			sessionID, _ := auth.CreateSession(db, user.ID, "")
+			app := newTestAuthApp(db, appConfig)
+
+			past := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+			rec := patchKey(app, record.ID, sessionID, map[string]any{"paused_until": past})
+			Expect(rec.Code).To(Equal(http.StatusBadRequest))
+		})
+
+		It("rejects a malformed pause time", func() {
+			user := createRouteTestUser(db, "pause-bad@test.com", auth.RoleUser)
+			_, record, _ := auth.CreateAPIKey(db, user.ID, "k", auth.RoleUser, "", nil)
+			sessionID, _ := auth.CreateSession(db, user.ID, "")
+			app := newTestAuthApp(db, appConfig)
+
+			rec := patchKey(app, record.ID, sessionID, map[string]any{"paused_until": "tomorrow"})
+			Expect(rec.Code).To(Equal(http.StatusBadRequest))
+		})
+
+		It("returns 404 for another user's key", func() {
+			owner := createRouteTestUser(db, "pause-owner@test.com", auth.RoleUser)
+			other := createRouteTestUser(db, "pause-other@test.com", auth.RoleAdmin)
+			_, record, _ := auth.CreateAPIKey(db, owner.ID, "k", auth.RoleUser, "", nil)
+			sessionID, _ := auth.CreateSession(db, other.ID, "")
+			app := newTestAuthApp(db, appConfig)
+
+			rec := patchKey(app, record.ID, sessionID, map[string]any{"disabled": true})
+			Expect(rec.Code).To(Equal(http.StatusNotFound))
+		})
+
+		It("returns 401 when not authenticated", func() {
+			app := newTestAuthApp(db, appConfig)
+			rec := doAuthRequest(app, "PATCH", "/api/auth/api-keys/x", []byte(`{"disabled":true}`))
+			Expect(rec.Code).To(Equal(http.StatusUnauthorized))
+		})
+	})
+
 	Context("Admin: GET /api/auth/admin/users", func() {
 		It("returns all users for admin", func() {
 			admin := createRouteTestUser(db, "admin@test.com", auth.RoleAdmin)
@@ -685,6 +853,107 @@ var _ = Describe("Auth Routes", Label("auth"), func() {
 
 			rec := doAuthRequest(app, "DELETE", "/api/auth/admin/users/"+target.ID, nil, withSession(sessionID))
 			Expect(rec.Code).To(Equal(http.StatusForbidden))
+		})
+
+		// Regression coverage for the production bug: in distributed mode the
+		// auth DB is PostgreSQL, which strictly enforces foreign keys. The old
+		// handler did not clean up invite_codes, user_permissions, quota_rules,
+		// or usage_records, which either caused FK violations (surfaced as a
+		// misleading 404 "user not found") or left orphan rows after delete.
+		It("removes invite codes the user authored", func() {
+			admin := createRouteTestUser(db, "admin-inv-author@test.com", auth.RoleAdmin)
+			target := createRouteTestUser(db, "deletes-author@test.com", auth.RoleAdmin)
+			Expect(db.Create(&auth.InviteCode{
+				ID: uuid.New().String(), Code: "code-authored", CodePrefix: "code-aut",
+				CreatedBy: target.ID, ExpiresAt: time.Now().Add(time.Hour),
+			}).Error).ToNot(HaveOccurred())
+			sessionID, _ := auth.CreateSession(db, admin.ID, "")
+			app := newTestAuthApp(db, appConfig)
+
+			rec := doAuthRequest(app, "DELETE", "/api/auth/admin/users/"+target.ID, nil, withSession(sessionID))
+			Expect(rec.Code).To(Equal(http.StatusOK))
+
+			var count int64
+			db.Model(&auth.InviteCode{}).Where("created_by = ?", target.ID).Count(&count)
+			Expect(count).To(Equal(int64(0)))
+		})
+
+		It("nulls used_by on invite codes the user consumed", func() {
+			admin := createRouteTestUser(db, "admin-inv-consumer@test.com", auth.RoleAdmin)
+			target := createRouteTestUser(db, "deletes-consumer@test.com", auth.RoleUser)
+			usedBy := target.ID
+			now := time.Now()
+			Expect(db.Create(&auth.InviteCode{
+				ID: uuid.New().String(), Code: "code-used", CodePrefix: "code-use",
+				CreatedBy: admin.ID, UsedBy: &usedBy, UsedAt: &now,
+				ExpiresAt: now.Add(time.Hour),
+			}).Error).ToNot(HaveOccurred())
+			sessionID, _ := auth.CreateSession(db, admin.ID, "")
+			app := newTestAuthApp(db, appConfig)
+
+			rec := doAuthRequest(app, "DELETE", "/api/auth/admin/users/"+target.ID, nil, withSession(sessionID))
+			Expect(rec.Code).To(Equal(http.StatusOK))
+
+			// Audit row stays, but no longer points to the deleted user.
+			var stale int64
+			db.Model(&auth.InviteCode{}).Where("used_by = ?", target.ID).Count(&stale)
+			Expect(stale).To(Equal(int64(0)))
+			var total int64
+			db.Model(&auth.InviteCode{}).Where("created_by = ?", admin.ID).Count(&total)
+			Expect(total).To(Equal(int64(1)))
+		})
+
+		It("wipes permissions, quotas, and usage metrics", func() {
+			admin := createRouteTestUser(db, "admin-clean@test.com", auth.RoleAdmin)
+			target := createRouteTestUser(db, "deletes-clean@test.com", auth.RoleUser)
+
+			Expect(auth.UpdateUserPermissions(db, target.ID, auth.PermissionMap{auth.FeatureChat: true})).ToNot(HaveOccurred())
+			max := int64(100)
+			_, err := auth.CreateOrUpdateQuotaRule(db, target.ID, "", &max, nil, 3600)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(auth.RecordUsage(db, &auth.UsageRecord{
+				UserID: target.ID, UserName: target.Name, Model: "test-model",
+				Endpoint: "/v1/chat/completions", PromptTokens: 5, CompletionTokens: 10, TotalTokens: 15,
+			})).ToNot(HaveOccurred())
+
+			sessionID, _ := auth.CreateSession(db, admin.ID, "")
+			app := newTestAuthApp(db, appConfig)
+
+			rec := doAuthRequest(app, "DELETE", "/api/auth/admin/users/"+target.ID, nil, withSession(sessionID))
+			Expect(rec.Code).To(Equal(http.StatusOK))
+
+			var perms, quotas, usage int64
+			db.Model(&auth.UserPermission{}).Where("user_id = ?", target.ID).Count(&perms)
+			db.Model(&auth.QuotaRule{}).Where("user_id = ?", target.ID).Count(&quotas)
+			db.Model(&auth.UsageRecord{}).Where("user_id = ?", target.ID).Count(&usage)
+			Expect(perms).To(Equal(int64(0)))
+			Expect(quotas).To(Equal(int64(0)))
+			Expect(usage).To(Equal(int64(0)))
+		})
+
+		It("returns 200 even when foreign keys are enforced and the user authored invites", func() {
+			// Mirror PostgreSQL's strict FK behavior on the SQLite test DB. This
+			// exercises exactly the production failure: without the cleanup,
+			// the user delete would be rejected by the engine and the handler
+			// would surface a misleading 404.
+			Expect(db.Exec("PRAGMA foreign_keys = ON").Error).ToNot(HaveOccurred())
+
+			admin := createRouteTestUser(db, "admin-fk@test.com", auth.RoleAdmin)
+			target := createRouteTestUser(db, "deletes-fk@test.com", auth.RoleAdmin)
+			Expect(db.Create(&auth.InviteCode{
+				ID: uuid.New().String(), Code: "code-fk", CodePrefix: "code-fk1",
+				CreatedBy: target.ID, ExpiresAt: time.Now().Add(time.Hour),
+			}).Error).ToNot(HaveOccurred())
+
+			sessionID, _ := auth.CreateSession(db, admin.ID, "")
+			app := newTestAuthApp(db, appConfig)
+
+			rec := doAuthRequest(app, "DELETE", "/api/auth/admin/users/"+target.ID, nil, withSession(sessionID))
+			Expect(rec.Code).To(Equal(http.StatusOK), "body=%s", rec.Body.String())
+
+			var users int64
+			db.Model(&auth.User{}).Where("id = ?", target.ID).Count(&users)
+			Expect(users).To(Equal(int64(0)))
 		})
 	})
 
@@ -827,6 +1096,112 @@ var _ = Describe("Auth Routes", Label("auth"), func() {
 			providers := resp["providers"].([]any)
 			Expect(providers).To(ContainElement(auth.ProviderLocal))
 			Expect(providers).To(ContainElement(auth.ProviderGitHub))
+		})
+	})
+
+	Describe("GET /api/auth/usage/sources", func() {
+		It("returns only the caller's data, never legacy", func() {
+			app := newTestAuthApp(db, appConfig)
+
+			alice := createRouteTestUser(db, "alice@example.com", auth.RoleUser)
+			aliceToken, err := auth.CreateSession(db, alice.ID, "")
+			Expect(err).ToNot(HaveOccurred())
+
+			keyID := "k-alice"
+			now := time.Now()
+			Expect(auth.RecordUsage(db, &auth.UsageRecord{
+				UserID: alice.ID, Source: auth.UsageSourceAPIKey,
+				APIKeyID: &keyID, APIKeyName: "alice-key",
+				Model: "gpt-4", TotalTokens: 100, CreatedAt: now,
+			})).To(Succeed())
+			Expect(auth.RecordUsage(db, &auth.UsageRecord{
+				UserID: alice.ID, Source: auth.UsageSourceWeb,
+				Model: "gpt-4", TotalTokens: 50, CreatedAt: now,
+			})).To(Succeed())
+			Expect(auth.RecordUsage(db, &auth.UsageRecord{
+				UserID: "legacy-api-key", Source: auth.UsageSourceLegacy,
+				Model: "gpt-4", TotalTokens: 30, CreatedAt: now,
+			})).To(Succeed())
+
+			rec := doAuthRequest(app, http.MethodGet, "/api/auth/usage/sources?period=month", nil, withSession(aliceToken))
+			Expect(rec.Code).To(Equal(http.StatusOK))
+
+			var resp struct {
+				Buckets   []auth.UsageBucket `json:"buckets"`
+				Totals    auth.SourceTotals  `json:"totals"`
+				Truncated bool               `json:"truncated"`
+			}
+			Expect(json.Unmarshal(rec.Body.Bytes(), &resp)).To(Succeed())
+			_, hasLegacy := resp.Totals.BySource[auth.UsageSourceLegacy]
+			Expect(hasLegacy).To(BeFalse())
+			Expect(resp.Totals.GrandTotal.Tokens).To(Equal(int64(150)))
+			Expect(resp.Truncated).To(BeFalse())
+		})
+
+		It("returns 401 when unauthenticated", func() {
+			app := newTestAuthApp(db, appConfig)
+
+			// Without a session cookie or bearer token, the global auth middleware
+			// should refuse the request before our handler runs.
+			rec := doAuthRequest(app, http.MethodGet, "/api/auth/usage/sources?period=month", nil)
+			Expect(rec.Code).To(Equal(http.StatusUnauthorized))
+		})
+	})
+
+	Describe("GET /api/auth/admin/usage/sources", func() {
+		It("returns 403 for non-admin", func() {
+			app := newTestAuthApp(db, appConfig)
+
+			alice := createRouteTestUser(db, "alice@example.com", auth.RoleUser)
+			aliceToken, _ := auth.CreateSession(db, alice.ID, "")
+
+			rec := doAuthRequest(app, http.MethodGet, "/api/auth/admin/usage/sources?period=month", nil, withSession(aliceToken))
+			Expect(rec.Code).To(Equal(http.StatusForbidden))
+		})
+
+		It("returns legacy bucket for admin and applies api_key_id filter", func() {
+			app := newTestAuthApp(db, appConfig)
+
+			admin := createRouteTestUser(db, "admin@example.com", auth.RoleAdmin)
+			adminToken, _ := auth.CreateSession(db, admin.ID, "")
+
+			k1 := "k1"
+			k2 := "k2"
+			now := time.Now()
+			Expect(auth.RecordUsage(db, &auth.UsageRecord{UserID: "alice", Source: auth.UsageSourceAPIKey, APIKeyID: &k1, APIKeyName: "ci", Model: "gpt-4", TotalTokens: 10, CreatedAt: now})).To(Succeed())
+			Expect(auth.RecordUsage(db, &auth.UsageRecord{UserID: "alice", Source: auth.UsageSourceAPIKey, APIKeyID: &k2, APIKeyName: "lap", Model: "gpt-4", TotalTokens: 20, CreatedAt: now})).To(Succeed())
+			Expect(auth.RecordUsage(db, &auth.UsageRecord{UserID: "legacy-api-key", Source: auth.UsageSourceLegacy, Model: "gpt-4", TotalTokens: 5, CreatedAt: now})).To(Succeed())
+
+			rec := doAuthRequest(app, http.MethodGet,
+				"/api/auth/admin/usage/sources?period=month&api_key_id=k2", nil, withSession(adminToken))
+			Expect(rec.Code).To(Equal(http.StatusOK))
+
+			var resp struct {
+				Totals    auth.SourceTotals `json:"totals"`
+				Truncated bool              `json:"truncated"`
+			}
+			Expect(json.Unmarshal(rec.Body.Bytes(), &resp)).To(Succeed())
+			Expect(resp.Totals.GrandTotal.Tokens).To(Equal(int64(20)))
+		})
+
+		It("includes legacy in by_source for admin with no filter", func() {
+			app := newTestAuthApp(db, appConfig)
+
+			admin := createRouteTestUser(db, "admin@example.com", auth.RoleAdmin)
+			adminToken, _ := auth.CreateSession(db, admin.ID, "")
+
+			now := time.Now()
+			Expect(auth.RecordUsage(db, &auth.UsageRecord{UserID: "legacy-api-key", Source: auth.UsageSourceLegacy, Model: "gpt-4", TotalTokens: 7, CreatedAt: now})).To(Succeed())
+
+			rec := doAuthRequest(app, http.MethodGet, "/api/auth/admin/usage/sources?period=month", nil, withSession(adminToken))
+			Expect(rec.Code).To(Equal(http.StatusOK))
+
+			var resp struct {
+				Totals auth.SourceTotals `json:"totals"`
+			}
+			Expect(json.Unmarshal(rec.Body.Bytes(), &resp)).To(Succeed())
+			Expect(resp.Totals.BySource).To(HaveKey(auth.UsageSourceLegacy))
+			Expect(resp.Totals.BySource[auth.UsageSourceLegacy].Tokens).To(Equal(int64(7)))
 		})
 	})
 })

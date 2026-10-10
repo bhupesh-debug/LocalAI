@@ -23,6 +23,30 @@ if [ "x${BUILD_PROFILE}" == "xcpu" ]; then
     EXTRA_PIP_INSTALL_FLAGS+=" --index-strategy=unsafe-best-match"
 fi
 
+# cublas12 needs a cu128 torch index (see requirements-cublas12.txt) — without
+# unsafe-best-match uv falls through to default PyPI's cu130 torch wheel and
+# the resulting sgl-kernel can't load on our cu12 host libs.
+if [ "x${BUILD_PROFILE}" == "xcublas12" ]; then
+    EXTRA_PIP_INSTALL_FLAGS+=" --index-strategy=unsafe-best-match"
+fi
+
+# sglang 0.5.11 (Gemma 4 support) declares flash-attn-4 as a hard dep, but
+# upstream only publishes pre-release wheels (4.0.0b*). uv rejects
+# pre-releases by default — opt in for sglang specifically. Drop this once
+# flash-attn-4 4.0 stable lands.
+EXTRA_PIP_INSTALL_FLAGS+=" --prerelease=allow"
+
+# JetPack 7 / L4T arm64 sglang + torch wheels come straight from PyPI now
+# (torch 2.11+ ships aarch64 + cu130 manylinux wheels and sglang 0.5.11+
+# ships a cp312 aarch64 wheel pinned to that torch). They're cp312-only,
+# so bump the venv Python accordingly.
+# https://pytorch.org/blog/vllm-and-pytorch-work-together-to-improve-the-developer-experience-on-aarch64/
+if [ "x${BUILD_PROFILE}" == "xl4t13" ]; then
+    PYTHON_VERSION="3.12"
+    PYTHON_PATCH="12"
+    PY_STANDALONE_TAG="20251120"
+fi
+
 # sglang's CPU path has no prebuilt wheel on PyPI — upstream publishes
 # a separate pyproject_cpu.toml that must be swapped in before `pip install`.
 # Reference: docker/xeon.Dockerfile in the sglang upstream repo.
@@ -61,9 +85,15 @@ if [ "x${BUILD_TYPE}" == "x" ] || [ "x${FROM_SOURCE:-}" == "xtrue" ]; then
     # The resulting binary still requires an AVX-512 capable CPU at runtime,
     # same constraint sglang upstream documents in docker/xeon.Dockerfile.
 
+    # Pin the source build to the same release the GPU path floors on
+    # (0.5.11, see requirements-cublas12-after.txt). An unpinned master clone
+    # pulls in newer CPU kernels (e.g. mamba/fla.cpp) that fail to compile
+    # (constexpr non-constant + kineto_LIBRARY-NOTFOUND). Bump deliberately.
+    SGLANG_VERSION="${SGLANG_VERSION:-v0.5.11}"
     _sgl_src=$(mktemp -d)
     trap 'rm -rf "${_sgl_src}"' EXIT
-    git clone --depth 1 https://github.com/sgl-project/sglang "${_sgl_src}/sglang"
+    git clone --depth 1 --branch "${SGLANG_VERSION}" \
+        https://github.com/sgl-project/sglang "${_sgl_src}/sglang"
 
     # Patch -march=native → -march=sapphirerapids in the CPU kernel CMakeLists
     sed -i 's/-march=native/-march=sapphirerapids/g' \

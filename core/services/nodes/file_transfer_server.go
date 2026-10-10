@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -22,6 +23,7 @@ import (
 	"github.com/mudler/LocalAI/core/services/storage"
 	"github.com/mudler/LocalAI/pkg/downloader"
 	"github.com/mudler/LocalAI/pkg/model"
+	"github.com/mudler/LocalAI/pkg/safefile"
 	"github.com/mudler/xlog"
 )
 
@@ -30,26 +32,66 @@ const (
 	HeaderContentSHA256 = "X-Content-SHA256"
 	HeaderLocalPath     = "X-Local-Path"
 	HeaderFileSize      = "X-File-Size"
-	hashSidecarSuffix   = ".sha256"
+	// HeaderTargetSHA256 is set on HEAD responses for partial (resumable) uploads
+	// to expose the expected final SHA-256 of the in-progress file. When set,
+	// the file on disk is not yet verified — the client may resume by
+	// PUT'ing the remainder with a matching X-Content-SHA256 header. A full-size
+	// file can still carry this marker if finalization was interrupted.
+	HeaderTargetSHA256 = "X-Target-SHA256"
+	hashSidecarSuffix  = ".sha256"
+	// targetSidecarSuffix stores the expected final SHA-256 of a partially
+	// uploaded file. Used to detect mid-flight content mismatches across
+	// resumed PUT requests.
+	targetSidecarSuffix = ".sha256.target"
 )
 
 // StartFileTransferServer starts a small HTTP server for file transfer in distributed mode.
 // It provides PUT/GET/POST endpoints for uploading, downloading, and allocating temp files,
 // as well as backend log REST and WebSocket endpoints when logStore is non-nil.
 // Auth is via Bearer token (registration token), using constant-time comparison.
-func StartFileTransferServer(addr, stagingDir, modelsDir, dataDir, token string, maxUploadSize int64, logStore ...*model.BackendLogStore) (*http.Server, error) {
+// A nil readiness fails open, keeping /readyz's historical always-200 answer.
+func StartFileTransferServer(addr, stagingDir, modelsDir, dataDir, token string, maxUploadSize int64, readiness *WorkerReadiness, logStore ...*model.BackendLogStore) (*http.Server, error) {
+	return StartFileTransferServerWithCapacity(addr, stagingDir, modelsDir, dataDir, token, maxUploadSize, readiness, nil, logStore...)
+}
+
+// StartFileTransferServerWithCapacity starts the file transfer server with a
+// worker-local guard for per-request ephemeral inputs.
+func StartFileTransferServerWithCapacity(addr, stagingDir, modelsDir, dataDir, token string, maxUploadSize int64, readiness *WorkerReadiness, capacity EphemeralCapacity, logStore ...*model.BackendLogStore) (*http.Server, error) {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("listen %s: %w", addr, err)
 	}
-	return StartFileTransferServerWithListener(listener, stagingDir, modelsDir, dataDir, token, maxUploadSize, logStore...)
+	return startFileTransferServer(listener, stagingDir, modelsDir, dataDir, token, maxUploadSize, readiness, capacity, logStore...)
 }
 
 // StartFileTransferServerWithListener starts the server on an existing listener.
 // This avoids the TOCTOU race of closing a listener and re-binding to the same port.
 func StartFileTransferServerWithListener(lis net.Listener, stagingDir, modelsDir, dataDir, token string, maxUploadSize int64, logStore ...*model.BackendLogStore) (*http.Server, error) {
+	return startFileTransferServer(lis, stagingDir, modelsDir, dataDir, token, maxUploadSize, nil, nil, logStore...)
+}
+
+// StartFileTransferServerWithReadiness is StartFileTransferServerWithListener
+// plus a readiness gate for the /readyz probe. A nil readiness fails open, so
+// the probe keeps its historical always-200 behaviour for callers that have no
+// meaningful readiness signal to report.
+func StartFileTransferServerWithReadiness(lis net.Listener, stagingDir, modelsDir, dataDir, token string, maxUploadSize int64, readiness *WorkerReadiness, logStore ...*model.BackendLogStore) (*http.Server, error) {
+	return startFileTransferServer(lis, stagingDir, modelsDir, dataDir, token, maxUploadSize, readiness, nil, logStore...)
+}
+
+func startFileTransferServer(lis net.Listener, stagingDir, modelsDir, dataDir, token string, maxUploadSize int64, readiness *WorkerReadiness, capacity EphemeralCapacity, logStore ...*model.BackendLogStore) (*http.Server, error) {
 	if err := os.MkdirAll(stagingDir, 0750); err != nil {
 		return nil, fmt.Errorf("creating staging dir %s: %w", stagingDir, err)
+	}
+
+	// An empty token makes checkBearerToken fail open: every /v1/files,
+	// /v1/files-list and /v1/backend-logs request is served unauthenticated,
+	// granting read/write to the staging/models/data directories to anyone who
+	// can reach this port. Surface that loudly — the worker process does not
+	// run DistributedConfig.Validate(), so this is the only signal an operator
+	// gets. Set LOCALAI_REGISTRATION_TOKEN (and LOCALAI_REGISTRATION_REQUIRE_AUTH
+	// to fail closed) to protect it.
+	if token == "" {
+		xlog.Warn("HTTP file transfer server starting WITHOUT a registration token — read/write to models/staging/data is unauthenticated for anyone who can reach this port; set LOCALAI_REGISTRATION_TOKEN")
 	}
 
 	mux := http.NewServeMux()
@@ -71,6 +113,18 @@ func StartFileTransferServerWithListener(lis net.Listener, stagingDir, modelsDir
 		handleListDir(w, r, stagingDir, modelsDir, dataDir, key)
 	})
 
+	mux.HandleFunc("/v1/files-release", func(w http.ResponseWriter, r *http.Request) {
+		if !checkBearerToken(r, token) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodDelete {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		handleReleaseBatchWithCapacity(w, r, stagingDir, capacity)
+	})
+
 	mux.HandleFunc("/v1/files/", func(w http.ResponseWriter, r *http.Request) {
 		if !checkBearerToken(r, token) {
 			xlog.Debug("HTTP file transfer: unauthorized request", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
@@ -86,12 +140,16 @@ func StartFileTransferServerWithListener(lis net.Listener, stagingDir, modelsDir
 		case http.MethodHead:
 			handleHead(w, r, stagingDir, modelsDir, dataDir, key)
 		case http.MethodPut:
-			handleUpload(w, r, stagingDir, modelsDir, dataDir, key, maxUploadSize)
+			handleUploadWithCapacity(w, r, stagingDir, modelsDir, dataDir, key, maxUploadSize, capacity)
 		case http.MethodGet:
 			handleDownload(w, r, stagingDir, modelsDir, dataDir, key)
+		case http.MethodDelete:
+			handleReleaseWithCapacity(w, r, stagingDir, key, capacity)
 		case http.MethodPost:
 			if key == "temp" {
 				handleAllocTemp(w, r, stagingDir)
+			} else if r.URL.Query().Get("claim") == "1" {
+				handleClaimWithCapacity(w, r, stagingDir, key, capacity)
 			} else {
 				http.Error(w, "not found", http.StatusNotFound)
 			}
@@ -109,6 +167,33 @@ func StartFileTransferServerWithListener(lis net.Listener, stagingDir, modelsDir
 		registerBackendLogHandlers(mux, token, ls)
 	}
 
+	// Liveness/readiness probes — unauthenticated so container orchestrators
+	// (Docker HEALTHCHECK, k8s probes) can hit them without the bearer token.
+	probe := func(check func() error) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			if err := check(); err != nil {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte("not ready: " + err.Error()))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		}
+	}
+
+	// Liveness: reaching this point means the listener is bound and the mux is
+	// serving. Deliberately independent of readiness — a worker whose NATS link
+	// is momentarily down must not be restarted, or a NATS blip becomes a
+	// cluster-wide restart storm.
+	mux.HandleFunc("/healthz", probe(func() error { return nil }))
+	// Readiness: "can this worker actually accept work?" See WorkerReadiness.
+	mux.HandleFunc("/readyz", probe(readiness.Check))
+
 	addr := lis.Addr().String()
 	server := &http.Server{
 		Handler:           mux,
@@ -123,6 +208,163 @@ func StartFileTransferServerWithListener(lis net.Listener, stagingDir, modelsDir
 	}()
 
 	return server, nil
+}
+
+// handleClaimWithCapacity marks an existing ephemeral file as owned by the
+// request that just verified its content.
+func handleClaimWithCapacity(w http.ResponseWriter, _ *http.Request, stagingDir, key string, capacity EphemeralCapacity) {
+	if err := validateEphemeralReleaseKey(key); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if operations, ok := capacity.(ephemeralRequestOperationCapacity); ok {
+		requestID := strings.Split(key, "/")[2]
+		if err := operations.BeginRequestOperation(requestID); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		defer operations.EndRequestOperation(requestID)
+	}
+	filePath := filepath.Join(stagingDir, filepath.FromSlash(key))
+	if err := validatePathInDir(filePath, stagingDir); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	info, err := os.Lstat(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "not found", http.StatusNotFound)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+	if !info.Mode().IsRegular() {
+		http.Error(w, "ephemeral path is not a regular file", http.StatusBadRequest)
+		return
+	}
+	if capacity != nil {
+		if err := capacity.Claim(filePath); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInsufficientStorage)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func handleRelease(w http.ResponseWriter, _ *http.Request, stagingDir, key string) {
+	handleReleaseWithCapacity(w, nil, stagingDir, key, nil)
+}
+
+func handleReleaseWithCapacity(w http.ResponseWriter, _ *http.Request, stagingDir, key string, capacity EphemeralCapacity) {
+	if err := releaseEphemeralStagingKey(stagingDir, key, capacity); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, safefile.ErrUnsafePath) || validateEphemeralReleaseKey(key) != nil {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func handleReleaseBatchWithCapacity(w http.ResponseWriter, r *http.Request, stagingDir string, capacity EphemeralCapacity) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var request struct {
+		RequestID string `json:"request_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, fmt.Sprintf("decoding release batch: %v", err), http.StatusBadRequest)
+		return
+	}
+	if err := validateEphemeralRequestID(request.RequestID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := releaseEphemeralStagingRequest(r.Context(), stagingDir, request.RequestID, capacity); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func releaseEphemeralStagingRequest(ctx context.Context, stagingDir, requestID string, capacity EphemeralCapacity) error {
+	if err := validateEphemeralRequestID(requestID); err != nil {
+		return err
+	}
+	if requestCapacity, ok := capacity.(ephemeralRequestCapacity); ok {
+		if err := requestCapacity.BeginRequestRelease(ctx, requestID); err != nil {
+			return fmt.Errorf("beginning release for request %q: %w", requestID, err)
+		}
+		defer requestCapacity.EndRequestRelease(requestID)
+	}
+	root := filepath.Join(stagingDir, "ephemeral")
+	categories, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var releaseErrors []error
+	for _, category := range categories {
+		if !category.IsDir() || category.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		requestDir := filepath.Join(root, category.Name(), requestID)
+		info, err := os.Lstat(requestDir)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				releaseErrors = append(releaseErrors, fmt.Errorf("stating request directory %q: %w", requestDir, err))
+			}
+			continue
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			releaseErrors = append(releaseErrors, fmt.Errorf("ephemeral request path %q is not a real directory", requestDir))
+			continue
+		}
+		entries, err := os.ReadDir(requestDir)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				releaseErrors = append(releaseErrors, fmt.Errorf("reading request directory %q: %w", requestDir, err))
+			}
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				releaseErrors = append(releaseErrors, fmt.Errorf("unexpected directory in ephemeral request %q", filepath.Join(requestDir, entry.Name())))
+				continue
+			}
+			key := filepath.ToSlash(filepath.Join("ephemeral", category.Name(), requestID, entry.Name()))
+			if err := releaseEphemeralStagingKey(stagingDir, key, capacity); err != nil {
+				releaseErrors = append(releaseErrors, fmt.Errorf("releasing %q: %w", key, err))
+			}
+		}
+	}
+	return errors.Join(releaseErrors...)
+}
+
+func releaseEphemeralStagingKey(stagingDir, key string, capacity EphemeralCapacity) error {
+	if err := validateEphemeralReleaseKey(key); err != nil {
+		return err
+	}
+	relativePath := filepath.FromSlash(key)
+	filePath := filepath.Join(stagingDir, relativePath)
+	if err := safefile.RemoveExact(stagingDir, relativePath, []string{hashSidecarSuffix, targetSidecarSuffix}, 2); err != nil {
+		return err
+	}
+	for _, path := range []string{filePath, filePath + hashSidecarSuffix, filePath + targetSidecarSuffix} {
+		if capacity != nil {
+			if err := capacity.Release(path); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func handleHead(w http.ResponseWriter, r *http.Request, stagingDir, modelsDir, dataDir, key string) {
@@ -154,7 +396,25 @@ func handleHead(w http.ResponseWriter, r *http.Request, stagingDir, modelsDir, d
 	}
 
 	w.Header().Set(HeaderFileSize, strconv.FormatInt(info.Size(), 10))
+	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 	w.Header().Set(HeaderLocalPath, filePath)
+	// Advertise resumable-upload support so clients know they may send
+	// Content-Range PUTs to continue partial transfers.
+	w.Header().Set("Accept-Ranges", "bytes")
+
+	// If a target-hash sidecar is present the file on disk is a partial
+	// upload, not a finished file. Expose the expected final hash via
+	// X-Target-SHA256 and skip emitting X-Content-SHA256 (which would otherwise
+	// be the hash of just the bytes received so far — misleading for clients
+	// trying to decide whether the file is "the right one").
+	if target, err := os.ReadFile(filePath + targetSidecarSuffix); err == nil {
+		t := strings.TrimSpace(string(target))
+		if len(t) == 64 {
+			w.Header().Set(HeaderTargetSHA256, t)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+	}
 
 	hashHex, err := computeAndCacheHash(filePath)
 	if err != nil {
@@ -166,17 +426,165 @@ func handleHead(w http.ResponseWriter, r *http.Request, stagingDir, modelsDir, d
 	w.WriteHeader(http.StatusOK)
 }
 
+// contentRange describes a parsed Content-Range request header of the form
+// "bytes <start>-<end>/<total>". An end of -1 means the request is open-ended
+// (unknown end), which is unusual for uploads but accepted.
+type contentRange struct {
+	start int64
+	end   int64
+	total int64
+}
+
+// EphemeralCapacity bounds worker-local request input storage. Implementations
+// must reserve before bytes reach disk and may reconcile reservations with the
+// resulting file after a write ends.
+type EphemeralCapacity interface {
+	Reserve(path string, size int64) error
+	Commit(path string) error
+	Claim(path string) error
+	Release(path string) error
+	CapacityWriter(path string, destination io.Writer) (io.WriteCloser, error)
+}
+
+type ephemeralRequestCapacity interface {
+	BeginRequestRelease(ctx context.Context, requestID string) error
+	EndRequestRelease(requestID string)
+}
+
+type ephemeralRequestOperationCapacity interface {
+	BeginRequestOperation(requestID string) error
+	EndRequestOperation(requestID string)
+}
+
+type uploadStatusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *uploadStatusWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *uploadStatusWriter) Write(payload []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(payload)
+}
+
+type ephemeralCapacityWriteError struct{ err error }
+
+func (e *ephemeralCapacityWriteError) Error() string { return e.err.Error() }
+func (e *ephemeralCapacityWriteError) Unwrap() error { return e.err }
+
+type ephemeralCapacityWriteCloser struct{ io.WriteCloser }
+
+func (w ephemeralCapacityWriteCloser) Write(payload []byte) (int, error) {
+	written, err := w.WriteCloser.Write(payload)
+	if err != nil {
+		return written, &ephemeralCapacityWriteError{err: err}
+	}
+	return written, nil
+}
+
+func (w ephemeralCapacityWriteCloser) Close() error {
+	if err := w.WriteCloser.Close(); err != nil {
+		return &ephemeralCapacityWriteError{err: err}
+	}
+	return nil
+}
+
+func uploadWriteStatus(err error) int {
+	var capacityErr *ephemeralCapacityWriteError
+	if errors.As(err, &capacityErr) {
+		return http.StatusInsufficientStorage
+	}
+	return http.StatusInternalServerError
+}
+
+// parseContentRange parses a Content-Range header value of the form
+// "bytes <start>-<end>/<total>". RFC 9110 §14.4.
+// Returns (nil, nil) when the header is empty (no range request).
+func parseContentRange(h string) (*contentRange, error) {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return nil, nil
+	}
+	const prefix = "bytes "
+	if !strings.HasPrefix(h, prefix) {
+		return nil, fmt.Errorf("invalid Content-Range: missing %q prefix", strings.TrimSpace(prefix))
+	}
+	spec := strings.TrimSpace(h[len(prefix):])
+	slash := strings.IndexByte(spec, '/')
+	if slash < 0 {
+		return nil, fmt.Errorf("invalid Content-Range: missing /total")
+	}
+	rangePart, totalPart := spec[:slash], spec[slash+1:]
+	dash := strings.IndexByte(rangePart, '-')
+	if dash < 0 {
+		return nil, fmt.Errorf("invalid Content-Range: missing - separator")
+	}
+	start, err := strconv.ParseInt(strings.TrimSpace(rangePart[:dash]), 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Content-Range start: %w", err)
+	}
+	end, err := strconv.ParseInt(strings.TrimSpace(rangePart[dash+1:]), 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Content-Range end: %w", err)
+	}
+	total, err := strconv.ParseInt(strings.TrimSpace(totalPart), 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Content-Range total: %w", err)
+	}
+	if start < 0 || end < start || total < end+1 {
+		return nil, fmt.Errorf("invalid Content-Range range: %d-%d/%d", start, end, total)
+	}
+	return &contentRange{start: start, end: end, total: total}, nil
+}
+
 func handleUpload(w http.ResponseWriter, r *http.Request, stagingDir, modelsDir, dataDir, key string, maxUploadSize int64) {
+	handleUploadWithCapacity(w, r, stagingDir, modelsDir, dataDir, key, maxUploadSize, nil)
+}
+
+func handleUploadWithCapacity(w http.ResponseWriter, r *http.Request, stagingDir, modelsDir, dataDir, key string, maxUploadSize int64, capacity EphemeralCapacity) {
 	if key == "" {
 		http.Error(w, "key is required", http.StatusBadRequest)
 		return
+	}
+	capacityEnabled := capacity != nil && strings.HasPrefix(key, "ephemeral/")
+	if capacityEnabled {
+		if err := validateEphemeralReleaseKey(key); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if operations, ok := capacity.(ephemeralRequestOperationCapacity); ok {
+			requestID := strings.Split(key, "/")[2]
+			if err := operations.BeginRequestOperation(requestID); err != nil {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
+			defer operations.EndRequestOperation(requestID)
+		}
 	}
 
 	if maxUploadSize > 0 {
 		r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
 	}
 
-	xlog.Info("Receiving file upload", "key", key, "contentLength", r.ContentLength, "remote", r.RemoteAddr)
+	// Parse optional Content-Range for resumable uploads.
+	cr, err := parseContentRange(r.Header.Get("Content-Range"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Optional expected total-file SHA-256 used to detect cross-attempt
+	// content drift on resume.
+	expectedFinalHash := strings.TrimSpace(r.Header.Get(HeaderContentSHA256))
+
+	xlog.Info("Receiving file upload", "key", key, "contentLength", r.ContentLength,
+		"contentRange", r.Header.Get("Content-Range"), "remote", r.RemoteAddr)
 
 	// Route keyed files to the appropriate directory
 	targetDir, relName := resolveKeyToDir(key, stagingDir, modelsDir, dataDir)
@@ -193,6 +601,70 @@ func handleUpload(w http.ResponseWriter, r *http.Request, stagingDir, modelsDir,
 		return
 	}
 
+	capacityEnabled = capacityEnabled && targetDir == stagingDir
+	unknownLengthCapacity := capacityEnabled && r.ContentLength < 0
+	capacityPaths := []string{dstPath, dstPath + hashSidecarSuffix, dstPath + targetSidecarSuffix}
+	if capacityEnabled {
+		if r.ContentLength >= 0 {
+			if err := capacity.Reserve(dstPath, r.ContentLength); err != nil {
+				http.Error(w, err.Error(), http.StatusInsufficientStorage)
+				return
+			}
+		}
+		for _, sidecarPath := range capacityPaths[1:] {
+			if err := capacity.Reserve(sidecarPath, sha256.Size*2); err != nil {
+				for _, reservedPath := range capacityPaths {
+					reconcileEphemeralCapacity(capacity, reservedPath, 0)
+				}
+				http.Error(w, err.Error(), http.StatusInsufficientStorage)
+				return
+			}
+		}
+	}
+
+	statusWriter := &uploadStatusWriter{ResponseWriter: w}
+	var uploadCapacity EphemeralCapacity
+	if unknownLengthCapacity {
+		uploadCapacity = capacity
+	}
+
+	if cr == nil {
+		// Non-resumable (legacy) path: truncate-create, single fire-and-forget.
+		handleFullUpload(statusWriter, r, dstPath, key, expectedFinalHash, uploadCapacity)
+	} else {
+		handleRangeUpload(statusWriter, r, dstPath, key, cr, expectedFinalHash, uploadCapacity)
+	}
+
+	if !capacityEnabled {
+		return
+	}
+	for _, capacityPath := range capacityPaths {
+		reconcileEphemeralCapacity(capacity, capacityPath, statusWriter.status)
+	}
+}
+
+func reconcileEphemeralCapacity(capacity EphemeralCapacity, path string, status int) {
+	if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
+		if err := capacity.Commit(path); err != nil {
+			xlog.Error("Committing ephemeral capacity failed", "path", path, "status", status, "error", err)
+			if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
+				xlog.Warn("Removing uncommitted ephemeral file failed", "path", path, "error", removeErr)
+			}
+			if releaseErr := capacity.Release(path); releaseErr != nil {
+				xlog.Warn("Rolling back failed ephemeral commit", "path", path, "error", releaseErr)
+			}
+		}
+	} else if err := capacity.Release(path); err != nil {
+		xlog.Warn("Rolling back ephemeral capacity failed", "path", path, "error", err)
+	}
+}
+
+// handleFullUpload writes the entire request body to dstPath, replacing any
+// existing content. This is the legacy happy-path with no Range header.
+func handleFullUpload(w http.ResponseWriter, r *http.Request, dstPath, key, expectedFinalHash string, capacity EphemeralCapacity) {
+	// Reset any in-progress resumable state.
+	_ = os.Remove(dstPath + targetSidecarSuffix)
+
 	f, err := os.Create(dstPath)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("creating file: %v", err), http.StatusInternalServerError)
@@ -200,22 +672,227 @@ func handleUpload(w http.ResponseWriter, r *http.Request, stagingDir, modelsDir,
 	}
 	defer f.Close()
 
+	var destination io.Writer = f
+	var capacityWriter io.WriteCloser
+	if capacity != nil {
+		var writer io.WriteCloser
+		writer, err = capacity.CapacityWriter(dstPath, f)
+		if err != nil {
+			_ = os.Remove(dstPath)
+			http.Error(w, err.Error(), http.StatusInsufficientStorage)
+			return
+		}
+		capacityWriter = ephemeralCapacityWriteCloser{WriteCloser: writer}
+		destination = capacityWriter
+	}
+
 	hasher := sha256.New()
-	n, err := io.Copy(f, io.TeeReader(r.Body, hasher))
+	n, err := io.Copy(destination, io.TeeReader(r.Body, hasher))
+	if capacityWriter != nil {
+		if closeErr := capacityWriter.Close(); err == nil {
+			err = closeErr
+		}
+	}
 	if err != nil {
 		os.Remove(dstPath)
 		os.Remove(dstPath + hashSidecarSuffix)
 		xlog.Error("File upload failed", "key", key, "bytesReceived", n, "contentLength", r.ContentLength, "remote", r.RemoteAddr, "error", err)
-		http.Error(w, fmt.Sprintf("writing file: %v", err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("writing file: %v", err), uploadWriteStatus(err))
 		return
 	}
 
 	hashHex := hex.EncodeToString(hasher.Sum(nil))
+	if expectedFinalHash != "" && !strings.EqualFold(expectedFinalHash, hashHex) {
+		_ = os.Remove(dstPath)
+		_ = os.Remove(dstPath + hashSidecarSuffix)
+		xlog.Error("Uploaded file SHA-256 mismatch", "key", key, "expected", expectedFinalHash, "got", hashHex)
+		http.Error(w, fmt.Sprintf("sha256 mismatch: expected %s got %s", expectedFinalHash, hashHex), http.StatusBadRequest)
+		return
+	}
+
 	if err := os.WriteFile(dstPath+hashSidecarSuffix, []byte(hashHex), 0640); err != nil {
 		xlog.Warn("Failed to write hash sidecar", "path", dstPath+hashSidecarSuffix, "error", err)
 	}
 
 	xlog.Info("File upload complete", "key", key, "path", dstPath, "size", n, "sha256", hashHex)
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(map[string]string{"local_path": dstPath}); err != nil {
+		xlog.Warn("Failed to encode upload response", "error", err)
+	}
+}
+
+// handleRangeUpload appends a Content-Range slice to dstPath, validating that
+// the request starts at the current file size. When the slice completes the
+// transfer (end+1 == total), it validates the optional expected final hash and
+// writes the sidecar.
+func handleRangeUpload(w http.ResponseWriter, r *http.Request, dstPath, key string, cr *contentRange, expectedFinalHash string, capacity EphemeralCapacity) {
+	// Determine the current on-disk size (0 if missing).
+	var currentSize int64
+	if info, err := os.Stat(dstPath); err == nil {
+		if info.IsDir() {
+			http.Error(w, "destination is a directory", http.StatusBadRequest)
+			return
+		}
+		currentSize = info.Size()
+	} else if !os.IsNotExist(err) {
+		http.Error(w, fmt.Sprintf("stat dst: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	targetSidecar := dstPath + targetSidecarSuffix
+
+	// Decide whether the existing on-disk bytes (if any) belong to the same
+	// logical file the client is uploading now. If they don't, and the client
+	// is starting from byte 0, we transparently truncate the old file and
+	// proceed — this is the natural "re-upload" case.
+	if cr.start == 0 && currentSize > 0 {
+		sameFile := false
+		if expectedFinalHash != "" {
+			// Compare the client's declared target hash against either an
+			// in-progress target sidecar OR the completed-file sidecar.
+			if t, err := os.ReadFile(targetSidecar); err == nil {
+				if strings.EqualFold(strings.TrimSpace(string(t)), expectedFinalHash) {
+					sameFile = true
+				}
+			} else if h, err := os.ReadFile(dstPath + hashSidecarSuffix); err == nil {
+				if strings.EqualFold(strings.TrimSpace(string(h)), expectedFinalHash) {
+					sameFile = true
+				}
+			}
+		}
+		if !sameFile {
+			// Different file content claimed under the same key — drop any
+			// existing bytes (completed or partial) so the new upload starts
+			// from a clean slate.
+			_ = os.Remove(dstPath)
+			_ = os.Remove(dstPath + hashSidecarSuffix)
+			_ = os.Remove(targetSidecar)
+			currentSize = 0
+		} else if currentSize == cr.total {
+			// The final bytes may have landed before a worker stopped during
+			// verification. Clients retry from zero when HEAD reports the full
+			// size without a committed hash. Verify the actual bytes, not the
+			// target sidecar, so this retry can finish without a 416 loop.
+			finalizeRangeUpload(w, dstPath, key, currentSize, expectedFinalHash)
+			return
+		}
+	}
+
+	// Cross-attempt consistency: if there's an in-progress target sidecar with
+	// a different hash than what's now being claimed, force a restart.
+	if expectedFinalHash != "" && cr.start > 0 {
+		prev, _ := os.ReadFile(targetSidecar)
+		prevHash := strings.TrimSpace(string(prev))
+		if prevHash != "" && !strings.EqualFold(prevHash, expectedFinalHash) {
+			_ = os.Remove(dstPath)
+			_ = os.Remove(dstPath + hashSidecarSuffix)
+			_ = os.Remove(targetSidecar)
+			http.Error(w, fmt.Sprintf("X-Content-SHA256 mismatch with in-progress upload (was %s, now %s); restart from byte 0", prevHash, expectedFinalHash), http.StatusConflict)
+			return
+		}
+	}
+
+	// The most important invariant: the client must continue from exactly
+	// where the server left off. If not, return 416 with the current size in
+	// the Range header so the client can re-sync.
+	if cr.start != currentSize {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", cr.total))
+		w.Header().Set(HeaderFileSize, strconv.FormatInt(currentSize, 10))
+		http.Error(w, fmt.Sprintf("Content-Range start %d does not match current file size %d", cr.start, currentSize), http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
+
+	// Open the file in append mode (create if missing).
+	f, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("opening dst: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer func() { _ = f.Close() }()
+	var destination io.Writer = f
+	var capacityWriter io.WriteCloser
+	if capacity != nil {
+		var writer io.WriteCloser
+		writer, err = capacity.CapacityWriter(dstPath, f)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInsufficientStorage)
+			return
+		}
+		capacityWriter = ephemeralCapacityWriteCloser{WriteCloser: writer}
+		destination = capacityWriter
+	}
+
+	// Persist the declared expected hash so subsequent chunks can be
+	// cross-checked.
+	if expectedFinalHash != "" {
+		if err := os.WriteFile(targetSidecar, []byte(expectedFinalHash), 0640); err != nil {
+			xlog.Warn("Failed to write target hash sidecar", "path", targetSidecar, "error", err)
+		}
+	}
+
+	expectedChunkLen := cr.end - cr.start + 1
+	limited := io.LimitReader(r.Body, expectedChunkLen)
+	n, err := io.Copy(destination, limited)
+	if capacityWriter != nil {
+		if closeErr := capacityWriter.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	if err != nil {
+		xlog.Error("Range upload chunk failed", "key", key, "bytesReceived", n, "expected", expectedChunkLen, "remote", r.RemoteAddr, "error", err)
+		http.Error(w, fmt.Sprintf("writing file: %v", err), uploadWriteStatus(err))
+		return
+	}
+	if n != expectedChunkLen {
+		xlog.Error("Range upload chunk short", "key", key, "bytesReceived", n, "expected", expectedChunkLen, "remote", r.RemoteAddr)
+		http.Error(w, fmt.Sprintf("short body: got %d expected %d", n, expectedChunkLen), http.StatusBadRequest)
+		return
+	}
+
+	newSize := currentSize + n
+
+	// If this chunk does not complete the transfer, return 308 Resume
+	// Incomplete (semantically aligns with the GCS/Tus resumable convention,
+	// which most language ecosystems treat as "keep going") and report the
+	// current size so the client can continue.
+	if newSize < cr.total {
+		w.Header().Set("Range", fmt.Sprintf("bytes=0-%d", newSize-1))
+		w.Header().Set(HeaderFileSize, strconv.FormatInt(newSize, 10))
+		w.WriteHeader(http.StatusPermanentRedirect) // 308 — "Resume Incomplete"
+		xlog.Debug("Range upload chunk accepted", "key", key, "newSize", newSize, "total", cr.total)
+		return
+	}
+
+	finalizeRangeUpload(w, dstPath, key, newSize, expectedFinalHash)
+}
+
+// finalizeRangeUpload also recovers transfers interrupted after the last byte
+// was written, so it must hash the file rather than trust cached metadata.
+func finalizeRangeUpload(w http.ResponseWriter, dstPath, key string, size int64, expectedFinalHash string) {
+	targetSidecar := dstPath + targetSidecarSuffix
+	finalHash, err := downloader.CalculateSHA(dstPath)
+	if err != nil {
+		xlog.Error("Failed to compute final hash on range upload", "path", dstPath, "error", err)
+		http.Error(w, fmt.Sprintf("computing final hash: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if expectedFinalHash != "" && !strings.EqualFold(expectedFinalHash, finalHash) {
+		_ = os.Remove(dstPath)
+		_ = os.Remove(dstPath + hashSidecarSuffix)
+		_ = os.Remove(targetSidecar)
+		xlog.Error("Resumed upload SHA-256 mismatch", "key", key, "expected", expectedFinalHash, "got", finalHash)
+		http.Error(w, fmt.Sprintf("sha256 mismatch: expected %s got %s", expectedFinalHash, finalHash), http.StatusBadRequest)
+		return
+	}
+
+	if err := os.WriteFile(dstPath+hashSidecarSuffix, []byte(finalHash), 0640); err != nil {
+		xlog.Warn("Failed to write hash sidecar", "path", dstPath+hashSidecarSuffix, "error", err)
+	}
+	// Clear the in-progress sidecar — upload is committed.
+	_ = os.Remove(targetSidecar)
+
+	xlog.Info("Resumable file upload complete", "key", key, "path", dstPath, "size", size, "sha256", finalHash)
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(map[string]string{"local_path": dstPath}); err != nil {

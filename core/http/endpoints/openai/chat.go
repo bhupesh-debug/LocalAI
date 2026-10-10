@@ -3,6 +3,8 @@ package openai
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -12,6 +14,7 @@ import (
 	mcpTools "github.com/mudler/LocalAI/core/http/endpoints/mcp"
 	"github.com/mudler/LocalAI/core/http/middleware"
 	"github.com/mudler/LocalAI/core/schema"
+	"github.com/mudler/LocalAI/core/services/cloudproxy"
 	"github.com/mudler/LocalAI/pkg/functions"
 	reason "github.com/mudler/LocalAI/pkg/reasoning"
 
@@ -21,6 +24,106 @@ import (
 
 	"github.com/mudler/xlog"
 )
+
+// messageText returns the textual content of a message, preferring the
+// middleware-populated StringContent and falling back to a string Content.
+func messageText(m schema.Message) string {
+	if m.StringContent != "" {
+		return m.StringContent
+	}
+	if s, ok := m.Content.(string); ok {
+		return s
+	}
+	return ""
+}
+
+// hasSystemMessage reports whether the message slice already contains a
+// non-empty system-role message — used to avoid clobbering a caller-supplied
+// system prompt when the LocalAI Assistant modality is on. Empty / whitespace
+// system turns (historically sent by the web Chat UI) are ignored so they do
+// not suppress the model config system_prompt.
+func hasSystemMessage(messages []schema.Message) bool {
+	for _, m := range messages {
+		if m.Role == "system" && strings.TrimSpace(messageText(m)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// stripEmptySystemMessages drops system-role messages whose content is empty
+// or whitespace-only. An explicit blank system turn would otherwise satisfy
+// tokenizer chat templates' `messages[0].role == "system"` check and suppress
+// both the model's configured system_prompt and any template default.
+func stripEmptySystemMessages(messages []schema.Message) []schema.Message {
+	out := messages[:0:0]
+	for _, m := range messages {
+		if m.Role == "system" && strings.TrimSpace(messageText(m)) == "" {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// normalizeLateSystemMessages handles system-role messages that appear after the
+// leading system block, according to template.system_messages_after_first:
+// "merge" folds them into the first system message (created if absent), "user"
+// forwards them as user-role turns at their original position. Any other value
+// returns the messages unchanged. Needed for tokenizer templates that reject
+// late system turns (Qwen3.8: "System message must be at the beginning") while
+// agent frameworks append instructions mid-conversation.
+func normalizeLateSystemMessages(messages []schema.Message, mode string) []schema.Message {
+	if mode != "merge" && mode != "user" {
+		return messages
+	}
+	lead := 0
+	for lead < len(messages) && messages[lead].Role == "system" {
+		lead++
+	}
+	late := false
+	for _, m := range messages[lead:] {
+		if m.Role == "system" {
+			late = true
+			break
+		}
+	}
+	if !late {
+		return messages
+	}
+	out := make([]schema.Message, 0, len(messages)+1)
+	out = append(out, messages[:lead]...)
+	if mode == "merge" && lead == 0 {
+		out = append(out, schema.Message{Role: "system"})
+	}
+	for _, m := range messages[lead:] {
+		if m.Role != "system" {
+			out = append(out, m)
+			continue
+		}
+		text := strings.TrimSpace(messageText(m))
+		if text == "" {
+			continue
+		}
+		switch mode {
+		case "merge":
+			first := &out[0]
+			joined := strings.TrimSpace(messageText(*first))
+			if joined != "" {
+				joined += "\n\n"
+			}
+			joined += text
+			first.Content = joined
+			first.StringContent = joined
+		case "user":
+			m.Role = "user"
+			m.Content = text
+			m.StringContent = text
+			out = append(out, m)
+		}
+	}
+	return out
+}
 
 // mergeToolCallDeltas merges streaming tool call deltas into complete tool calls.
 // In SSE streaming, a single tool call arrives as multiple chunks sharing the same Index:
@@ -53,439 +156,69 @@ func mergeToolCallDeltas(existing []schema.ToolCall, deltas []schema.ToolCall) [
 	return existing
 }
 
+// applyAutoparserOverride replaces the Go-side reasoning-extraction result with
+// the C++ autoparser's classified ChatDeltas when those deltas contain
+// actionable content or reasoning. It preserves the original logprobs.
+//
+// When the autoparser did not classify any reasoning (deltaReasoning == "") but
+// deltaContent still carries an unparsed reasoning tag pair (e.g. the
+// non-jinja "pure content" fallback path on a <think> model — issue #9985),
+// the Go-side reasoning extractor is run on deltaContent as a defensive
+// fallback so <think>…</think> blocks do not leak into the OpenAI `content`
+// field.
+func applyAutoparserOverride(
+	chatDeltas []*pb.ChatDelta,
+	thinkingStartToken string,
+	reasoningConfig reason.Config,
+	existing []schema.Choice,
+) []schema.Choice {
+	if len(chatDeltas) == 0 {
+		return existing
+	}
+	deltaContent := functions.ContentFromChatDeltas(chatDeltas)
+	deltaReasoning := functions.ReasoningFromChatDeltas(chatDeltas)
+	if deltaContent == "" && deltaReasoning == "" {
+		return existing
+	}
+	// Fallback for non-jinja models (issue #9985): when the C++ autoparser
+	// did not classify reasoning but the raw content still contains a known
+	// reasoning tag pair, run Go-side extraction on the content so that the
+	// <think>…</think> block does not leak into the OpenAI `content` field.
+	// When the autoparser DID populate ReasoningContent, leave its
+	// content/reasoning split alone — trust the parser. We replace
+	// deltaContent unconditionally because ExtractReasoningWithConfig is a
+	// no-op when no tag pair matches; this also strips empty thinking
+	// blocks like "<think></think>" that some models emit when reasoning
+	// is disabled.
+	if deltaReasoning == "" && deltaContent != "" {
+		// Complete-response extraction: only honor a prefilled <think> start
+		// token when deltaContent actually closes the reasoning block. Without
+		// it the model answered directly and the whole answer must stay in
+		// content rather than be swallowed as unclosed reasoning. See
+		// reason.ExtractReasoningComplete.
+		deltaReasoning, deltaContent = reason.ExtractReasoningComplete(deltaContent, thinkingStartToken, reasoningConfig)
+	}
+	xlog.Debug("[ChatDeltas] non-SSE no-tools: overriding result with C++ autoparser deltas",
+		"content_len", len(deltaContent), "reasoning_len", len(deltaReasoning))
+	stopReason := FinishReasonStop
+	message := &schema.Message{Role: "assistant", Content: &deltaContent}
+	if deltaReasoning != "" {
+		message.Reasoning = &deltaReasoning
+	}
+	newChoice := schema.Choice{FinishReason: &stopReason, Index: 0, Message: message}
+	if len(existing) > 0 && existing[0].Logprobs != nil {
+		newChoice.Logprobs = existing[0].Logprobs
+	}
+	return []schema.Choice{newChoice}
+}
+
 // ChatEndpoint is the OpenAI Completion API endpoint https://platform.openai.com/docs/api-reference/chat/create
 // @Summary Generate a chat completions for a given prompt and model.
 // @Tags inference
 // @Param request body schema.OpenAIRequest true "query params"
 // @Success 200 {object} schema.OpenAIResponse "Response"
 // @Router /v1/chat/completions [post]
-func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator *templates.Evaluator, startupOptions *config.ApplicationConfig, natsClient mcpTools.MCPNATSClient) echo.HandlerFunc {
-	process := func(s string, req *schema.OpenAIRequest, config *config.ModelConfig, loader *model.ModelLoader, responses chan schema.OpenAIResponse, extraUsage bool, id string, created int) error {
-		initialMessage := schema.OpenAIResponse{
-			ID:      id,
-			Created: created,
-			Model:   req.Model, // we have to return what the user sent here, due to OpenAI spec.
-			Choices: []schema.Choice{{Delta: &schema.Message{Role: "assistant"}, Index: 0, FinishReason: nil}},
-			Object:  "chat.completion.chunk",
-		}
-		responses <- initialMessage
-
-		// Detect if thinking token is already in prompt or template
-		// When UseTokenizerTemplate is enabled, predInput is empty, so we check the template
-		var template string
-		if config.TemplateConfig.UseTokenizerTemplate {
-			template = config.GetModelTemplate()
-		} else {
-			template = s
-		}
-		thinkingStartToken := reason.DetectThinkingStartToken(template, &config.ReasoningConfig)
-		extractor := reason.NewReasoningExtractor(thinkingStartToken, config.ReasoningConfig)
-
-		_, _, _, err := ComputeChoices(req, s, config, cl, startupOptions, loader, func(s string, c *[]schema.Choice) {}, func(s string, tokenUsage backend.TokenUsage) bool {
-			var reasoningDelta, contentDelta string
-
-			// Always keep the Go-side extractor in sync with raw tokens so it
-			// can serve as fallback for backends without an autoparser (e.g. vLLM).
-			goReasoning, goContent := extractor.ProcessToken(s)
-
-			// When C++ autoparser chat deltas are available, prefer them — they
-			// handle model-specific formats (Gemma 4, etc.) without Go-side tags.
-			// Otherwise fall back to Go-side extraction.
-			if tokenUsage.HasChatDeltaContent() {
-				rawReasoning, cd := tokenUsage.ChatDeltaReasoningAndContent()
-				contentDelta = cd
-				reasoningDelta = extractor.ProcessChatDeltaReasoning(rawReasoning)
-			} else {
-				reasoningDelta = goReasoning
-				contentDelta = goContent
-			}
-
-			usage := schema.OpenAIUsage{
-				PromptTokens:     tokenUsage.Prompt,
-				CompletionTokens: tokenUsage.Completion,
-				TotalTokens:      tokenUsage.Prompt + tokenUsage.Completion,
-			}
-			if extraUsage {
-				usage.TimingTokenGeneration = tokenUsage.TimingTokenGeneration
-				usage.TimingPromptProcessing = tokenUsage.TimingPromptProcessing
-			}
-
-			delta := &schema.Message{}
-			if contentDelta != "" {
-				delta.Content = &contentDelta
-			}
-			if reasoningDelta != "" {
-				delta.Reasoning = &reasoningDelta
-			}
-
-			resp := schema.OpenAIResponse{
-				ID:      id,
-				Created: created,
-				Model:   req.Model, // we have to return what the user sent here, due to OpenAI spec.
-				Choices: []schema.Choice{{Delta: delta, Index: 0, FinishReason: nil}},
-				Object:  "chat.completion.chunk",
-				Usage:   usage,
-			}
-
-			responses <- resp
-			return true
-		})
-		close(responses)
-		return err
-	}
-	processTools := func(noAction string, prompt string, req *schema.OpenAIRequest, config *config.ModelConfig, loader *model.ModelLoader, responses chan schema.OpenAIResponse, extraUsage bool, id string, created int, textContentToReturn *string) error {
-		// Detect if thinking token is already in prompt or template
-		var template string
-		if config.TemplateConfig.UseTokenizerTemplate {
-			template = config.GetModelTemplate()
-		} else {
-			template = prompt
-		}
-		thinkingStartToken := reason.DetectThinkingStartToken(template, &config.ReasoningConfig)
-		extractor := reason.NewReasoningExtractor(thinkingStartToken, config.ReasoningConfig)
-
-		result := ""
-		lastEmittedCount := 0
-		sentInitialRole := false
-		hasChatDeltaToolCalls := false
-		hasChatDeltaContent := false
-
-		_, tokenUsage, chatDeltas, err := ComputeChoices(req, prompt, config, cl, startupOptions, loader, func(s string, c *[]schema.Choice) {}, func(s string, usage backend.TokenUsage) bool {
-			result += s
-
-			// Track whether ChatDeltas from the C++ autoparser contain
-			// tool calls or content, so the retry decision can account for them.
-			for _, d := range usage.ChatDeltas {
-				if len(d.ToolCalls) > 0 {
-					hasChatDeltaToolCalls = true
-				}
-				if d.Content != "" {
-					hasChatDeltaContent = true
-				}
-			}
-
-			var reasoningDelta, contentDelta string
-
-			goReasoning, goContent := extractor.ProcessToken(s)
-
-			if usage.HasChatDeltaContent() {
-				rawReasoning, cd := usage.ChatDeltaReasoningAndContent()
-				contentDelta = cd
-				reasoningDelta = extractor.ProcessChatDeltaReasoning(rawReasoning)
-			} else {
-				reasoningDelta = goReasoning
-				contentDelta = goContent
-			}
-
-			// Emit reasoning deltas in their own SSE chunks before any tool-call chunks
-			// (OpenAI spec: reasoning and tool_calls never share a delta)
-			if reasoningDelta != "" {
-				responses <- schema.OpenAIResponse{
-					ID:      id,
-					Created: created,
-					Model:   req.Model,
-					Choices: []schema.Choice{{
-						Delta: &schema.Message{Reasoning: &reasoningDelta},
-						Index: 0,
-					}},
-					Object: "chat.completion.chunk",
-				}
-			}
-
-			// Stream content deltas (cleaned of reasoning tags) while no tool calls
-			// have been detected. Once the incremental parser finds tool calls,
-			// content stops — per OpenAI spec, content and tool_calls don't mix.
-			if lastEmittedCount == 0 && contentDelta != "" {
-				if !sentInitialRole {
-					responses <- schema.OpenAIResponse{
-						ID: id, Created: created, Model: req.Model,
-						Choices: []schema.Choice{{Delta: &schema.Message{Role: "assistant"}, Index: 0}},
-						Object:  "chat.completion.chunk",
-					}
-					sentInitialRole = true
-				}
-				responses <- schema.OpenAIResponse{
-					ID: id, Created: created, Model: req.Model,
-					Choices: []schema.Choice{{
-						Delta: &schema.Message{Content: &contentDelta},
-						Index: 0,
-					}},
-					Object: "chat.completion.chunk",
-				}
-			}
-
-			// Try incremental XML parsing for streaming support using iterative parser
-			// This allows emitting partial tool calls as they're being generated
-			cleanedResult := functions.CleanupLLMResult(result, config.FunctionsConfig)
-
-			// Determine XML format from config
-			var xmlFormat *functions.XMLToolCallFormat
-			if config.FunctionsConfig.XMLFormat != nil {
-				xmlFormat = config.FunctionsConfig.XMLFormat
-			} else if config.FunctionsConfig.XMLFormatPreset != "" {
-				xmlFormat = functions.GetXMLFormatPreset(config.FunctionsConfig.XMLFormatPreset)
-			}
-
-			// Use iterative parser for streaming (partial parsing enabled)
-			// Try XML parsing first
-			partialResults, parseErr := functions.ParseXMLIterative(cleanedResult, xmlFormat, true)
-			if parseErr == nil && len(partialResults) > 0 {
-				// Emit new XML tool calls that weren't emitted before
-				if len(partialResults) > lastEmittedCount {
-					for i := lastEmittedCount; i < len(partialResults); i++ {
-						toolCall := partialResults[i]
-						initialMessage := schema.OpenAIResponse{
-							ID:      id,
-							Created: created,
-							Model:   req.Model,
-							Choices: []schema.Choice{{
-								Delta: &schema.Message{
-									Role: "assistant",
-									ToolCalls: []schema.ToolCall{
-										{
-											Index: i,
-											ID:    id,
-											Type:  "function",
-											FunctionCall: schema.FunctionCall{
-												Name: toolCall.Name,
-											},
-										},
-									},
-								},
-								Index:        0,
-								FinishReason: nil,
-							}},
-							Object: "chat.completion.chunk",
-						}
-						select {
-						case responses <- initialMessage:
-						default:
-						}
-					}
-					lastEmittedCount = len(partialResults)
-				}
-			} else {
-				// Try JSON tool call parsing for streaming.
-				// Only emit NEW tool calls (same guard as XML parser above).
-				jsonResults, jsonErr := functions.ParseJSONIterative(cleanedResult, true)
-				if jsonErr == nil && len(jsonResults) > lastEmittedCount {
-					for i := lastEmittedCount; i < len(jsonResults); i++ {
-						jsonObj := jsonResults[i]
-						name, ok := jsonObj["name"].(string)
-						if !ok || name == "" {
-							continue
-						}
-						args := "{}"
-						if argsVal, ok := jsonObj["arguments"]; ok {
-							if argsStr, ok := argsVal.(string); ok {
-								args = argsStr
-							} else {
-								argsBytes, _ := json.Marshal(argsVal)
-								args = string(argsBytes)
-							}
-						}
-						initialMessage := schema.OpenAIResponse{
-							ID:      id,
-							Created: created,
-							Model:   req.Model,
-							Choices: []schema.Choice{{
-								Delta: &schema.Message{
-									Role: "assistant",
-									ToolCalls: []schema.ToolCall{
-										{
-											Index: i,
-											ID:    id,
-											Type:  "function",
-											FunctionCall: schema.FunctionCall{
-												Name:      name,
-												Arguments: args,
-											},
-										},
-									},
-								},
-								Index:        0,
-								FinishReason: nil,
-							}},
-							Object: "chat.completion.chunk",
-						}
-						responses <- initialMessage
-					}
-					lastEmittedCount = len(jsonResults)
-				}
-			}
-			return true
-		},
-			func(attempt int) bool {
-				// After streaming completes: check if we got actionable content
-				cleaned := extractor.CleanedContent()
-				// Check for tool calls from chat deltas (will be re-checked after ComputeChoices,
-				// but we need to know here whether to retry).
-				// Also check ChatDelta flags — when the C++ autoparser is active,
-				// tool calls and content are delivered via ChatDeltas while the
-				// raw message is cleared. Without this check, we'd retry
-				// unnecessarily, losing valid results and concatenating output.
-				hasToolCalls := lastEmittedCount > 0 || hasChatDeltaToolCalls
-				hasContent := cleaned != "" || hasChatDeltaContent
-				if !hasContent && !hasToolCalls {
-					xlog.Warn("Streaming: backend produced only reasoning, retrying",
-						"reasoning_len", len(extractor.Reasoning()), "attempt", attempt+1)
-					extractor.ResetAndSuppressReasoning()
-					result = ""
-					lastEmittedCount = 0
-					sentInitialRole = false
-					hasChatDeltaToolCalls = false
-					hasChatDeltaContent = false
-					return true
-				}
-				return false
-			},
-		)
-		if err != nil {
-			return err
-		}
-		// Try using pre-parsed tool calls from C++ autoparser (chat deltas)
-		var functionResults []functions.FuncCallResults
-		var reasoning string
-
-		if deltaToolCalls := functions.ToolCallsFromChatDeltas(chatDeltas); len(deltaToolCalls) > 0 {
-			xlog.Debug("[ChatDeltas] Using pre-parsed tool calls from C++ autoparser", "count", len(deltaToolCalls))
-			functionResults = deltaToolCalls
-			// Use content/reasoning from deltas too
-			*textContentToReturn = functions.ContentFromChatDeltas(chatDeltas)
-			reasoning = functions.ReasoningFromChatDeltas(chatDeltas)
-		} else {
-			// Fallback: parse tool calls from raw text (no chat deltas from backend)
-			xlog.Debug("[ChatDeltas] no pre-parsed tool calls, falling back to Go-side text parsing")
-			reasoning = extractor.Reasoning()
-			cleanedResult := extractor.CleanedContent()
-			*textContentToReturn = functions.ParseTextContent(cleanedResult, config.FunctionsConfig)
-			cleanedResult = functions.CleanupLLMResult(cleanedResult, config.FunctionsConfig)
-			functionResults = functions.ParseFunctionCall(cleanedResult, config.FunctionsConfig)
-		}
-		xlog.Debug("[ChatDeltas] final tool call decision", "tool_calls", len(functionResults), "text_content", *textContentToReturn)
-		noActionToRun := len(functionResults) > 0 && functionResults[0].Name == noAction || len(functionResults) == 0
-
-		switch {
-		case noActionToRun:
-			usage := schema.OpenAIUsage{
-				PromptTokens:     tokenUsage.Prompt,
-				CompletionTokens: tokenUsage.Completion,
-				TotalTokens:      tokenUsage.Prompt + tokenUsage.Completion,
-			}
-			if extraUsage {
-				usage.TimingTokenGeneration = tokenUsage.TimingTokenGeneration
-				usage.TimingPromptProcessing = tokenUsage.TimingPromptProcessing
-			}
-
-			if sentInitialRole {
-				// Content was already streamed during the callback — just emit usage.
-				delta := &schema.Message{}
-				if reasoning != "" && extractor.Reasoning() == "" {
-					delta.Reasoning = &reasoning
-				}
-				responses <- schema.OpenAIResponse{
-					ID: id, Created: created, Model: req.Model,
-					Choices: []schema.Choice{{Delta: delta, Index: 0}},
-					Object:  "chat.completion.chunk",
-					Usage:   usage,
-				}
-			} else {
-				// Content was NOT streamed — send everything at once (fallback).
-				responses <- schema.OpenAIResponse{
-					ID: id, Created: created, Model: req.Model,
-					Choices: []schema.Choice{{Delta: &schema.Message{Role: "assistant"}, Index: 0}},
-					Object:  "chat.completion.chunk",
-				}
-
-				result, err := handleQuestion(config, functionResults, extractor.CleanedContent(), prompt)
-				if err != nil {
-					xlog.Error("error handling question", "error", err)
-					return err
-				}
-
-				delta := &schema.Message{Content: &result}
-				if reasoning != "" {
-					delta.Reasoning = &reasoning
-				}
-				responses <- schema.OpenAIResponse{
-					ID: id, Created: created, Model: req.Model,
-					Choices: []schema.Choice{{Delta: delta, Index: 0}},
-					Object:  "chat.completion.chunk",
-					Usage:   usage,
-				}
-			}
-
-		default:
-			for i, ss := range functionResults {
-				name, args := ss.Name, ss.Arguments
-				toolCallID := ss.ID
-				if toolCallID == "" {
-					toolCallID = id
-				}
-
-				if i < lastEmittedCount {
-					// Already emitted during streaming by the incremental
-					// JSON/XML parser — skip to avoid duplicate tool calls.
-					continue
-				}
-
-				// Tool call not yet emitted — send name + args (two chunks).
-				initialMessage := schema.OpenAIResponse{
-					ID:      id,
-					Created: created,
-					Model:   req.Model,
-					Choices: []schema.Choice{{
-						Delta: &schema.Message{
-							Role: "assistant",
-							ToolCalls: []schema.ToolCall{
-								{
-									Index: i,
-									ID:    toolCallID,
-									Type:  "function",
-									FunctionCall: schema.FunctionCall{
-										Name: name,
-									},
-								},
-							},
-						},
-						Index:        0,
-						FinishReason: nil,
-					}},
-					Object: "chat.completion.chunk",
-				}
-				responses <- initialMessage
-
-				responses <- schema.OpenAIResponse{
-					ID:      id,
-					Created: created,
-					Model:   req.Model,
-					Choices: []schema.Choice{{
-						Delta: &schema.Message{
-							Role:    "assistant",
-							Content: textContentToReturn,
-							ToolCalls: []schema.ToolCall{
-								{
-									Index: i,
-									ID:    toolCallID,
-									Type:  "function",
-									FunctionCall: schema.FunctionCall{
-										Arguments: args,
-									},
-								},
-							},
-						},
-						Index:        0,
-						FinishReason: nil,
-					}},
-					Object: "chat.completion.chunk",
-				}
-			}
-		}
-
-		close(responses)
-		return err
-	}
-
+func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator *templates.Evaluator, startupOptions *config.ApplicationConfig, agentControl mcpTools.AgentControl, assistantHolder *mcpTools.LocalAIAssistantHolder, compressor middleware.ChatCompressor) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		var textContentToReturn string
 		id := uuid.New().String()
@@ -505,6 +238,31 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 
 		xlog.Debug("Chat endpoint configuration read", "config", config)
 
+		// Drop blank system turns from the web UI (and similar clients) so they
+		// cannot suppress the model YAML system_prompt / tokenizer defaults.
+		input.Messages = stripEmptySystemMessages(input.Messages)
+		input.Messages = normalizeLateSystemMessages(input.Messages, config.TemplateConfig.SystemMessagesAfterFirst)
+
+		// Tokenizer-template models pass messages through to the backend as-is,
+		// so apply the configured system_prompt when the request did not supply
+		// one. Go-template models already receive SystemPrompt via PromptTemplateData.
+		if config.TemplateConfig.UseTokenizerTemplate && config.SystemPrompt != "" && !hasSystemMessage(input.Messages) {
+			prompt := config.SystemPrompt
+			input.Messages = append([]schema.Message{{Role: "system", Content: prompt, StringContent: prompt}}, input.Messages...)
+		}
+
+		// Cloud-proxy bail. Bypasses the local pipeline (templating,
+		// MCP injection, gRPC backend) and forwards via the cloud-
+		// proxy backend, which does the outbound HTTP. Request-side PII
+		// redaction already ran in the middleware; the response is
+		// forwarded unmodified.
+		if config.IsCloudProxyBackendPassthrough() {
+			if err := middleware.CompressChatRequest(c, compressor); err != nil {
+				return err
+			}
+			return forwardCloudProxyOpenAIViaBackend(c, config, input, ml, startupOptions)
+		}
+
 		funcs := input.Functions
 		shouldUseFn := len(input.Functions) > 0 && config.ShouldUseFunctions()
 		strictMode := false
@@ -513,6 +271,48 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 		var mcpExecutor mcpTools.ToolExecutor
 		mcpServers := mcpTools.MCPServersFromMetadata(input.Metadata)
 
+		// LocalAI Assistant modality: an admin opted into the in-process MCP
+		// admin tool surface. Runs *before* the regular MCP block — when both
+		// are set, the assistant tools win (the admin cannot mix them with
+		// per-model MCP servers in the same chat session by design).
+		assistantMode := mcpTools.LocalAIAssistantFromMetadata(input.Metadata)
+		if assistantMode {
+			if err := requireAssistantAccess(c, startupOptions.Auth.Enabled); err != nil {
+				return err
+			}
+			// Read the disable flag live: an admin can flip it via /api/settings
+			// and the next request must see the change without a restart.
+			if startupOptions.DisableLocalAIAssistant {
+				return echo.NewHTTPError(http.StatusServiceUnavailable, "LocalAI Assistant is disabled on this server")
+			}
+			if assistantHolder == nil || !assistantHolder.HasTools() {
+				return echo.NewHTTPError(http.StatusServiceUnavailable, "LocalAI Assistant is not available on this server")
+			}
+			mcpExecutor = assistantHolder.Executor()
+			mcpFuncs, discErr := mcpExecutor.DiscoverTools(c.Request().Context())
+			if discErr != nil {
+				xlog.Error("Failed to discover LocalAI Assistant tools", "error", discErr)
+				return echo.NewHTTPError(http.StatusInternalServerError, "discover assistant tools: "+discErr.Error())
+			}
+			for _, fn := range mcpFuncs {
+				funcs = append(funcs, fn)
+				input.Tools = append(input.Tools, functions.Tool{Type: "function", Function: fn})
+			}
+			shouldUseFn = len(funcs) > 0 && config.ShouldUseFunctions()
+
+			// Prepend the embedded system prompt unless the caller supplied
+			// their own system message. Why: the prompt is what teaches the
+			// model the safety rules and recipes. If a caller already has a
+			// system message they're responsible for keeping the assistant
+			// safe, so we leave it alone.
+			if !hasSystemMessage(input.Messages) {
+				prompt := assistantHolder.SystemPrompt()
+				input.Messages = append([]schema.Message{{Role: "system", Content: prompt, StringContent: prompt}}, input.Messages...)
+			}
+
+			xlog.Debug("LocalAI Assistant tools injected", "count", len(mcpFuncs))
+		}
+
 		// MCP prompt and resource injection (extracted before tool injection)
 		mcpPromptName, mcpPromptArgs := mcpTools.MCPPromptFromMetadata(input.Metadata)
 		mcpResourceURIs := mcpTools.MCPResourcesFromMetadata(input.Metadata)
@@ -520,7 +320,7 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 		if (len(mcpServers) > 0 || mcpPromptName != "" || len(mcpResourceURIs) > 0) && (config.MCP.Servers != "" || config.MCP.Stdio != "") {
 			remote, stdio, mcpErr := config.MCP.MCPConfigFromYAML()
 			if mcpErr == nil {
-				mcpExecutor = mcpTools.NewToolExecutor(c.Request().Context(), natsClient, config.Name, remote, stdio, mcpServers)
+				mcpExecutor = mcpTools.NewToolExecutor(c.Request().Context(), agentControl, config.Name, remote, stdio, mcpServers)
 
 				// Prompt and resource injection (pre-processing step — resolves locally regardless of distributed mode)
 				namedSessions, sessErr := mcpTools.NamedSessionsFromMCPConfig(config.Name, remote, stdio, mcpServers)
@@ -549,6 +349,9 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 			} else {
 				xlog.Error("Failed to parse MCP config", "error", mcpErr)
 			}
+		}
+		if err := middleware.CompressChatRequest(c, compressor); err != nil {
+			return err
 		}
 
 		xlog.Debug("Tool call routing decision",
@@ -632,7 +435,8 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 						"message": map[string]any{
 							"type":        "string",
 							"description": "The message to reply the user with",
-						}},
+						},
+					},
 				},
 			}
 
@@ -647,7 +451,7 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 			}
 
 			// Update input grammar or json_schema based on use_llama_grammar option
-			jsStruct := funcs.ToJSONStructure(config.FunctionsConfig.FunctionNameKey, config.FunctionsConfig.FunctionNameKey)
+			jsStruct := config.FunctionsConfig.ToJSONStructure(funcs)
 			g, err := jsStruct.Grammar(config.FunctionsConfig.GrammarOptions()...)
 			if err == nil {
 				config.Grammar = g
@@ -706,23 +510,37 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 
 			for mcpStreamIter := 0; mcpStreamIter <= mcpStreamMaxIterations; mcpStreamIter++ {
 				// Re-template on MCP iterations
-				if mcpStreamIter > 0 && !config.TemplateConfig.UseTokenizerTemplate {
-					predInput = evaluator.TemplateMessages(*input, input.Messages, config, funcs, shouldUseFn)
-					xlog.Debug("MCP stream re-templating", "iteration", mcpStreamIter)
+				if mcpStreamIter > 0 {
+					if err := middleware.CompressChatRequest(c, compressor); err != nil {
+						fmt.Fprintf(c.Response().Writer, "data: {\"error\":{\"message\":%q,\"type\":\"context_compression_error\"}}\n\n", err.Error())
+						fmt.Fprintf(c.Response().Writer, "data: [DONE]\n\n")
+						c.Response().Flush()
+						return nil
+					}
+					if !config.TemplateConfig.UseTokenizerTemplate {
+						predInput = evaluator.TemplateMessages(*input, input.Messages, config, funcs, shouldUseFn)
+						xlog.Debug("MCP stream re-templating", "iteration", mcpStreamIter)
+					}
 				}
 
 				responses := make(chan schema.OpenAIResponse)
-				ended := make(chan error, 1)
+				ended := make(chan streamWorkerResult, 1)
 
 				go func() {
 					if !shouldUseFn {
-						ended <- process(predInput, input, config, ml, responses, extraUsage, id, created)
+						u, err := processStream(predInput, input, config, cl, startupOptions, ml, responses, id, created)
+						ended <- streamWorkerResult{usage: u, err: err}
 					} else {
-						ended <- processTools(noActionName, predInput, input, config, ml, responses, extraUsage, id, created, &textContentToReturn)
+						u, err := processStreamWithTools(noActionName, predInput, input, config, cl, startupOptions, ml, responses, id, created, &textContentToReturn)
+						ended <- streamWorkerResult{usage: u, err: err}
 					}
 				}()
 
-				usage := &schema.OpenAIUsage{}
+				var finalUsage backend.TokenUsage
+				// wroteChunk records whether this iteration sent anything. The
+				// chunks go to the raw writer, so c.Response().Committed stays
+				// false and cannot tell.
+				wroteChunk := false
 				toolsCalled := false
 				var collectedToolCalls []schema.ToolCall
 				var collectedContent string
@@ -740,7 +558,6 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 							xlog.Debug("No choices in the response, skipping")
 							continue
 						}
-						usage = &ev.Usage // Copy a pointer to the latest usage chunk so that the stop message can reference it
 						if len(ev.Choices[0].Delta.ToolCalls) > 0 {
 							toolsCalled = true
 							// Collect and merge tool call deltas for MCP execution
@@ -748,13 +565,29 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 								collectedToolCalls = mergeToolCallDeltas(collectedToolCalls, ev.Choices[0].Delta.ToolCalls)
 							}
 						}
-						// Collect content for MCP conversation history and automatic tool parsing fallback
-						if (hasMCPToolsStream || config.FunctionsConfig.AutomaticToolParsingFallback) && ev.Choices[0].Delta != nil && ev.Choices[0].Delta.Content != nil {
-							if s, ok := ev.Choices[0].Delta.Content.(string); ok {
-								collectedContent += s
-							} else if sp, ok := ev.Choices[0].Delta.Content.(*string); ok && sp != nil {
-								collectedContent += *sp
+						// Extract the raw content delta string once per chunk;
+						// both the MCP collector and the PII filter need it
+						// and the type-switch is otherwise duplicated.
+						var rawContent string
+						haveContent := false
+						if ev.Choices[0].Delta != nil && ev.Choices[0].Delta.Content != nil {
+							switch v := ev.Choices[0].Delta.Content.(type) {
+							case string:
+								rawContent = v
+								haveContent = true
+							case *string:
+								if v != nil {
+									rawContent = *v
+									haveContent = true
+								}
 							}
+						}
+						// Collect content for MCP conversation history and automatic tool parsing fallback.
+						// We collect the RAW (unfiltered) content so the model's tool-call
+						// markup keeps parsing correctly even when PII redaction would mask
+						// substrings.
+						if (hasMCPToolsStream || config.FunctionsConfig.AutomaticToolParsingFallback) && haveContent {
+							collectedContent += rawContent
 						}
 						respData, err := json.Marshal(ev)
 						if err != nil {
@@ -769,16 +602,30 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 							input.Cancel()
 							return err
 						}
+						wroteChunk = true
 						c.Response().Flush()
-					case err := <-ended:
-						if err == nil {
+					case res := <-ended:
+						if res.err == nil {
+							finalUsage = res.usage
 							break LOOP
 						}
-						xlog.Error("Stream ended with error", "error", err)
+						xlog.Error("Stream ended with error", "error", res.err)
+
+						// Nothing was sent yet, so the status line is still
+						// open: answer with a real HTTP error instead of an
+						// error chunk on a 200 stream. Clients then handle it
+						// like the same failure on a non-streaming request.
+						if mcpStreamIter == 0 && !wroteChunk {
+							h := c.Response().Header()
+							h.Del("Content-Type")
+							h.Del("Cache-Control")
+							h.Del("Connection")
+							return backendRequestError(res.err)
+						}
 
 						errorResp := schema.ErrorResponse{
 							Error: &schema.APIError{
-								Message: err.Error(),
+								Message: res.err.Error(),
 								Type:    "server_error",
 								Code:    "server_error",
 							},
@@ -801,7 +648,10 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 				// still trying to send (e.g., after client disconnect). The goroutine
 				// calls close(responses) when done, which terminates the drain.
 				if input.Context.Err() != nil {
-					go func() { for range responses {} }()
+					go func() {
+						for range responses {
+						}
+					}()
 					<-ended
 				}
 
@@ -902,8 +752,15 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 					finishReason = FinishReasonToolCalls
 				} else if toolsCalled {
 					finishReason = FinishReasonFunctionCall
+				} else if reachedTokenBudget(finalUsage.Completion, config.Maxtokens) {
+					// Generation stopped because it hit the max_tokens ceiling
+					// rather than a natural stop — report "length" (issue #9716).
+					finishReason = FinishReasonLength
 				}
 
+				// Final delta chunk: empty delta with finish_reason set. Per
+				// OpenAI streaming spec this chunk does NOT carry usage —
+				// the optional trailer (below) does, gated on include_usage.
 				resp := &schema.OpenAIResponse{
 					ID:      id,
 					Created: created,
@@ -913,13 +770,33 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 							FinishReason: &finishReason,
 							Index:        0,
 							Delta:        &schema.Message{},
-						}},
+						},
+					},
 					Object: "chat.completion.chunk",
-					Usage:  *usage,
 				}
 				respData, _ := json.Marshal(resp)
 
+				middleware.StampUsage(c, input.Model, finalUsage.Prompt, finalUsage.Completion)
+
 				fmt.Fprintf(c.Response().Writer, "data: %s\n\n", respData)
+
+				// Trailing usage chunk per OpenAI spec: emit only when the
+				// caller opted in via stream_options.include_usage. Shape:
+				// {"choices":[],"usage":{...},"object":"chat.completion.chunk",...}
+				//
+				// finalUsage is the authoritative TokenUsage returned by the
+				// worker function (process / processTools) via the `ended`
+				// channel. The worker reads it from ComputeChoices' return
+				// value, which is the cumulative count produced by the backend
+				// over the whole prediction. Issue #9927 was caused by the
+				// tools-path worker not surfacing this value at all.
+				if input.StreamOptions != nil && input.StreamOptions.IncludeUsage {
+					trailerUsage := streamUsageFromTokenUsage(finalUsage, extraUsage)
+					trailerUsage.CompressionMeta = middleware.CompressionMetadata(c)
+					trailer := streamUsageTrailerJSON(id, input.Model, created, trailerUsage)
+					_, _ = fmt.Fprintf(c.Response().Writer, "data: %s\n\n", trailer)
+				}
+
 				fmt.Fprintf(c.Response().Writer, "data: [DONE]\n\n")
 				c.Response().Flush()
 				xlog.Debug("Stream ended")
@@ -941,9 +818,14 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 
 			for mcpIteration := 0; mcpIteration <= mcpMaxIterations; mcpIteration++ {
 				// Re-template on each MCP iteration since messages may have changed
-				if mcpIteration > 0 && !config.TemplateConfig.UseTokenizerTemplate {
-					predInput = evaluator.TemplateMessages(*input, input.Messages, config, funcs, shouldUseFn)
-					xlog.Debug("MCP re-templating", "iteration", mcpIteration, "prompt_len", len(predInput))
+				if mcpIteration > 0 {
+					if err := middleware.CompressChatRequest(c, compressor); err != nil {
+						return err
+					}
+					if !config.TemplateConfig.UseTokenizerTemplate {
+						predInput = evaluator.TemplateMessages(*input, input.Messages, config, funcs, shouldUseFn)
+						xlog.Debug("MCP re-templating", "iteration", mcpIteration, "prompt_len", len(predInput))
+					}
 				}
 
 				// Detect if thinking token is already in prompt or template
@@ -954,6 +836,9 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 					template = predInput
 				}
 				thinkingStartToken := reason.DetectThinkingStartToken(template, &config.ReasoningConfig)
+				if config.TemplateConfig.UseTokenizerTemplate {
+					thinkingStartToken = reason.DetectThinkingStartTokenInTemplate(template, &config.ReasoningConfig)
+				}
 
 				xlog.Debug("Thinking start token", "thinkingStartToken", thinkingStartToken, "template", template)
 
@@ -1013,30 +898,14 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 					},
 				)
 				if err != nil {
-					return err
+					return backendRequestError(err)
 				}
 
 				// For non-tool requests: prefer C++ autoparser chat deltas over
 				// Go-side tag extraction (which can mangle output when thinkingStartToken
 				// differs from the model's actual reasoning tags, e.g. Gemma 4).
-				if !shouldUseFn && len(chatDeltas) > 0 {
-					deltaContent := functions.ContentFromChatDeltas(chatDeltas)
-					deltaReasoning := functions.ReasoningFromChatDeltas(chatDeltas)
-					if deltaContent != "" || deltaReasoning != "" {
-						xlog.Debug("[ChatDeltas] non-SSE no-tools: overriding result with C++ autoparser deltas",
-							"content_len", len(deltaContent), "reasoning_len", len(deltaReasoning))
-						stopReason := FinishReasonStop
-						message := &schema.Message{Role: "assistant", Content: &deltaContent}
-						if deltaReasoning != "" {
-							message.Reasoning = &deltaReasoning
-						}
-						newChoice := schema.Choice{FinishReason: &stopReason, Index: 0, Message: message}
-						// Preserve logprobs from the original result
-						if len(result) > 0 && result[0].Logprobs != nil {
-							newChoice.Logprobs = result[0].Logprobs
-						}
-						result = []schema.Choice{newChoice}
-					}
+				if !shouldUseFn {
+					result = applyAutoparserOverride(chatDeltas, thinkingStartToken, config.ReasoningConfig, result)
 				}
 
 				// Tool parsing is deferred here (only when shouldUseFn) so chat deltas are available
@@ -1262,6 +1131,18 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 					}
 				}
 
+				// If generation hit the max_tokens ceiling, report "length"
+				// instead of a natural "stop" (issue #9716). Mirrors the
+				// streaming path; tool/function finish reasons are untouched.
+				if reachedTokenBudget(tokenUsage.Completion, config.Maxtokens) {
+					for i := range result {
+						if result[i].FinishReason != nil && *result[i].FinishReason == FinishReasonStop {
+							lengthReason := FinishReasonLength
+							result[i].FinishReason = &lengthReason
+						}
+					}
+				}
+
 				// No MCP tools to execute (or no MCP tools configured), return response
 				usage := schema.OpenAIUsage{
 					PromptTokens:     tokenUsage.Prompt,
@@ -1272,6 +1153,7 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 					usage.TimingTokenGeneration = tokenUsage.TimingTokenGeneration
 					usage.TimingPromptProcessing = tokenUsage.TimingPromptProcessing
 				}
+				usage.CompressionMeta = middleware.CompressionMetadata(c)
 
 				resp := &schema.OpenAIResponse{
 					ID:      id,
@@ -1279,10 +1161,12 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 					Model:   input.Model, // we have to return what the user sent here, due to OpenAI spec.
 					Choices: result,
 					Object:  "chat.completion",
-					Usage:   usage,
+					Usage:   &usage,
 				}
 				respData, _ := json.Marshal(resp)
 				xlog.Debug("Response", "response", string(respData))
+
+				middleware.StampUsage(c, input.Model, usage.PromptTokens, usage.CompletionTokens)
 
 				// Return the prediction in the response body
 				return c.JSON(200, resp)
@@ -1295,7 +1179,6 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 }
 
 func handleQuestion(config *config.ModelConfig, funcResults []functions.FuncCallResults, result, prompt string) (string, error) {
-
 	if len(funcResults) == 0 && result != "" {
 		xlog.Debug("nothing function results but we had a message from the LLM")
 
@@ -1329,4 +1212,18 @@ func handleQuestion(config *config.ModelConfig, funcResults []functions.FuncCall
 	xlog.Debug("No action received from LLM, without a message, computing a reply")
 
 	return "", nil
+}
+
+// forwardCloudProxyOpenAIViaBackend marshals the OpenAI request and
+// hands off to the cloud-proxy gRPC backend which does the outbound
+// HTTP. The chat endpoint owns the body construction because it's the
+// only place the request lands as a parsed *schema.OpenAIRequest.
+// Request-side PII redaction already ran in the middleware; the
+// response is forwarded unmodified.
+func forwardCloudProxyOpenAIViaBackend(c echo.Context, cfg *config.ModelConfig, input *schema.OpenAIRequest, ml *model.ModelLoader, appConfig *config.ApplicationConfig) error {
+	body, err := json.Marshal(input)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "cloudproxy: marshal request: "+err.Error())
+	}
+	return cloudproxy.ForwardViaBackend(c, cfg, body, ml, appConfig)
 }

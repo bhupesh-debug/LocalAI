@@ -3,7 +3,6 @@ package application
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,12 +12,25 @@ import (
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/core/gallery"
 	"github.com/mudler/LocalAI/core/http/auth"
+	"github.com/mudler/LocalAI/core/services/failover"
 	"github.com/mudler/LocalAI/core/services/galleryop"
 	"github.com/mudler/LocalAI/core/services/jobs"
+	"github.com/mudler/LocalAI/core/services/messaging"
+	"github.com/mudler/LocalAI/core/services/modeladmin"
+	"github.com/mudler/LocalAI/core/services/monitoring"
 	"github.com/mudler/LocalAI/core/services/nodes"
+	"github.com/mudler/LocalAI/core/services/routing/admission"
+	"github.com/mudler/LocalAI/core/services/routing/billing"
+	"github.com/mudler/LocalAI/core/services/routing/pii"
+	"github.com/mudler/LocalAI/core/services/routing/router"
 	"github.com/mudler/LocalAI/core/services/storage"
 	coreStartup "github.com/mudler/LocalAI/core/startup"
+	"github.com/mudler/LocalAI/core/trace"
 	"github.com/mudler/LocalAI/internal"
+	"github.com/mudler/LocalAI/pkg/downloader"
+	"github.com/mudler/LocalAI/pkg/modelartifacts"
+	"github.com/mudler/LocalAI/pkg/signals"
+	"github.com/mudler/LocalAI/pkg/vram"
 
 	"github.com/mudler/LocalAI/pkg/model"
 	"github.com/mudler/LocalAI/pkg/sanitize"
@@ -29,9 +41,28 @@ import (
 func New(opts ...config.AppOption) (*Application, error) {
 	options := config.NewApplicationConfig(opts...)
 
-	// Store a copy of the startup config (from env vars, before file loading)
-	// This is used to determine if settings came from env vars vs file
+	// Store a copy of the startup config (env/CLI only, before file
+	// loading): the settings endpoint uses it to tell env-provided API
+	// keys apart from runtime-managed ones.
 	startupConfigCopy := *options
+
+	// Merge persisted runtime settings BEFORE anything consumes options:
+	// model-config defaults (ToConfigLoaderOptions), gallery services, the
+	// watchdog, and the MITM listener are all configured from options
+	// further down. Loading late (the old call site, after model configs
+	// were read) meant boot-loaded models saw pre-file defaults for one
+	// full restart. Env/CLI values win over the file (see
+	// ApplyRuntimeSettingsAtStartup).
+	loadRuntimeSettingsFromFile(options)
+
+	// WithThreads no longer eagerly resolves 0 (so the settings merge can
+	// tell "unset" from "env-set"); resolve the physical-core default now
+	// that env, CLI, and file have all had their say.
+	if options.Threads == 0 {
+		options.Threads = xsysinfo.CPUPhysicalCores()
+	}
+
+	trace.ConfigureBackendTracePersistence(options.DataPath)
 	application := newApplication(options)
 	application.startupConfig = &startupConfigCopy
 
@@ -45,7 +76,6 @@ func New(opts ...config.AppOption) (*Application, error) {
 	caps, err := xsysinfo.CPUCapabilities()
 	if err == nil {
 		xlog.Debug("CPU capabilities", "capabilities", caps)
-
 	}
 	gpus, err := xsysinfo.GPUs()
 	if err == nil {
@@ -60,18 +90,37 @@ func New(opts ...config.AppOption) (*Application, error) {
 		return nil, fmt.Errorf("models path cannot be empty")
 	}
 
-	err = os.MkdirAll(options.SystemState.Model.ModelsPath, 0750)
+	err = os.MkdirAll(options.SystemState.Model.ModelsPath, 0o750)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create ModelPath: %q", err)
 	}
+
+	// Reap *.partial downloads abandoned by a previous run (killed mid-transfer
+	// by an OOM/restart, or stalled before cleanup could run). The 24h window
+	// is well beyond any legitimate in-flight download, so this never trims an
+	// active transfer; it just stops dead partials accumulating on the volume.
+	if removed, cErr := downloader.CleanupStalePartialFiles(options.SystemState.Model.ModelsPath, 24*time.Hour); cErr != nil {
+		xlog.Warn("Failed to reap stale partial downloads", "error", cErr)
+	} else if removed > 0 {
+		xlog.Info("Reaped stale partial downloads", "count", removed)
+	}
+	// Managed artifacts stage into a per-writer tree, which a crashed writer's
+	// successor no longer overwrites for it, so the tree itself needs reaping
+	// too. Sweeping here as well as on the materialization path is what
+	// reclaims a volume whose abandoned artifact is never requested again.
+	if removed, cErr := modelartifacts.SweepStalePartialTrees(options.SystemState.Model.ModelsPath, modelartifacts.PartialOrphanTTL, ""); cErr != nil {
+		xlog.Warn("Failed to reap abandoned artifact partials", "error", cErr)
+	} else if removed > 0 {
+		xlog.Info("Reaped abandoned artifact partials", "count", removed)
+	}
 	if options.GeneratedContentDir != "" {
-		err := os.MkdirAll(options.GeneratedContentDir, 0750)
+		err := os.MkdirAll(options.GeneratedContentDir, 0o750)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create ImageDir: %q", err)
 		}
 	}
 	if options.UploadDir != "" {
-		err := os.MkdirAll(options.UploadDir, 0750)
+		err := os.MkdirAll(options.UploadDir, 0o750)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create UploadDir: %q", err)
 		}
@@ -79,7 +128,7 @@ func New(opts ...config.AppOption) (*Application, error) {
 
 	// Create and migrate data directory
 	if options.DataPath != "" {
-		if err := os.MkdirAll(options.DataPath, 0750); err != nil {
+		if err := os.MkdirAll(options.DataPath, 0o750); err != nil {
 			return nil, fmt.Errorf("unable to create DataPath: %q", err)
 		}
 		// Migrate data from DynamicConfigsDir to DataPath if needed
@@ -87,7 +136,6 @@ func New(opts ...config.AppOption) (*Application, error) {
 			migrateDataFiles(options.DynamicConfigsDir, options.DataPath)
 		}
 	}
-
 	// Initialize auth database if auth is enabled
 	if options.Auth.Enabled {
 		// Auto-generate HMAC secret if not provided
@@ -127,6 +175,102 @@ func New(opts ...config.AppOption) (*Application, error) {
 		}()
 	}
 
+	// Initialize the OTel + Prometheus metric pipeline before any
+	// counter is created. monitoring.NewLocalAIMetricsService calls
+	// otel.SetMeterProvider, so any subsequent otel.Meter() call —
+	// including billing.NewRecorder below — sees the real provider
+	// rather than the no-op global. Initialising metrics later (in
+	// core/http/app.go) leaves billing's counters bound to a no-op
+	// meter and never reaches /metrics. We deliberately ignore
+	// DisableMetrics here for ordering purposes; the HTTP middleware
+	// that records api_call histograms is still gated.
+	if !options.DisableMetrics {
+		ms, err := monitoring.NewLocalAIMetricsService()
+		if err != nil {
+			xlog.Error("failed to initialize metrics provider", "error", err)
+		} else {
+			application.metricsService = ms
+			// Bind the billing package's counters to the same meter the
+			// metrics service exports. Without this, billing's counters
+			// resolve via the OTel global and never reach /metrics.
+			billing.SetMeter(ms.Meter)
+		}
+	}
+
+	// Wire the routing-module billing recorder. The recorder runs in
+	// every mode (auth on/off, distributed/single-node) so that token
+	// tracking is not gated on auth — a no-auth single-user box still
+	// gets dashboards and `/api/usage` populated.
+	//
+	// fallbackUser is wired *unconditionally* when stats are enabled.
+	// UsageMiddleware uses it as the attribution source whenever
+	// auth.GetUser(c) is nil — that covers (a) no-auth deployments and
+	// (b) internal callers under auth-on (cron flushers, distributed
+	// worker callbacks) that hit a recordable endpoint without a user
+	// in context. The billing.user_id_present invariant still rejects
+	// empty IDs; LocalUser() returns a stable UUID per data path.
+	if !options.DisableStats {
+		var statsBackend billing.StatsBackend
+		switch {
+		case application.authDB != nil:
+			statsBackend = billing.NewGormBackend(application.authDB, 0, 0)
+			xlog.Info("stats: using auth DB for usage records")
+		default:
+			statsBackend = billing.NewMemoryBackend(0)
+			xlog.Info("stats: using in-memory ring buffer (no-auth single-user mode)")
+		}
+		application.fallbackUser = billing.LocalUser(options.DataPath)
+		application.statsRecorder = billing.NewRecorder(statsBackend)
+		// Drain pending records on SIGTERM. The GORM backend buffers up
+		// to maxPending (5k) records across a 5s flush tick, so without
+		// this the last few seconds of usage disappear on graceful exit.
+		signals.RegisterGracefulTerminationHandler(func() {
+			_ = application.statsRecorder.Close()
+		})
+		xlog.Info("stats: fallback user wired", "local_user_id", application.fallbackUser.ID)
+	} else {
+		xlog.Info("stats: disabled by --disable-stats")
+	}
+
+	// Wire the PII filter subsystem. The redactor is now a stateless
+	// handle — detection is driven by per-model NER detectors
+	// (pii.detectors → the detector model's pii_detection policy), run
+	// request-side by the chat middleware and the MITM input path. The
+	// regex tier was removed; redaction is opt-in per model via
+	// PIIIsEnabled(). The event store backs the /api/pii/events audit log.
+	application.piiRedactor = &pii.Redactor{}
+	application.piiEvents = pii.NewMemoryEventStore(0)
+
+	// Wire the routing decision log. Always-on when stats are enabled —
+	// the per-router admin page reads this as the live activity feed
+	// and as input to drift checks for subsystem 5. Embedders may retain this
+	// bounded log independently without enabling billing stats.
+	if !options.DisableStats || options.RouterDecisionLog {
+		application.routerDecisions = router.NewMemoryDecisionStore(0)
+	}
+	// Process-wide classifier cache shared across all route middlewares so
+	// the embedding-cache stats endpoint sees a single source of truth.
+	application.routerRegistry = router.NewRegistry()
+
+	// Failover chains: probe targets and track which one is active per
+	// chain. WithOnWarmChanged pins and preloads warm local targets so a
+	// switch to them does not wait for a cold load.
+	application.failoverManager = failover.New(application.ModelConfigLoader(),
+		failover.WithProber(failover.NewProber(failoverLoadedBackend(application.ModelLoader()), options.ProxyAPIKeyEnvLookup)),
+		failover.WithOnWarmChanged(application.applyFailoverWarmTargets),
+	)
+	// The assistant client was built in start() (above), before this
+	// manager existed; wire it now so list_failover_chains /
+	// pin_failover_target / unpin_failover_target see real chains.
+	if application.assistantClient != nil {
+		application.assistantClient.Failover = application.failoverManager
+	}
+
+	// Subsystem 5: admission control. Limiter is always wired so a
+	// model that gains a limits: block via gallery install or YAML
+	// edit takes effect on the next restart without conditional plumbing.
+	application.admissionLimiter = admission.New()
+
 	// Wire JobStore for DB-backed task/job persistence whenever auth DB is available.
 	// This ensures tasks and jobs survive restarts in both single-node and distributed modes.
 	if application.authDB != nil && application.agentJobService != nil {
@@ -139,12 +283,24 @@ func New(opts ...config.AppOption) (*Application, error) {
 	}
 
 	// Initialize distributed mode services (NATS, object storage, node registry)
-	distSvc, err := initDistributed(options, application.authDB)
+	// revisionStore is built inside the distributed block below but used after
+	// the model configs are loaded, so it is declared out here.
+	var revisionStore modeladmin.RevisionStore
+	// modelConfigResync is built there too, and started only once the model
+	// configs are loaded: a pass against an empty loader would treat every
+	// model as new.
+	var modelConfigResync *modeladmin.DirectoryResync
+
+	distSvc, err := initDistributed(options, application.authDB, application.ModelConfigLoader(),
+		&failoverPinnedResolver{base: application.ModelConfigLoader(), fm: application.failoverManager})
 	if err != nil {
 		return nil, fmt.Errorf("distributed mode initialization failed: %w", err)
 	}
 	if distSvc != nil {
 		application.distributed = distSvc
+		// Before failoverManager.Run starts below: the gate and sync must be
+		// in place for its first tick.
+		application.startFailoverDistributed(options.Context)
 		// Wire remote model unloader so ShutdownModel works for remote nodes
 		// Uses NATS to tell serve-backend nodes to Free + kill their backend process
 		application.modelLoader.SetRemoteUnloader(distSvc.Unloader)
@@ -156,16 +312,24 @@ func New(opts ...config.AppOption) (*Application, error) {
 			distSvc.Registry,
 		)
 		application.modelLoader.SetModelStore(distStore)
+		// Drop the local stub when a model's last replica leaves the registry.
+		// The store reports local stubs UNION registry rows, and every removal
+		// path deletes the row only, so without this the frontend keeps
+		// reporting a model as loaded long after the replica is gone.
+		// Registered unconditionally: this is independent of the prefix cache.
+		distSvc.Registry.AddReplicaRemovedHook(
+			nodes.NewLocalStubInvalidator(distSvc.Registry, distStore),
+		)
 		// Start health monitor
 		distSvc.Health.Start(options.Context)
 		// Start replica reconciler for auto-scaling model replicas
 		if distSvc.Reconciler != nil {
 			go distSvc.Reconciler.Run(options.Context)
 		}
+		go distSvc.ModelCleanup.Run(options.Context)
 		// In distributed mode, MCP CI jobs are executed by agent workers (not the frontend)
 		// because the frontend can't create MCP sessions (e.g., stdio servers using docker).
-		// The dispatcher still subscribes to jobs.new for persistence (result/progress subs)
-		// but does NOT set a workerFn — agent workers consume jobs from the same NATS queue.
+		// The dispatcher only enqueues jobs and persists the results and traces workers publish.
 
 		// Wire model config loader so job events include model config for agent workers
 		distSvc.Dispatcher.SetModelConfigLoader(application.backendLoader)
@@ -180,6 +344,9 @@ func New(opts ...config.AppOption) (*Application, error) {
 		if application.agentJobService != nil {
 			application.agentJobService.SetDistributedBackends(distSvc.Dispatcher)
 			application.agentJobService.SetDistributedJobStore(distSvc.JobStore)
+			// Keep agent tasks consistent across replicas (jobs already sync via the
+			// dispatcher + DB read-through). Same NATS client the dispatcher uses.
+			application.agentJobService.SetTaskSyncNATS(distSvc.Nats)
 		}
 		// Wire skill store into AgentPoolService (wired at pool start time via closure)
 		// The actual wiring happens in StartAgentPool since the pool doesn't exist yet.
@@ -189,17 +356,73 @@ func New(opts ...config.AppOption) (*Application, error) {
 			application.galleryService.SetNATSClient(distSvc.Nats)
 			if distSvc.DistStores != nil && distSvc.DistStores.Gallery != nil {
 				// Clean up stale in-progress operations from previous crashed instances
-				if err := distSvc.DistStores.Gallery.CleanStale(30 * time.Minute); err != nil {
+				if _, err := distSvc.DistStores.Gallery.CleanStale(30 * time.Minute); err != nil {
 					xlog.Warn("Failed to clean stale gallery operations", "error", err)
 				}
 				application.galleryService.SetGalleryStore(distSvc.DistStores.Gallery)
+
+				// Reap stale ops periodically, not just at boot: an op orphaned by
+				// a replica that died mid-install (its foreground handler goroutine
+				// gone) would otherwise linger "processing" in the UI until the next
+				// restart. 30m matches the install/upgrade ceiling so a genuinely
+				// slow op is never reaped out from under itself.
+				gsvc := application.galleryService
+				go func() {
+					ticker := time.NewTicker(15 * time.Minute)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-options.Context.Done():
+							return
+						case <-ticker.C:
+							if _, err := gsvc.ReapStaleOperations(30 * time.Minute); err != nil {
+								xlog.Warn("Failed to reap stale gallery operations", "error", err)
+							}
+						}
+					}
+				}()
+			}
+			// Hydrate from the store first so the wildcard subscriber finds an
+			// already-populated statuses map for any operations still in flight
+			// on a peer replica.
+			if err := application.galleryService.Hydrate(); err != nil {
+				xlog.Warn("Gallery service hydrate failed", "error", err)
+			}
+			// Bind cache-invalidation handler before SubscribeBroadcasts so the
+			// first inbound event is already routed. Peer replicas install a
+			// model and broadcast on SubjectCacheInvalidateModels; this
+			// callback re-runs LoadModelConfigsFromPath so a subsequent chat
+			// completion that load-balances onto this replica finds the new
+			// config. The originating replica reloads inline in modelHandler
+			// and never enters this path.
+			gs := application.galleryService
+			sys := options.SystemState
+			cfgLoaderOpts := options.ToConfigLoaderOptions()
+			modelRevisionLifecycle := modeladmin.NewDistributedModelRevisionLifecycle(distSvc.Registry, distSvc.ModelCleanup)
+			gs.SetModelRevisionLifecycle(modelRevisionLifecycle)
+			// Captured here, used after the model configs are loaded below: the
+			// resync reads the loader, which is still empty at this point.
+			revisionStore = modeladmin.NewRevisionStore(distSvc.Registry, modelRevisionLifecycle)
+			modelConfigResync = modeladmin.NewDirectoryResync(application.ModelConfigLoader(), sys.Model.ModelsPath, modelRevisionLifecycle, cfgLoaderOpts...)
+			gs.OnModelsChanged = func(evt messaging.CacheInvalidateEvent) {
+				// ApplyRemoteChange honors the op: a "delete" prunes the element
+				// (a reload-from-path is additive and cannot drop it), anything
+				// else reloads from disk; a named element's running instance is
+				// shut down so the new config takes effect. The originating
+				// replica reloads inline and never depends on this path.
+				if err := modeladmin.ApplyRemoteChange(options.Context, application.ModelConfigLoader(), sys.Model.ModelsPath, evt, modelRevisionLifecycle, cfgLoaderOpts...); err != nil {
+					xlog.Warn("Failed to apply peer model config change", "error", err)
+				}
+			}
+			if err := application.galleryService.SubscribeBroadcasts(); err != nil {
+				xlog.Warn("Gallery service subscribe failed", "error", err)
 			}
 			// Wire distributed model/backend managers so delete propagates to workers
 			application.galleryService.SetModelManager(
 				nodes.NewDistributedModelManager(options, application.modelLoader, distSvc.Unloader),
 			)
 			application.galleryService.SetBackendManager(
-				nodes.NewDistributedBackendManager(options, application.modelLoader, distSvc.Unloader, distSvc.Registry),
+				nodes.NewDistributedBackendManager(options, application.modelLoader, distSvc.Unloader, distSvc.Registry, application.galleryService),
 			)
 		}
 	}
@@ -211,12 +434,12 @@ func New(opts ...config.AppOption) (*Application, error) {
 		}
 	}
 
-	if err := coreStartup.InstallModels(options.Context, application.GalleryService(), options.Galleries, options.BackendGalleries, options.SystemState, application.ModelLoader(), options.EnforcePredownloadScans, options.AutoloadBackendGalleries, nil, options.ModelsURL...); err != nil {
+	if err := coreStartup.InstallModels(options.Context, application.GalleryService(), options.Galleries, options.BackendGalleries, options.SystemState, application.ModelLoader(), options.EnforcePredownloadScans, options.AutoloadBackendGalleries, options.RequireBackendIntegrity, nil, options.ModelsURL...); err != nil {
 		xlog.Error("error installing models", "error", err)
 	}
 
 	for _, backend := range options.ExternalBackends {
-		if err := galleryop.InstallExternalBackend(options.Context, options.BackendGalleries, options.SystemState, application.ModelLoader(), nil, backend, "", ""); err != nil {
+		if err := galleryop.InstallExternalBackend(options.Context, options.BackendGalleries, options.SystemState, application.ModelLoader(), nil, backend, "", "", false, options.RequireBackendIntegrity); err != nil {
 			xlog.Error("error installing external backend", "error", err)
 		}
 	}
@@ -227,6 +450,18 @@ func New(opts ...config.AppOption) (*Application, error) {
 		xlog.Error("error loading config files", "error", err)
 	}
 
+	// Bring the controller's stored revisions back in line with the
+	// configuration just loaded. An inference request may only establish a
+	// revision, never replace one, so a model whose stored value has drifted
+	// stays unroutable until something republishes it. This has to run after
+	// the load above: the loader is empty until then, and a resync against an
+	// empty loader silently reconciles nothing.
+	if revisionStore != nil {
+		if err := modeladmin.ResyncModelConfigRevisions(options.Context, application.ModelConfigLoader(), options, revisionStore); err != nil {
+			xlog.Warn("Failed to resync model config revisions", "error", err)
+		}
+	}
+
 	if err := gallery.RegisterBackends(options.SystemState, application.ModelLoader()); err != nil {
 		xlog.Error("error registering external backends", "error", err)
 	}
@@ -235,9 +470,38 @@ func New(opts ...config.AppOption) (*Application, error) {
 	// In distributed mode, uses PostgreSQL advisory lock so only one frontend
 	// instance runs periodic checks (avoids duplicate upgrades across replicas).
 	if len(options.BackendGalleries) > 0 {
-		uc := NewUpgradeChecker(options, application.ModelLoader(), application.distributedDB())
+		// Pass a lazy getter for the backend manager so the checker always
+		// uses the active one — DistributedBackendManager is swapped in above
+		// and asks workers for their installed backends, which is what
+		// upgrade detection needs in distributed mode.
+		bmFn := func() galleryop.BackendManager { return application.GalleryService().BackendManager() }
+		uc := NewUpgradeChecker(options, application.ModelLoader(), application.distributedDB(), bmFn)
 		application.upgradeChecker = uc
+		// Refresh the upgrade cache the moment a backend op finishes — otherwise
+		// the UI keeps showing a just-upgraded backend as upgradeable until the
+		// next 6-hour tick. TriggerCheck is non-blocking.
+		if gs := application.GalleryService(); gs != nil {
+			gs.OnBackendOpCompleted = uc.TriggerCheck
+		}
 		go uc.Run(options.Context)
+	}
+
+	// Wire gallery generation counter into VRAM caches so they invalidate
+	// when gallery data refreshes instead of using a fixed TTL.
+	vram.SetGalleryGenerationFunc(gallery.GalleryGeneration)
+	if options.AutoloadGalleries {
+		if options.VRAMPersistentCache {
+			// Remote GGUF probes can transfer substantial metadata. Keep successful
+			// results across restarts so the startup warmer does not repeat that work.
+			vram.ConfigurePersistentCache(filepath.Join(options.SystemState.Model.ModelsPath, "..", "cache", "vram"), 24*time.Hour)
+		}
+
+		// Fill those caches ahead of the first visitor. An estimate for an entry
+		// nobody has asked about yet costs a remote probe of its weight files, and
+		// the model gallery asks for one per row, so without this the first page
+		// spends seconds filling in its own sizes while somebody watches it.
+		// Non-blocking, and bounded: see DefaultEstimateWarmConfig.
+		gallery.WarmEstimateCache(options.Context, options.Galleries, options.SystemState, gallery.EstimateWarmConfigFromEnv())
 	}
 
 	if options.ConfigFile != "" {
@@ -246,18 +510,27 @@ func New(opts ...config.AppOption) (*Application, error) {
 		}
 	}
 
-	if err := application.ModelConfigLoader().Preload(options.SystemState.Model.ModelsPath); err != nil {
+	if err := application.ModelConfigLoader().PreloadWithContext(options.Context, options.SystemState.Model.ModelsPath); err != nil {
 		xlog.Error("error downloading models", "error", err)
 	}
 
+	// Catch up on model config changes whose invalidation this frontend
+	// missed. NATS keeps no history, so a change published while this
+	// frontend was disconnected is otherwise never applied here. Every
+	// frontend runs its own pass against the shared models directory; the
+	// pass is idempotent, so no leader is needed.
+	if modelConfigResync != nil && distSvc != nil {
+		modelConfigResync.Start(options.Context, options.Distributed.ModelConfigResyncIntervalOrDefault(), distSvc.Nats)
+	}
+
 	if options.PreloadJSONModels != "" {
-		if err := galleryop.ApplyGalleryFromString(options.SystemState, application.ModelLoader(), options.EnforcePredownloadScans, options.AutoloadBackendGalleries, options.Galleries, options.BackendGalleries, options.PreloadJSONModels); err != nil {
+		if err := galleryop.ApplyGalleryFromString(options.SystemState, application.ModelLoader(), options.EnforcePredownloadScans, options.AutoloadBackendGalleries, options.Galleries, options.BackendGalleries, options.PreloadJSONModels, options.RequireBackendIntegrity, gallery.WithArtifactMaterializer(options.ModelArtifactMaterializer)); err != nil {
 			return nil, err
 		}
 	}
 
 	if options.PreloadModelsFromPath != "" {
-		if err := galleryop.ApplyGalleryFromFile(options.SystemState, application.ModelLoader(), options.EnforcePredownloadScans, options.AutoloadBackendGalleries, options.Galleries, options.BackendGalleries, options.PreloadModelsFromPath); err != nil {
+		if err := galleryop.ApplyGalleryFromFile(options.SystemState, application.ModelLoader(), options.EnforcePredownloadScans, options.AutoloadBackendGalleries, options.Galleries, options.BackendGalleries, options.PreloadModelsFromPath, options.RequireBackendIntegrity, gallery.WithArtifactMaterializer(options.ModelArtifactMaterializer)); err != nil {
 			return nil, err
 		}
 	}
@@ -268,22 +541,27 @@ func New(opts ...config.AppOption) (*Application, error) {
 		}
 	}
 
-	// Load runtime settings from file if DynamicConfigsDir is set
-	// This applies file settings with env var precedence (env vars take priority)
-	// Note: startupConfigCopy was already created above, so it has the original env var values
-	if options.DynamicConfigsDir != "" {
-		loadRuntimeSettingsFromFile(options)
-	}
+	// Wire the cloudproxy MITM listener. Opt-in: empty MITMListen
+	// means "no MITM" — operators must explicitly choose to start
+	// it because clients have to install the generated CA cert.
+	// The handler reuses the global redactor + event store so an
+	// admin who's already configured PII filtering for direct API
+	// traffic doesn't need a parallel config for MITM traffic.
+	// Runs after loadRuntimeSettingsFromFile so a listener configured
+	// via /api/settings is brought back up across restarts.
+	startMITMIfConfigured(application, options)
 
 	application.ModelLoader().SetBackendLoggingEnabled(options.EnableBackendLogging)
 
-	// turn off any process that was started by GRPC if the context is canceled
+	// Safety-net cleanup if the application context is cancelled without
+	// the caller invoking Shutdown directly. This is fire-and-forget — it
+	// races binary exit and is unreliable in tests; the deterministic path
+	// is application.Shutdown(), which Shutdown's sync.Once dedupes with
+	// this goroutine.
 	go func() {
 		<-options.Context.Done()
 		xlog.Debug("Context canceled, shutting down")
-		application.distributed.Shutdown()
-		err := application.ModelLoader().StopAllGRPC()
-		if err != nil {
+		if err := application.Shutdown(); err != nil {
 			xlog.Error("error while stopping all grpc backends", "error", err)
 		}
 	}()
@@ -293,25 +571,30 @@ func New(opts ...config.AppOption) (*Application, error) {
 
 	if options.LoadToMemory != nil && !options.SingleBackend {
 		for _, m := range options.LoadToMemory {
-			cfg, err := application.ModelConfigLoader().LoadModelConfigFileByNameDefaultOptions(m, options)
-			if err != nil {
+			xlog.Debug("Auto loading model into memory from file", "model", m)
+			// Same path as POST /backend/load: a realtime pipeline model expands
+			// to its sub-models, and load failures are recorded as model_load
+			// traces.
+			if _, err := backend.PreloadModelByName(options.Context, application.ModelConfigLoader(), application.ModelLoader(), options, m); err != nil {
 				return nil, err
-			}
-
-			xlog.Debug("Auto loading model into memory from file", "model", m, "file", cfg.Model)
-
-			o := backend.ModelOptions(*cfg, options)
-
-			var backendErr error
-			_, backendErr = application.ModelLoader().Load(o...)
-			if backendErr != nil {
-				return nil, backendErr
 			}
 		}
 	}
 
+	// Start the failover scheduler: it syncs chains from config, runs
+	// liveness/recovery probes and dwell-based fail-back. Run is the only
+	// caller of Sync in production so onWarm callbacks stay ordered.
+	application.registerFailoverMetrics()
+	go application.failoverManager.Run(options.Context)
+
 	// Watch the configuration directory
 	startWatcher(options)
+
+	// Everything that must happen before this process can serve a request has
+	// happened. Flip readiness last, and only on the success path — the early
+	// `return nil, err` exits above abort startup, and an application that
+	// never finished starting must never report itself ready.
+	application.markStartupComplete()
 
 	xlog.Info("core/startup process completed!")
 	return application, nil
@@ -326,7 +609,7 @@ func startWatcher(options *config.ApplicationConfig) {
 	if _, err := os.Stat(options.DynamicConfigsDir); err != nil {
 		if os.IsNotExist(err) {
 			// We try to create the directory if it does not exist and was specified
-			if err := os.MkdirAll(options.DynamicConfigsDir, 0700); err != nil {
+			if err := os.MkdirAll(options.DynamicConfigsDir, 0o700); err != nil {
 				xlog.Error("failed creating DynamicConfigsDir", "error", err)
 			}
 		} else {
@@ -342,201 +625,27 @@ func startWatcher(options *config.ApplicationConfig) {
 	}
 }
 
-// loadRuntimeSettingsFromFile loads settings from runtime_settings.json with env var precedence
-// This function is called at startup, before env vars are applied via AppOptions.
-// Since env vars are applied via AppOptions in run.go, we need to check if they're set.
-// We do this by checking if the current options values differ from defaults, which would
-// indicate they were set from env vars. However, a simpler approach is to just apply
-// file settings here, and let the AppOptions (which are applied after this) override them.
-// But actually, this is called AFTER AppOptions are applied in New(), so we need to check env vars.
-// The cleanest solution: Store original values before applying file, or check if values match
-// what would be set from env vars. For now, we'll apply file settings and they'll be
-// overridden by AppOptions if env vars were set (but AppOptions are already applied).
-// Actually, this function is called in New() before AppOptions are fully processed for watchdog.
-// Let's check the call order: New() -> loadRuntimeSettingsFromFile() -> initializeWatchdog()
-// But AppOptions are applied in NewApplicationConfig() which is called first.
-// So at this point, options already has values from env vars. We should compare against
-// defaults to see if env vars were set. But we don't have defaults stored.
-// Simplest: Just apply file settings. If env vars were set, they're already in options.
-// The file watcher handler will handle runtime changes properly by comparing with startupAppConfig.
+// loadRuntimeSettingsFromFile merges runtime_settings.json into options
+// with env-over-file precedence. Field coverage and the precedence rules
+// live in the config registry (ApplyRuntimeSettingsAtStartup); this wrapper
+// only handles the file read. No-op when DynamicConfigsDir is unset.
 func loadRuntimeSettingsFromFile(options *config.ApplicationConfig) {
-	settingsFile := filepath.Join(options.DynamicConfigsDir, "runtime_settings.json")
-	fileContent, err := os.ReadFile(settingsFile)
+	if options.DynamicConfigsDir == "" {
+		return
+	}
+	// ReadPersistedSettings treats a missing file as zero settings, so probe
+	// for it here only to keep the log honest: "loaded" must mean a file was
+	// actually read, not that we merged an all-nil struct.
+	if _, err := os.Stat(filepath.Join(options.DynamicConfigsDir, "runtime_settings.json")); os.IsNotExist(err) {
+		xlog.Debug("runtime_settings.json not found, using defaults")
+		return
+	}
+	settings, err := options.ReadPersistedSettings()
 	if err != nil {
-		if os.IsNotExist(err) {
-			xlog.Debug("runtime_settings.json not found, using defaults")
-			return
-		}
 		xlog.Warn("failed to read runtime_settings.json", "error", err)
 		return
 	}
-
-	var settings config.RuntimeSettings
-
-	if err := json.Unmarshal(fileContent, &settings); err != nil {
-		xlog.Warn("failed to parse runtime_settings.json", "error", err)
-		return
-	}
-
-	// At this point, options already has values from env vars (via AppOptions in run.go).
-	// To avoid env var duplication, we determine if env vars were set by checking if
-	// current values differ from defaults. Defaults are: false for bools, 0 for durations.
-	// If current value is at default, it likely wasn't set from env var, so we can apply file.
-	// If current value is non-default, it was likely set from env var, so we preserve it.
-	// Note: This means env vars explicitly setting to false/0 won't be distinguishable from defaults,
-	// but that's an acceptable limitation to avoid env var duplication.
-
-	if settings.WatchdogIdleEnabled != nil {
-		// Only apply if current value is default (false), suggesting it wasn't set from env var
-		if !options.WatchDogIdle {
-			options.WatchDogIdle = *settings.WatchdogIdleEnabled
-			if options.WatchDogIdle {
-				options.WatchDog = true
-			}
-		}
-	}
-	if settings.WatchdogBusyEnabled != nil {
-		if !options.WatchDogBusy {
-			options.WatchDogBusy = *settings.WatchdogBusyEnabled
-			if options.WatchDogBusy {
-				options.WatchDog = true
-			}
-		}
-	}
-	if settings.WatchdogIdleTimeout != nil {
-		// Only apply if current value is default (0), suggesting it wasn't set from env var
-		if options.WatchDogIdleTimeout == 0 {
-			dur, err := time.ParseDuration(*settings.WatchdogIdleTimeout)
-			if err == nil {
-				options.WatchDogIdleTimeout = dur
-			} else {
-				xlog.Warn("invalid watchdog idle timeout in runtime_settings.json", "error", err, "timeout", *settings.WatchdogIdleTimeout)
-			}
-		}
-	}
-	if settings.WatchdogBusyTimeout != nil {
-		if options.WatchDogBusyTimeout == 0 {
-			dur, err := time.ParseDuration(*settings.WatchdogBusyTimeout)
-			if err == nil {
-				options.WatchDogBusyTimeout = dur
-			} else {
-				xlog.Warn("invalid watchdog busy timeout in runtime_settings.json", "error", err, "timeout", *settings.WatchdogBusyTimeout)
-			}
-		}
-	}
-	if settings.WatchdogInterval != nil {
-		if options.WatchDogInterval == 0 {
-			dur, err := time.ParseDuration(*settings.WatchdogInterval)
-			if err == nil {
-				options.WatchDogInterval = dur
-			} else {
-				xlog.Warn("invalid watchdog interval in runtime_settings.json", "error", err, "interval", *settings.WatchdogInterval)
-				options.WatchDogInterval = model.DefaultWatchdogInterval
-			}
-		}
-	}
-	// Handle MaxActiveBackends (new) and SingleBackend (deprecated)
-	if settings.MaxActiveBackends != nil {
-		// Only apply if current value is default (0), suggesting it wasn't set from env var
-		if options.MaxActiveBackends == 0 {
-			options.MaxActiveBackends = *settings.MaxActiveBackends
-			// For backward compatibility, also set SingleBackend if MaxActiveBackends == 1
-			options.SingleBackend = (*settings.MaxActiveBackends == 1)
-		}
-	} else if settings.SingleBackend != nil {
-		// Legacy: SingleBackend maps to MaxActiveBackends = 1
-		if !options.SingleBackend {
-			options.SingleBackend = *settings.SingleBackend
-			if *settings.SingleBackend {
-				options.MaxActiveBackends = 1
-			}
-		}
-	}
-	if settings.MemoryReclaimerEnabled != nil {
-		// Only apply if current value is default (false), suggesting it wasn't set from env var
-		if !options.MemoryReclaimerEnabled {
-			options.MemoryReclaimerEnabled = *settings.MemoryReclaimerEnabled
-			if options.MemoryReclaimerEnabled {
-				options.WatchDog = true // Memory reclaimer requires watchdog
-			}
-		}
-	}
-	if settings.MemoryReclaimerThreshold != nil {
-		// Only apply if current value is default (0), suggesting it wasn't set from env var
-		if options.MemoryReclaimerThreshold == 0 {
-			options.MemoryReclaimerThreshold = *settings.MemoryReclaimerThreshold
-		}
-	}
-	if settings.ForceEvictionWhenBusy != nil {
-		// Only apply if current value is default (false), suggesting it wasn't set from env var
-		if !options.ForceEvictionWhenBusy {
-			options.ForceEvictionWhenBusy = *settings.ForceEvictionWhenBusy
-		}
-	}
-	if settings.LRUEvictionMaxRetries != nil {
-		// Only apply if current value is default (30), suggesting it wasn't set from env var
-		if options.LRUEvictionMaxRetries == 0 {
-			options.LRUEvictionMaxRetries = *settings.LRUEvictionMaxRetries
-		}
-	}
-	if settings.LRUEvictionRetryInterval != nil {
-		// Only apply if current value is default (1s), suggesting it wasn't set from env var
-		if options.LRUEvictionRetryInterval == 0 {
-			dur, err := time.ParseDuration(*settings.LRUEvictionRetryInterval)
-			if err == nil {
-				options.LRUEvictionRetryInterval = dur
-			} else {
-				xlog.Warn("invalid LRU eviction retry interval in runtime_settings.json", "error", err, "interval", *settings.LRUEvictionRetryInterval)
-			}
-		}
-	}
-	if settings.AgentJobRetentionDays != nil {
-		// Only apply if current value is default (0), suggesting it wasn't set from env var
-		if options.AgentJobRetentionDays == 0 {
-			options.AgentJobRetentionDays = *settings.AgentJobRetentionDays
-		}
-	}
-	if !options.WatchDogIdle && !options.WatchDogBusy {
-		if settings.WatchdogEnabled != nil && *settings.WatchdogEnabled {
-			options.WatchDog = true
-		}
-	}
-
-	// P2P settings
-	if settings.P2PToken != nil {
-		if options.P2PToken == "" {
-			options.P2PToken = *settings.P2PToken
-		}
-	}
-	if settings.P2PNetworkID != nil {
-		if options.P2PNetworkID == "" {
-			options.P2PNetworkID = *settings.P2PNetworkID
-		}
-	}
-	if settings.Federated != nil {
-		if !options.Federated {
-			options.Federated = *settings.Federated
-		}
-	}
-
-	if settings.EnableBackendLogging != nil {
-		if !options.EnableBackendLogging {
-			options.EnableBackendLogging = *settings.EnableBackendLogging
-		}
-	}
-
-	// Tracing settings
-	if settings.EnableTracing != nil {
-		if !options.EnableTracing {
-			options.EnableTracing = *settings.EnableTracing
-		}
-	}
-	if settings.TracingMaxItems != nil {
-		if options.TracingMaxItems == 0 {
-			options.TracingMaxItems = *settings.TracingMaxItems
-		}
-	}
-
+	options.ApplyRuntimeSettingsAtStartup(&settings)
 	xlog.Debug("Runtime settings loaded from runtime_settings.json")
 }
 
@@ -557,6 +666,7 @@ func initializeWatchdog(application *Application, options *config.ApplicationCon
 			model.WithLRULimit(lruLimit),
 			model.WithMemoryReclaimer(options.MemoryReclaimerEnabled, options.MemoryReclaimerThreshold),
 			model.WithForceEvictionWhenBusy(options.ForceEvictionWhenBusy),
+			model.WithSizeAwareEviction(options.SizeAwareEviction),
 		)
 		application.ModelLoader().SetWatchDog(wd)
 
@@ -565,6 +675,12 @@ func initializeWatchdog(application *Application, options *config.ApplicationCon
 			options.LRUEvictionMaxRetries,
 			options.LRUEvictionRetryInterval,
 		)
+
+		// Sync per-model state from configs to the watchdog. Without this,
+		// `pinned: true` and `concurrency_groups:` are only honored after a
+		// settings-driven RestartWatchdog and never at boot.
+		application.SyncPinnedModelsToWatchdog()
+		application.SyncModelGroupsToWatchdog()
 
 		// Start watchdog goroutine if any periodic checks are enabled
 		// LRU eviction doesn't need the Run() loop - it's triggered on model load
@@ -598,7 +714,7 @@ func loadOrGenerateHMACSecret(path string) (string, error) {
 	}
 	secret := hex.EncodeToString(b)
 
-	if err := os.WriteFile(path, []byte(secret), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(secret), 0o600); err != nil {
 		return "", fmt.Errorf("failed to persist HMAC secret: %w", err)
 	}
 
@@ -644,4 +760,13 @@ func migrateDataFiles(srcDir, dstDir string) {
 	if migrated {
 		xlog.Info("Data migration complete", "from", srcDir, "to", dstDir)
 	}
+}
+
+// registerFailoverMetrics must not retain a manager on the global provider
+// when this application has metrics disabled.
+func (a *Application) registerFailoverMetrics() {
+	if a.applicationConfig.DisableMetrics || a.metricsService == nil {
+		return
+	}
+	failover.RegisterMetrics(a.failoverManager, a.metricsService.Meter)
 }

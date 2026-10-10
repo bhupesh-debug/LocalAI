@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"sync/atomic"
+	"time"
 
 	"github.com/mudler/LocalAI/core/services/messaging"
 	"github.com/mudler/LocalAI/core/services/nodes"
+	"github.com/mudler/LocalAI/core/services/workerctl"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -45,19 +47,19 @@ var _ = Describe("Node Backend Lifecycle (NATS-driven)", Label("Distributed"), f
 
 			// Simulate worker subscribing to backend.install and replying success
 			infra.NC.SubscribeReply(messaging.SubjectNodeBackendInstall(node.ID), func(data []byte, reply func([]byte)) {
-				var req messaging.BackendInstallRequest
+				var req workerctl.BackendInstallRequest
 				json.Unmarshal(data, &req)
 				Expect(req.Backend).To(Equal("llama-cpp"))
 
-				resp := messaging.BackendInstallReply{Success: true}
+				resp := workerctl.BackendInstallReply{Success: true}
 				respData, _ := json.Marshal(resp)
 				reply(respData)
 			})
 
 			FlushNATS(infra.NC)
 
-			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC)
-			installReply, err := adapter.InstallBackend(node.ID, "llama-cpp", "", "")
+			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC, 3*time.Minute, 15*time.Minute)
+			installReply, err := adapter.InstallBackend(node.ID, "llama-cpp", "", "", "", "", "", 0, "", nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(installReply.Success).To(BeTrue())
 		})
@@ -70,15 +72,15 @@ var _ = Describe("Node Backend Lifecycle (NATS-driven)", Label("Distributed"), f
 
 			// Simulate worker replying with error
 			infra.NC.SubscribeReply(messaging.SubjectNodeBackendInstall(node.ID), func(data []byte, reply func([]byte)) {
-				resp := messaging.BackendInstallReply{Success: false, Error: "backend not found"}
+				resp := workerctl.BackendInstallReply{Success: false, Error: "backend not found"}
 				respData, _ := json.Marshal(resp)
 				reply(respData)
 			})
 
 			FlushNATS(infra.NC)
 
-			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC)
-			installReply, err := adapter.InstallBackend(node.ID, "nonexistent", "", "")
+			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC, 3*time.Minute, 15*time.Minute)
+			installReply, err := adapter.InstallBackend(node.ID, "nonexistent", "", "", "", "", "", 0, "", nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(installReply.Success).To(BeFalse())
 			Expect(installReply.Error).To(ContainSubstring("backend not found"))
@@ -91,7 +93,7 @@ var _ = Describe("Node Backend Lifecycle (NATS-driven)", Label("Distributed"), f
 				Name: "gpu-node-2", Address: "h2:50051",
 			}
 			Expect(registry.Register(context.Background(), node, true)).To(Succeed())
-			Expect(registry.SetNodeModel(context.Background(), node.ID, "whisper-large", "loaded", "", 0)).To(Succeed())
+			Expect(registry.SetNodeModel(context.Background(), node.ID, "whisper-large", 0, "loaded", "", 0)).To(Succeed())
 
 			var stopReceived atomic.Int32
 			sub, err := infra.NC.Subscribe(messaging.SubjectNodeBackendStop(node.ID), func(data []byte) {
@@ -103,7 +105,7 @@ var _ = Describe("Node Backend Lifecycle (NATS-driven)", Label("Distributed"), f
 			FlushNATS(infra.NC)
 
 			// Frontend calls UnloadRemoteModel (triggered by UI "Stop" or WatchDog)
-			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC)
+			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC, 3*time.Minute, 15*time.Minute)
 			Expect(adapter.UnloadRemoteModel("whisper-large")).To(Succeed())
 
 			Eventually(func() int32 { return stopReceived.Load() }, "5s").Should(Equal(int32(1)))
@@ -118,8 +120,8 @@ var _ = Describe("Node Backend Lifecycle (NATS-driven)", Label("Distributed"), f
 			node2 := &nodes.BackendNode{Name: "n2", Address: "h2:50051"}
 			registry.Register(context.Background(), node1, true)
 			registry.Register(context.Background(), node2, true)
-			registry.SetNodeModel(context.Background(), node1.ID, "shared-model", "loaded", "", 0)
-			registry.SetNodeModel(context.Background(), node2.ID, "shared-model", "loaded", "", 0)
+			registry.SetNodeModel(context.Background(), node1.ID, "shared-model", 0, "loaded", "", 0)
+			registry.SetNodeModel(context.Background(), node2.ID, "shared-model", 0, "loaded", "", 0)
 
 			var count atomic.Int32
 			sub1, _ := infra.NC.Subscribe(messaging.SubjectNodeBackendStop(node1.ID), func(data []byte) {
@@ -133,14 +135,23 @@ var _ = Describe("Node Backend Lifecycle (NATS-driven)", Label("Distributed"), f
 
 			FlushNATS(infra.NC)
 
-			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC)
+			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC, 3*time.Minute, 15*time.Minute)
 			adapter.UnloadRemoteModel("shared-model")
 
 			Eventually(func() int32 { return count.Load() }, "5s").Should(Equal(int32(2)))
 		})
 
 		It("should be no-op for models not on any node", func() {
-			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC)
+			// Unloading is idempotent by contract: cleanup paths (model
+			// deletion, config edits, watchdog eviction) legitimately run
+			// against an already-unloaded model, and the watchdog's LRU
+			// reclaimer only untracks a model when shutdown reports success.
+			// Callers needing to tell "stopped it" from "nothing to stop" —
+			// ShutdownModel, so it can answer 404 — use HasRemoteModel instead.
+			// The same contract is pinned at unit level by "with no nodes
+			// returns nil" in core/services/nodes/unloader_test.go; keep them
+			// in step.
+			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC, 3*time.Minute, 15*time.Minute)
 			Expect(adapter.UnloadRemoteModel("nonexistent-model")).To(Succeed())
 		})
 	})
@@ -161,7 +172,7 @@ var _ = Describe("Node Backend Lifecycle (NATS-driven)", Label("Distributed"), f
 
 			FlushNATS(infra.NC)
 
-			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC)
+			adapter := nodes.NewRemoteUnloaderAdapter(registry, infra.NC, 3*time.Minute, 15*time.Minute)
 			Expect(adapter.StopNode(node.ID)).To(Succeed())
 
 			Eventually(func() int32 { return stopped.Load() }, "5s").Should(Equal(int32(1)))

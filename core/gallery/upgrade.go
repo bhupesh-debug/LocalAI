@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/pkg/downloader"
 	"github.com/mudler/LocalAI/pkg/model"
-	"github.com/mudler/LocalAI/pkg/oci"
 	"github.com/mudler/LocalAI/pkg/system"
 	"github.com/mudler/xlog"
 	cp "github.com/otiai10/copy"
@@ -23,31 +23,100 @@ type UpgradeInfo struct {
 	AvailableVersion string `json:"available_version"`
 	InstalledDigest  string `json:"installed_digest,omitempty"`
 	AvailableDigest  string `json:"available_digest,omitempty"`
+	// NodeDrift lists nodes whose installed version or digest differs from
+	// the cluster majority. Non-empty means the cluster has diverged and an
+	// upgrade will realign it. Empty in single-node mode.
+	NodeDrift []NodeDriftInfo `json:"node_drift,omitempty"`
 }
 
-// CheckBackendUpgrades compares installed backends against gallery entries
-// and returns a map of backend names to UpgradeInfo for those that have
-// newer versions or different OCI digests available.
+// NodeDriftInfo describes one node that disagrees with the cluster majority
+// on which version/digest of a backend is installed.
+type NodeDriftInfo struct {
+	NodeID   string `json:"node_id"`
+	NodeName string `json:"node_name"`
+	Version  string `json:"version,omitempty"`
+	Digest   string `json:"digest,omitempty"`
+}
+
+// CheckBackendUpgrades is the single-node entrypoint. Distributed callers use
+// CheckUpgradesAgainst directly with their aggregated SystemBackends.
 func CheckBackendUpgrades(ctx context.Context, galleries []config.Gallery, systemState *system.SystemState) (map[string]UpgradeInfo, error) {
-	galleryBackends, err := AvailableBackends(galleries, systemState)
+	installed, err := ListSystemBackends(systemState)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list installed backends: %w", err)
+	}
+	return CheckUpgradesAgainst(ctx, galleries, systemState, installed)
+}
+
+// CheckUpgradesAgainst compares a caller-supplied SystemBackends set against
+// the gallery. Fixes the distributed-mode bug where the old code passed the
+// frontend's (empty) local filesystem through ListSystemBackends and so never
+// surfaced any upgrades.
+//
+// Cluster drift policy: if a backend's per-node versions/digests disagree, the
+// row is flagged upgradeable regardless of whether any node matches the gallery
+// — next Upgrade All realigns the cluster. NodeDrift lists the outliers.
+func CheckUpgradesAgainst(ctx context.Context, galleries []config.Gallery, systemState *system.SystemState, installedBackends SystemBackends) (map[string]UpgradeInfo, error) {
+	// Unfiltered on purpose. AvailableBackends drops every gallery entry the
+	// *local* host cannot run, and in distributed mode the host running this
+	// check is a CPU-only controller while the GPU backends live on worker
+	// nodes. Filtering there made FindGalleryElement return nil for every
+	// cuda/rocm/l4t entry, so those backends were silently skipped and never
+	// reported an upgrade. Every name we look up here is already installed
+	// somewhere in the cluster, so hardware compatibility has been decided at
+	// install time and re-deciding it against the controller is wrong.
+	galleryBackends, err := AvailableBackendsUnfiltered(galleries, systemState)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list available backends: %w", err)
 	}
 
-	installedBackends, err := ListSystemBackends(systemState)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list installed backends: %w", err)
-	}
-
 	result := make(map[string]UpgradeInfo)
 
+	// Build a set of installed metadata names so we can suppress non-dev
+	// candidates whose `-development` counterpart is already installed —
+	// dev variants share an alias with the stable one and are explicit
+	// drop-in replacements, so auto-upgrade must never reintroduce the
+	// non-dev alongside them.
+	_, _, devSuffix := getFallbackTagValues(systemState)
+	devTag := "-" + devSuffix
+	installedNames := make(map[string]struct{}, len(installedBackends))
 	for _, installed := range installedBackends {
+		if installed.Metadata == nil || installed.Metadata.Name == "" {
+			continue
+		}
+		installedNames[installed.Metadata.Name] = struct{}{}
+	}
+
+	for key, installed := range installedBackends {
 		// Skip system backends — they are managed outside the gallery
 		if installed.IsSystem {
 			continue
 		}
 		if installed.Metadata == nil {
 			continue
+		}
+
+		// Skip synthetic alias rows: ListSystemBackends emits an extra
+		// entry keyed by the alias name that re-uses the chosen concrete's
+		// metadata pointer. Iterating it just duplicates the concrete's
+		// gallery lookup, and in distributed mode the wire-reconstructed
+		// version of that row carries a forged Metadata.Name = alias which
+		// can match an unrelated gallery entry.
+		if key != installed.Metadata.Name {
+			continue
+		}
+
+		// Drop-in replacement guard: skip non-dev `X` if `X-<devSuffix>`
+		// is installed. Without this, any upgrade flagged on the non-dev
+		// row (e.g. surfaced via a synthetic-alias path on older workers,
+		// or because both variants happen to be present on disk via stale
+		// state) would tell auto-upgrade to install the stable variant on
+		// top of the user's explicit dev pick.
+		name := installed.Metadata.Name
+		if !strings.HasSuffix(name, devTag) {
+			if _, devInstalled := installedNames[name+devTag]; devInstalled {
+				continue
+			}
 		}
 
 		// Find matching gallery entry by metadata name
@@ -57,59 +126,120 @@ func CheckBackendUpgrades(ctx context.Context, galleries []config.Gallery, syste
 		}
 
 		installedVersion := installed.Metadata.Version
+		installedDigest := installed.Metadata.Digest
 		galleryVersion := galleryEntry.Version
 
-		// If both sides have versions, compare them
+		// Detect cluster drift: does every node report the same version+digest?
+		// In single-node mode this stays empty (Nodes is nil).
+		majority, drift := summarizeNodeDrift(installed.Nodes)
+		if majority.version != "" {
+			installedVersion = majority.version
+		}
+		if majority.digest != "" {
+			installedDigest = majority.digest
+		}
+
+		makeInfo := func(info UpgradeInfo) UpgradeInfo {
+			info.NodeDrift = drift
+			return info
+		}
+
+		// If versions are available on both sides, they're the source of truth.
 		if galleryVersion != "" && installedVersion != "" {
-			if galleryVersion != installedVersion {
-				result[installed.Metadata.Name] = UpgradeInfo{
+			if galleryVersion != installedVersion || len(drift) > 0 {
+				result[installed.Metadata.Name] = makeInfo(UpgradeInfo{
 					BackendName:      installed.Metadata.Name,
 					InstalledVersion: installedVersion,
 					AvailableVersion: galleryVersion,
-				}
+				})
 			}
-			// Versions match — no upgrade needed
 			continue
 		}
 
-		// Gallery has a version but installed doesn't — this happens for backends
-		// installed before version tracking was added. Flag as upgradeable so
-		// users can re-install to pick up version metadata.
+		// Gallery has a version but installed doesn't — backends installed before
+		// version tracking was added. Flag as upgradeable to pick up metadata.
 		if galleryVersion != "" && installedVersion == "" {
-			result[installed.Metadata.Name] = UpgradeInfo{
+			result[installed.Metadata.Name] = makeInfo(UpgradeInfo{
 				BackendName:      installed.Metadata.Name,
 				InstalledVersion: "",
 				AvailableVersion: galleryVersion,
-			}
+			})
 			continue
 		}
 
-		// Fall back to OCI digest comparison when versions are unavailable
-		if downloader.URI(galleryEntry.URI).LooksLikeOCI() {
-			remoteDigest, err := oci.GetImageDigest(galleryEntry.URI, "", nil, nil)
+		// Fall back to OCI digest comparison when versions are unavailable.
+		if galleryURI := downloader.URI(galleryEntry.URI); galleryURI.LooksLikeRegistryOCI() {
+			remoteDigest, err := lookupImageDigest(galleryURI.OCIReference())
 			if err != nil {
 				xlog.Warn("Failed to get remote OCI digest for upgrade check", "backend", installed.Metadata.Name, "error", err)
 				continue
 			}
 			// If we have a stored digest, compare; otherwise any remote digest
-			// means we can't confirm we're up to date — flag as upgradeable
-			if installed.Metadata.Digest == "" || remoteDigest != installed.Metadata.Digest {
-				result[installed.Metadata.Name] = UpgradeInfo{
+			// means we can't confirm we're up to date — flag as upgradeable.
+			if installedDigest == "" || remoteDigest != installedDigest || len(drift) > 0 {
+				result[installed.Metadata.Name] = makeInfo(UpgradeInfo{
 					BackendName:     installed.Metadata.Name,
-					InstalledDigest: installed.Metadata.Digest,
+					InstalledDigest: installedDigest,
 					AvailableDigest: remoteDigest,
-				}
+				})
 			}
+		} else if len(drift) > 0 {
+			// No version/digest path but nodes disagree — still worth flagging.
+			result[installed.Metadata.Name] = makeInfo(UpgradeInfo{
+				BackendName:      installed.Metadata.Name,
+				InstalledVersion: installedVersion,
+				InstalledDigest:  installedDigest,
+			})
 		}
-		// No version info and non-OCI URI — cannot determine, skip
 	}
 
 	return result, nil
 }
 
+// summarizeNodeDrift collapses per-node version/digest tuples to a majority
+// pair and returns the outliers. In single-node mode (empty nodes slice) this
+// returns zero values and a nil drift list.
+func summarizeNodeDrift(nodes []NodeBackendRef) (majority struct{ version, digest string }, drift []NodeDriftInfo) {
+	if len(nodes) == 0 {
+		return majority, nil
+	}
+
+	type key struct{ version, digest string }
+	counts := map[key]int{}
+	var topKey key
+	var topCount int
+	for _, n := range nodes {
+		k := key{n.Version, n.Digest}
+		counts[k]++
+		if counts[k] > topCount {
+			topCount = counts[k]
+			topKey = k
+		}
+	}
+
+	majority.version = topKey.version
+	majority.digest = topKey.digest
+
+	if len(counts) == 1 {
+		return majority, nil // unanimous — no drift
+	}
+	for _, n := range nodes {
+		if n.Version == majority.version && n.Digest == majority.digest {
+			continue
+		}
+		drift = append(drift, NodeDriftInfo{
+			NodeID:   n.NodeID,
+			NodeName: n.NodeName,
+			Version:  n.Version,
+			Digest:   n.Digest,
+		})
+	}
+	return majority, drift
+}
+
 // UpgradeBackend upgrades a single backend to the latest gallery version using
 // an atomic swap with backup-based rollback on failure.
-func UpgradeBackend(ctx context.Context, systemState *system.SystemState, modelLoader *model.ModelLoader, galleries []config.Gallery, backendName string, downloadStatus func(string, string, string, float64)) error {
+func UpgradeBackend(ctx context.Context, systemState *system.SystemState, modelLoader *model.ModelLoader, galleries []config.Gallery, backendName string, downloadStatus func(string, string, string, float64), requireIntegrity bool) error {
 	// Look up the installed backend
 	installedBackends, err := ListSystemBackends(systemState)
 	if err != nil {
@@ -128,11 +258,13 @@ func UpgradeBackend(ctx context.Context, systemState *system.SystemState, modelL
 	// If this is a meta backend, recursively upgrade the concrete backend it points to
 	if installed.Metadata != nil && installed.Metadata.MetaBackendFor != "" {
 		xlog.Info("Meta backend detected, upgrading concrete backend", "meta", backendName, "concrete", installed.Metadata.MetaBackendFor)
-		return UpgradeBackend(ctx, systemState, modelLoader, galleries, installed.Metadata.MetaBackendFor, downloadStatus)
+		return UpgradeBackend(ctx, systemState, modelLoader, galleries, installed.Metadata.MetaBackendFor, downloadStatus, requireIntegrity)
 	}
 
-	// Find the gallery entry
-	galleryBackends, err := AvailableBackends(galleries, systemState)
+	// Find the gallery entry. Unfiltered for the same reason as the check
+	// above: backendName is already installed here, so the capability filter
+	// can only reject an entry we must be able to resolve.
+	galleryBackends, err := AvailableBackendsUnfiltered(galleries, systemState)
 	if err != nil {
 		return fmt.Errorf("failed to list available backends: %w", err)
 	}
@@ -141,6 +273,17 @@ func UpgradeBackend(ctx context.Context, systemState *system.SystemState, modelL
 	if galleryEntry == nil {
 		return fmt.Errorf("no gallery entry found for backend %q", backendName)
 	}
+
+	// Resolve integrity options (cosign verifier for OCI URIs, strict-mode
+	// gate for missing SHA256/policy) BEFORE writing anything to disk.
+	// Without this, the upgrade path would atomically swap in an
+	// unverified backend even when the gallery has a verification policy
+	// — see backendDownloadOptions in backends.go.
+	downloadOpts, err := backendDownloadOptions(galleryEntry, requireIntegrity)
+	if err != nil {
+		return fmt.Errorf("upgrade %q: %w", backendName, err)
+	}
+	downloadOpts = append(downloadOpts, downloader.WithStagingDir(systemState.StagingPath))
 
 	backendPath := filepath.Join(systemState.Backend.BackendsPath, backendName)
 	tmpPath := backendPath + ".upgrade-tmp"
@@ -162,7 +305,7 @@ func UpgradeBackend(ctx context.Context, systemState *system.SystemState, modelL
 			return fmt.Errorf("failed to copy backend from directory: %w", err)
 		}
 	} else {
-		if err := uri.DownloadFileWithContext(ctx, tmpPath, "", 1, 1, downloadStatus); err != nil {
+		if err := uri.DownloadFileWithContext(ctx, tmpPath, galleryEntry.SHA256, 1, 1, downloadStatus, downloadOpts...); err != nil {
 			os.RemoveAll(tmpPath)
 			return fmt.Errorf("failed to download backend: %w", err)
 		}
@@ -210,8 +353,8 @@ func UpgradeBackend(ctx context.Context, systemState *system.SystemState, modelL
 	}
 
 	// Record OCI digest if applicable (non-fatal on failure)
-	if uri.LooksLikeOCI() {
-		digest, digestErr := oci.GetImageDigest(galleryEntry.URI, "", nil, nil)
+	if uri.LooksLikeRegistryOCI() {
+		digest, digestErr := lookupImageDigest(uri.OCIReference())
 		if digestErr != nil {
 			xlog.Warn("Failed to get OCI image digest after upgrade", "uri", galleryEntry.URI, "error", digestErr)
 		} else {
